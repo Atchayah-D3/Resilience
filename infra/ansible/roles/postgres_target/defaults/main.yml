@@ -1,0 +1,13 @@
+---
+# Password for the harness role. Taken from the driver host's ~/.pgpass by default, so the
+# repository never contains a credential. Override with -e harness_password=...
+harness_password: >-
+  {{ lookup('pipe', "awk -F: -v h=" + node.db.host + " -v p=" + (node.db.port | string) +
+     " -v d=" + node.db.dbname + " -v u=" + node.db.user +
+     " '$1==h && $2==p && $3==d && $4==u {print $5; exit}' ~/.pgpass") }}
+
+# Database the setup tasks connect to before the harness database exists (psql would
+# otherwise connect to a database named after the OS user, which need not exist). `postgres`
+# is the standard maintenance database and initdb creates it; on a pre-existing cluster where
+# it was dropped, override with template1, which always exists.
+maintenance_db: postgres

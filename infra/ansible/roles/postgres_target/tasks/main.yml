@@ -1,0 +1,174 @@
+---
+# The disposable target cluster for the resilience harness.
+#
+# Idempotent and conservative: it never drops or re-initialises an existing cluster, and it
+# touches nothing outside the data directory named in the environment profile.
+#
+# Everything runs as root and switches to the database account with `runuser` -- the same
+# mechanism the harness uses over SSH, so no ACL support or unprivileged escalation is needed.
+
+- name: Refuse to run without a password for the harness role
+  ansible.builtin.assert:
+    that: harness_password | default('') | length > 0
+    fail_msg: >-
+      no password found for {{ node.db.user }}@{{ node.db.host }}:{{ node.db.port }} in
+      ~/.pgpass on the control host; add it, or pass -e harness_password=...
+
+- name: Data directory exists, owned by the database account
+  ansible.builtin.file:
+    path: "{{ node.pgdata }}"
+    state: directory
+    owner: "{{ node.os_user }}"
+    group: "{{ node.os_user }}"
+    mode: "0700"
+
+- name: Is the cluster already initialised?
+  ansible.builtin.stat:
+    path: "{{ node.pgdata }}/PG_VERSION"
+  register: pg_version_file
+
+- name: Initialise the cluster with page checksums (Framework §16.2)
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - "{{ node.os_user }}"
+      - --
+      - "{{ node.pg_bin }}/initdb"
+      - -D
+      - "{{ node.pgdata }}"
+      - --data-checksums
+      - --auth-local=peer
+      - --auth-host=scram-sha-256
+      - --no-ssl
+    chdir: /tmp
+  when: not pg_version_file.stat.exists
+  register: initdb_run
+  changed_when: initdb_run.rc == 0
+
+- name: Durability settings and port (Framework §3.5)
+  ansible.builtin.blockinfile:
+    path: "{{ node.pgdata }}/postgresql.conf"
+    owner: "{{ node.os_user }}"
+    group: "{{ node.os_user }}"
+    marker: "# {mark} resilience harness target"
+    block: |
+      listen_addresses = '*'
+      port = {{ node.db.port }}
+      fsync = on
+      synchronous_commit = on
+      full_page_writes = on
+  notify: restart database
+
+- name: Local connections by peer, so local tools need no password
+  ansible.builtin.replace:
+    path: "{{ node.pgdata }}/pg_hba.conf"
+    regexp: '^local\s+all\s+all\s+(?!peer).*$'
+    replace: 'local   all             all                                     peer'
+  notify: reload database
+
+- name: The harness role may connect only from the driver host
+  ansible.builtin.lineinfile:
+    path: "{{ node.pgdata }}/pg_hba.conf"
+    line: "host    {{ node.db.dbname }}    {{ node.db.user }}    {{ client_cidr }}    scram-sha-256"
+    regexp: "^host\\s+{{ node.db.dbname }}\\s+{{ node.db.user }}\\s+"
+  vars:
+    client_cidr: >-
+      {{ node.client_source_cidr
+         | default(hostvars['localhost']['env_profile'].driver_host.host ~ '/32', true) }}
+  notify: reload database
+
+- name: Service unit, enabled so recovery is unattended (Framework §10.1)
+  ansible.builtin.template:
+    src: service.j2
+    dest: "/etc/systemd/system/{{ node.service }}"
+    mode: "0644"
+  notify: restart database
+
+- name: Service enabled and running
+  ansible.builtin.systemd_service:
+    name: "{{ node.service }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Flush handlers before touching the database
+  ansible.builtin.meta: flush_handlers
+
+- name: Harness role exists
+  ansible.builtin.command:
+    argv: ["runuser", "-u", "{{ node.os_user }}", "--", "{{ node.pg_bin }}/psql",
+           "-p", "{{ node.db.port }}", "-d", "{{ maintenance_db }}", "-XAtc",
+           "SELECT 1 FROM pg_roles WHERE rolname = '{{ node.db.user }}'"]
+    chdir: /tmp
+  register: role_exists
+  changed_when: false
+
+- name: Create the harness role
+  ansible.builtin.command:
+    argv: ["runuser", "-u", "{{ node.os_user }}", "--", "{{ node.pg_bin }}/psql",
+           "-p", "{{ node.db.port }}", "-d", "{{ maintenance_db }}", "-c",
+           "CREATE ROLE {{ node.db.user }} LOGIN PASSWORD '{{ harness_password }}'"]
+    chdir: /tmp
+  when: role_exists.stdout != "1"
+  no_log: true
+  changed_when: true
+
+- name: Harness database exists
+  ansible.builtin.command:
+    argv: ["runuser", "-u", "{{ node.os_user }}", "--", "{{ node.pg_bin }}/psql",
+           "-p", "{{ node.db.port }}", "-d", "{{ maintenance_db }}", "-XAtc",
+           "SELECT 1 FROM pg_database WHERE datname = '{{ node.db.dbname }}'"]
+    chdir: /tmp
+  register: db_exists
+  changed_when: false
+
+- name: Create the harness database
+  ansible.builtin.command:
+    argv: ["runuser", "-u", "{{ node.os_user }}", "--", "{{ node.pg_bin }}/psql",
+           "-p", "{{ node.db.port }}", "-d", "{{ maintenance_db }}", "-c",
+           "CREATE DATABASE {{ node.db.dbname }} OWNER {{ node.db.user }}"]
+    chdir: /tmp
+  when: db_exists.stdout != "1"
+  changed_when: true
+
+- name: Monitoring grant, integrity extension and the harness schema
+  ansible.builtin.command:
+    argv: ["runuser", "-u", "{{ node.os_user }}", "--", "{{ node.pg_bin }}/psql",
+           "-p", "{{ node.db.port }}", "-d", "{{ node.db.dbname }}",
+           "-c", "GRANT pg_monitor TO {{ node.db.user }}",
+           "-c", "CREATE EXTENSION IF NOT EXISTS amcheck",
+           "-c", "CREATE SCHEMA IF NOT EXISTS resilience",
+           "-c", "ALTER SCHEMA resilience OWNER TO {{ node.db.user }}"]
+    chdir: /tmp
+  changed_when: false
+
+- name: Report what the harness will find
+  ansible.builtin.command:
+    argv: ["runuser", "-u", "{{ node.os_user }}", "--", "{{ node.pg_bin }}/psql",
+           "-p", "{{ node.db.port }}", "-d", "{{ node.db.dbname }}", "-XAtc",
+           "select current_setting('data_directory')||' | checksums='||current_setting('data_checksums')||' | sync_commit='||current_setting('synchronous_commit')||' | fsync='||current_setting('fsync')"]
+    chdir: /tmp
+  register: ready
+  changed_when: false
+
+- name: Ready
+  ansible.builtin.debug:
+    msg: "{{ ready.stdout }}"
+
+- name: Is the operator's sentinel present? (Arch §15 -- automation never creates it)
+  ansible.builtin.command:
+    argv: ["runuser", "-u", "{{ node.os_user }}", "--", "{{ node.pg_bin }}/psql",
+           "-p", "{{ node.db.port }}", "-d", "{{ node.db.dbname }}", "-XAtc",
+           "SELECT count(*) FROM {{ sentinel_table }} WHERE hostname = '{{ ansible_hostname }}'"]
+    chdir: /tmp
+  register: sentinel_rows
+  failed_when: false
+  changed_when: false
+
+- name: Remind the operator to create the sentinel by hand
+  ansible.builtin.debug:
+    msg: >-
+      No sentinel row for {{ ansible_hostname }} in {{ sentinel_table }}. The harness will
+      refuse to run until an operator creates it (inventory_tag '{{ inventory_tag }}').
+  when: sentinel_rows.stdout | default('0') != '1'

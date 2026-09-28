@@ -1,0 +1,27 @@
+# Managed by infra/ansible/roles/postgres_target -- edits will be overwritten.
+# Enabled and restart-on-failure: recovery after a crash or power loss must be unattended
+# (Framework §10.1). The process-kill driver refuses to inject if this is not the case.
+[Unit]
+Description=Resilience harness target cluster ({{ node.name }})
+After=network.target
+
+[Service]
+Type=forking
+User={{ node.os_user }}
+Group={{ node.os_user }}
+Environment=PGDATA={{ node.pgdata }}
+OOMScoreAdjust=-1000
+Environment=PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj
+Environment=PG_OOM_ADJUST_VALUE=0
+Environment=PGSTARTTIMEOUT=270
+TimeoutSec=300
+ExecStart={{ node.pg_bin }}/pg_ctl -D ${PGDATA} -l {{ node.log_file }} -t ${PGSTARTTIMEOUT} start
+ExecStop={{ node.pg_bin }}/pg_ctl -D ${PGDATA} stop
+ExecReload={{ node.pg_bin }}/pg_ctl -D ${PGDATA} reload
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ node.name }}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

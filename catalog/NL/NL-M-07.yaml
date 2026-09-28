@@ -1,0 +1,73 @@
+# NL-M-07 -- Config reload under load (Framework §10.7, Tier 1, P1).
+# Fault injection: SIGHUP with changed parameters under load.
+# Acceptance: zero dropped connections; zero failed transactions.
+#
+# The mildest fault in the catalog, and a useful control: if a plain reload disturbs clients,
+# every timing measured under load elsewhere is suspect. Nothing restarts and nothing crashes,
+# so service should be completely uninterrupted.
+#
+# The Framework fixes the offered load for this row: "SIGHUP with changed parameters at
+# 1000 TPS" (Framework §10.7), so rate_tps is 1000. It gives no steady-state floor or latency
+# ceiling; tps_min is 75% of the offered load (the same ratio as NL-C-01) and the p99 ceiling
+# matches NL-C-01. The target must be qualified at 1000 TPS before this row can produce a
+# verdict -- the pre_fault phase aborts, naming the slower side, if it cannot. NEEDS SIGN-OFF.
+id: NL-M-07
+name: Config reload under load
+tier: node_local
+category: NL-M
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-M is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 750                   # 75% of the offered 1000/s
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: oltp_write_heavy
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 1000                 # Framework §10.7: "at 1000 TPS"
+
+fault:
+  type: config_reload
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:                        # engine capabilities this scenario needs (Arch §8)
+  - transactional_markers
+  - structural_integrity_check
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - failed_transactions          # transactions the server definitively rejected
+  - dropped_connections          # client connections broken during or after the reload
+  - connect_failures             # new connections refused during or after the reload (reported)
+  - rto_first_write_s
+  - corruption_count
+  - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
+
+accept:
+  - failed_transactions == 0     # Framework §10.7: zero failed transactions
+  - dropped_connections == 0     # Framework §10.7: zero dropped connections
+  - rpo_txn == 0
+
+priority: P1
+
+description: >
+  A parameter is changed and the configuration reloaded while marker-instrumented write load
+  is running. A reload signals running backends; it neither restarts the service nor breaks
+  sessions, so clients must see no failed transaction and no dropped connection.

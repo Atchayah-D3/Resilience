@@ -1,0 +1,54 @@
+---
+# Provision the disposable target cluster described by an environment profile.
+#
+#   ansible-playbook infra/ansible/provision-target.yml -e profile=envs/e2-dedicated-vm.yaml
+#
+# The profile is the single source of truth (Arch §3.1): the data directory, port, service
+# name and binaries come from the same file the harness reads at run time, so the machine and
+# the tests cannot disagree. Nothing here is written back into the profile.
+#
+# The database password is never stored in the repo. It is taken from the driver host's
+# ~/.pgpass, or passed with -e harness_password=...
+- name: Resolve the target from the environment profile
+  hosts: localhost
+  gather_facts: false
+  vars:
+    profile: "{{ undef(hint='pass -e profile=envs/<name>.yaml') }}"
+  tasks:
+    - name: Load the environment profile
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../{{ profile }}"
+        name: env_profile
+
+    - name: Refuse an engine this role does not provision
+      ansible.builtin.assert:
+        that: env_profile.database.engine == 'postgresql'
+        fail_msg: >-
+          this role provisions PostgreSQL-family engines only;
+          profile declares {{ env_profile.database.engine }}
+
+    - name: Refuse anything but a lab or staging environment
+      ansible.builtin.assert:
+        that: env_profile.environment in ['lab', 'staging']
+        fail_msg: "refusing to provision a target in {{ env_profile.environment }} (Framework §7.2)"
+
+    - name: Add the target node to the inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: resilience_targets
+        ansible_host: "{{ item.ssh.host }}"
+        ansible_port: "{{ item.ssh.port }}"
+        ansible_user: "{{ item.ssh.user }}"
+        node: "{{ item }}"
+        sentinel_table: "{{ env_profile.safety.sentinel_table }}"
+        inventory_tag: "{{ env_profile.safety.allowlist.inventory_tag }}"
+      loop: "{{ env_profile.nodes }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.ssh.host }})"
+
+- name: Provision the disposable target cluster
+  hosts: resilience_targets
+  become: true
+  gather_facts: true
+  roles:
+    - postgres_target

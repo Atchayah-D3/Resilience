@@ -1,0 +1,64 @@
+# Environment profile (Arch §3.1).
+# Everything environment-specific lives here: hosts, ports, paths, services, drivers,
+# phase bounds and safety fingerprints. Scenarios in catalog/ stay environment-agnostic.
+name: e2-dedicated-vm
+class: E2
+environment: lab
+
+database:
+  engine: postgresql             # adapter that serves this environment (Arch §8)
+
+storage_class: null              # declared once the storage backend is qualified (Framework §3.4)
+
+os_ssh:
+  driver: os_ssh                 # process, systemd and filesystem faults over SSH (Arch §5)
+
+noisy_neighbour:
+  injectable: false
+  driver: null
+
+storage_fault:
+  dm_shim: false                 # set true when PGDATA sits behind a dm-flakey shim (Arch §3)
+
+reset:
+  driver: none                   # snapshot reset driver, when the environment provides one
+
+sla_tier_target: platinum
+
+driver_host:                     # workload driver and marker journals, separate from the target (Arch §6.2)
+  host: 10.11.21.111
+  run_dir: /home/distdbsdb17user/resilience-runs
+
+nodes:
+  - name: shaktidb-standalone
+    role: standalone
+    topology_role: primary
+    ssh: {host: 10.11.21.112, port: 5015, user: distdbsdb17user}
+    db: {host: 10.11.21.112, port: 5433, dbname: resilience, user: harness}
+    client: {host: 10.11.21.112, port: 5433, dbname: resilience, user: harness}
+    pgdata: /var/lib/resilience/pgdata
+    pg_bin: /usr/lib/postgresql/17.11.1.0/bin
+    os_user: postgres
+    service: shaktidb-resilience.service
+    log_file: /var/lib/resilience/pgdata/logfile
+
+safety:                          # Arch §15: default deny, plus an operator-created sentinel
+  allowlist:
+    hostname_pattern: '^BDB-QA-U22-30$'
+    inventory_tag: resilience-lab-e2
+  sentinel_table: resilience.harness_target
+
+phase_timeouts_s:                # every phase is bounded; an unbounded wait is a defect (Arch §15)
+  reset: 600
+  init: 180
+  baseline: 300
+  pre_fault: 300
+  fault_inject: 120
+  recovery: 900
+  validate: 1800
+  report: 120
+  cleanup: 600
+
+disclosures:                     # stated in every report produced against this environment
+  - "Baseline reset is not configured here: the target is not rolled back to a snapshot before a run."
+  - "Storage class is not declared: results certify no storage class."

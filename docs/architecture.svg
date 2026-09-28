@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="720" viewBox="0 0 1360 720" role="img" aria-label="Resilience test harness — architecture">
+<title>Resilience test harness — architecture</title>
+<style>
+ text{font-family:'IBM Plex Sans','DejaVu Sans',Verdana,sans-serif;fill:#131b22}
+ .h1{font-size:25px;font-weight:600} .sub{font-size:12.5px;fill:#5a6b78}
+ .band{font-family:'IBM Plex Mono','DejaVu Sans Mono',monospace;font-size:10px;fill:#5a6b78;letter-spacing:1.3px}
+ .ti{font-size:12.5px;font-weight:600}
+ .bd{font-size:11px;fill:#5a6b78}
+ .chip{font-size:11px;fill:#131b22}
+ .bdm{font-family:'IBM Plex Mono','DejaVu Sans Mono',monospace;font-size:9.5px;fill:#5a6b78;letter-spacing:.8px}
+ .numt{font-family:'IBM Plex Mono','DejaVu Sans Mono',monospace;font-size:10.5px}
+</style>
+<defs><marker id="am" viewBox="0 0 8 8" refX="4" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1 L5 4 L0 7z" fill="#5a6b78"/></marker><marker id="af" viewBox="0 0 8 8" refX="4" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1 L5 4 L0 7z" fill="#ab3a20"/></marker><marker id="as" viewBox="0 0 8 8" refX="4" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M8 1 L3 4 L8 7z" fill="#ab3a20"/></marker></defs>
+<rect x="0" y="0" width="1360" height="720" fill="#ffffff"/>
+<text x="50" y="60" class="h1">Resilience test harness</text>
+<text x="50" y="84" class="sub">What each layer contains, and how one run travels through them.</text>
+<text x="50" y="144" class="band">THE RUN · LEFT TO RIGHT</text>
+<text x="550" y="466" class="band" text-anchor="end">THE EVIDENCE ·</text>
+<text x="550" y="482" class="band" text-anchor="end">WHAT THE VERDICT IS MADE OF</text>
+<rect x="50" y="158" width="224" height="164" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<text x="64" y="178" class="ti">CONFIGURATION</text>
+<rect x="62" y="188" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="72" y="205" class="chip">catalog/&lt;tier&gt;/*.yaml</text>
+<rect x="62" y="220" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="72" y="237" class="chip">envs/*.yaml</text>
+<rect x="308" y="158" width="224" height="164" rx="6" fill="#fffaf0" stroke="#d9a13b" stroke-width="1.4"/>
+<text x="322" y="178" class="ti">CONTROL PLANE</text>
+<rect x="320" y="188" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="330" y="205" class="chip">orchestrator</text>
+<rect x="320" y="220" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="330" y="237" class="chip">safety controller</text>
+<rect x="320" y="252" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="330" y="269" class="chip">injection ledger</text>
+<rect x="320" y="284" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="330" y="301" class="chip">kill switch</text>
+<rect x="566" y="158" width="224" height="164" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<text x="580" y="178" class="ti">EXECUTION</text>
+<rect x="578" y="188" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="588" y="205" class="chip">fault injectors</text>
+<rect x="578" y="220" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="588" y="237" class="chip">workload driver</text>
+<rect x="578" y="252" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="588" y="269" class="chip">probes</text>
+<rect x="824" y="158" width="224" height="164" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<text x="838" y="178" class="ti">ADAPTER LAYER</text>
+<rect x="836" y="188" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="846" y="205" class="chip">database adapter</text>
+<rect x="836" y="220" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="846" y="237" class="chip">SSH transport</text>
+<rect x="1082" y="158" width="224" height="164" rx="6" fill="#fdf3f2" stroke="#ab3a20" stroke-width="1.4"/>
+<text x="1096" y="178" class="ti">TARGET MACHINE</text>
+<rect x="1094" y="188" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="1104" y="205" class="chip">database</text>
+<rect x="1094" y="220" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="1104" y="237" class="chip">service manager</text>
+<rect x="1094" y="252" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="1104" y="269" class="chip">database log</text>
+<rect x="566" y="420" width="224" height="132" rx="6" fill="#efecfa" stroke="#6b5bb5" stroke-width="1.4"/>
+<text x="580" y="440" class="ti">EVIDENCE</text>
+<rect x="578" y="450" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="588" y="467" class="chip">events.jsonl</text>
+<rect x="578" y="482" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="588" y="499" class="chip">marker.jrnl · acked.jrnl</text>
+<rect x="578" y="514" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="588" y="531" class="chip">injection-ledger.jsonl</text>
+<rect x="824" y="420" width="224" height="132" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<text x="838" y="440" class="ti">ANALYSIS</text>
+<rect x="836" y="450" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="846" y="467" class="chip">RTO decomposer</text>
+<rect x="836" y="482" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="846" y="499" class="chip">marker arithmetic</text>
+<rect x="836" y="514" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="846" y="531" class="chip">threshold evaluator</text>
+<rect x="1082" y="420" width="224" height="132" rx="6" fill="#f0f7f1" stroke="#3f8f5f" stroke-width="1.4"/>
+<text x="1096" y="440" class="ti">VERDICT</text>
+<rect x="1094" y="450" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="1104" y="467" class="chip">results.json</text>
+<rect x="1094" y="482" width="200" height="26" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1"/>
+<text x="1104" y="499" class="chip">summary.txt</text>
+<path d="M 281 216 L 299 216" fill="none" stroke="#5a6b78" stroke-width="1.7" marker-end="url(#am)"/>
+<circle cx="291.0" cy="194" r="10.5" fill="#ffffff" stroke="#5a6b78" stroke-width="1.3"/>
+<text x="291.0" y="198" class="numt" text-anchor="middle">1</text>
+<path d="M 539 216 L 557 216" fill="none" stroke="#5a6b78" stroke-width="1.7" marker-end="url(#am)"/>
+<circle cx="549.0" cy="194" r="10.5" fill="#ffffff" stroke="#5a6b78" stroke-width="1.3"/>
+<text x="549.0" y="198" class="numt" text-anchor="middle">2</text>
+<path d="M 797 216 L 815 216" fill="none" stroke="#5a6b78" stroke-width="1.7" marker-end="url(#am)"/>
+<circle cx="807.0" cy="194" r="10.5" fill="#ffffff" stroke="#5a6b78" stroke-width="1.3"/>
+<text x="807.0" y="198" class="numt" text-anchor="middle">3</text>
+<path d="M 1055 216 L 1073 216" fill="none" stroke="#ab3a20" stroke-width="1.7" marker-end="url(#af)" marker-start="url(#as)"/>
+<circle cx="1065.0" cy="194" r="10.5" fill="#ffffff" stroke="#5a6b78" stroke-width="1.3"/>
+<text x="1065.0" y="198" class="numt" text-anchor="middle">4</text>
+<path d="M 360.0 329 L 360.0 356 L 618.0 356 L 618.0 411" fill="none" stroke="#5a6b78" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#am)"/>
+<circle cx="378.0" cy="342" r="10.5" fill="#ffffff" stroke="#5a6b78" stroke-width="1.3"/>
+<text x="378.0" y="346" class="numt" text-anchor="middle">5</text>
+<text x="489.0" y="346" class="bdm" text-anchor="middle">the ledger, before the fault</text>
+<path d="M 718.0 329 L 718.0 356 L 718.0 356 L 718.0 411" fill="none" stroke="#5a6b78" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#am)"/>
+<circle cx="736.0" cy="342" r="10.5" fill="#ffffff" stroke="#5a6b78" stroke-width="1.3"/>
+<text x="736.0" y="346" class="numt" text-anchor="middle">6</text>
+<text x="732.0" y="380" class="bdm" text-anchor="start">journals · probes · samples</text>
+<path d="M 797 478 L 815 478" fill="none" stroke="#5a6b78" stroke-width="1.7" marker-end="url(#am)"/>
+<circle cx="807.0" cy="456" r="10.5" fill="#ffffff" stroke="#5a6b78" stroke-width="1.3"/>
+<text x="807.0" y="460" class="numt" text-anchor="middle">7</text>
+<path d="M 1055 478 L 1073 478" fill="none" stroke="#5a6b78" stroke-width="1.7" marker-end="url(#am)"/>
+<circle cx="1065.0" cy="456" r="10.5" fill="#ffffff" stroke="#5a6b78" stroke-width="1.3"/>
+<text x="1065.0" y="460" class="numt" text-anchor="middle">8</text>
+<text x="50" y="604" class="band">THE EIGHT STEPS</text>
+<text x="50" y="628" class="bd">1  catalog and envs are read and validated, then the run plan is built</text>
+<text x="50" y="647" class="bd">2  the orchestrator runs the nine phases and refuses an unsafe target</text>
+<text x="50" y="666" class="bd">3  injectors kill or restart, the workload commits markers, probes write</text>
+<text x="50" y="685" class="bd">4  shell commands over SSH, SQL over the database protocol, answers back</text>
+<text x="520" y="628" class="bd">5  the ledger is flushed to disk before the fault is applied, never after</text>
+<text x="520" y="647" class="bd">6  marker journals, probe results and one-second samples are appended live</text>
+<text x="520" y="666" class="bd">7  the decomposer and the marker sets read the record, not the live database</text>
+<text x="520" y="685" class="bd">8  every accept rule is evaluated; passed also needs the machine left clean</text>
+<text x="1010" y="604" class="band">LINES</text>
+<path d="M 1010 624 L 1042 624" stroke="#5a6b78" stroke-width="1.7"/>
+<text x="1052" y="628" class="bd">inside the harness</text>
+<path d="M 1010 643 L 1042 643" stroke="#ab3a20" stroke-width="1.7"/>
+<text x="1052" y="647" class="bd">to the machine</text>
+<path d="M 1010 662 L 1042 662" stroke="#5a6b78" stroke-width="1.7" stroke-dasharray="4 3"/>
+<text x="1052" y="666" class="bd">written to disk</text>
+</svg>

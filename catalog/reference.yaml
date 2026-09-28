@@ -1,0 +1,65 @@
+# Declared figures from the Unified Resilience Testing Framework v1.0 that the catalog
+# must reconcile to (Framework §13.7 check 6). Change only when the Framework changes.
+
+# Framework §9 -- scenarios and P0 per category
+categories:
+  NL-D: {count: 6,  P0: 5}
+  NL-C: {count: 7,  P0: 4}
+  NL-W: {count: 7,  P0: 4}
+  NL-I: {count: 9,  P0: 6}
+  NL-R: {count: 9,  P0: 4}
+  NL-N: {count: 8,  P0: 4}
+  NL-M: {count: 8,  P0: 2}
+  CL-F: {count: 10, P0: 7}
+  CL-S: {count: 6,  P0: 4}
+  CL-R: {count: 10, P0: 6}
+  CL-N: {count: 6,  P0: 1}
+  CL-C: {count: 5,  P0: 2}
+  CL-B: {count: 9,  P0: 5}
+  CL-X: {count: 9,  P0: 9}
+  DX-T: {count: 11, P0: 8}
+  DX-M: {count: 9,  P0: 7}
+  DX-S: {count: 8,  P0: 6}
+  DX-Q: {count: 7,  P0: 4}
+  DX-P: {count: 6,  P0: 6}
+  DX-D: {count: 5,  P0: 3}
+
+# Framework §5 coverage summary
+tiers:
+  node_local:  {count: 54, P0: 29, P1: 23, P2: 2}
+  cluster:     {count: 55, P0: 34, P1: 19, P2: 2}
+  distributed: {count: 46, P0: 34, P1: 12, P2: 0}
+total: {count: 155, P0: 97, P1: 54, P2: 4}
+
+# Framework §7.3 -- the 21 environment-sensitive scenarios
+# (NL-D 6 + NL-N 8 + CL-F-01/02/03/08 + CL-B-05 + DX-S-08 + DX-Q-07)
+env_sensitive: [
+  NL-D-01, NL-D-02, NL-D-03, NL-D-04, NL-D-05, NL-D-06,
+  NL-N-01, NL-N-02, NL-N-03, NL-N-04, NL-N-05, NL-N-06, NL-N-07, NL-N-08,
+  CL-F-01, CL-F-02, CL-F-03, CL-F-08, CL-B-05, DX-S-08, DX-Q-07,
+]
+# 21 x 4 classes + 134 run once (Framework §7.3, Arch §4.2)
+runs: 218
+
+# Architecture table of contents (check 5). A scenario citing "Arch §n" is checked against
+# this list; "Framework §n" against the list below. Extracted from the Architecture document.
+arch_sections: [
+  "1", "2", "2.1", "3", "3.1", "4", "4.1", "4.2", "4.3", "5",
+  "6", "6.1", "6.2", "6.3", "7", "7.1", "7.2", "7.3", "8", "9",
+  "10", "10.1", "10.2", "10.3", "10.4", "11", "11.1", "12", "13",
+  "14", "14.1", "15", "16", "17", "17.1", "18", "19",
+]
+
+# Framework table of contents (check 5). The TOC has no §3.4 and no §15 heading even
+# though the body cites both -- a defect in the source document, deliberately not papered over.
+framework_sections: [
+  "1", "1.1", "1.2", "1.3", "2", "2.1", "2.2", "2.3",
+  "3", "3.1", "3.2", "3.3", "3.5", "3.6", "4", "4.1", "4.2", "5",
+  "6", "6.1", "6.2", "6.3", "6.4", "6.5",
+  "7", "7.1", "7.2", "7.3", "7.4", "7.5", "8", "9",
+  "10", "10.1", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7",
+  "11", "11.1", "11.2", "11.3", "11.4", "11.5", "11.6", "11.7",
+  "12", "12.1", "12.2", "12.3", "12.4", "12.5", "12.6",
+  "13", "13.1", "13.2", "13.3", "13.4", "13.5", "13.6", "13.7",
+  "14", "16", "16.1", "16.2", "16.3", "17", "18", "19", "20",
+]

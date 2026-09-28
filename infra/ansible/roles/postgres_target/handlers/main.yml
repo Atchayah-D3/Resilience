@@ -1,0 +1,13 @@
+---
+- name: reload database
+  ansible.builtin.systemd_service:
+    name: "{{ node.service }}"
+    state: reloaded
+  when: not initdb_run.changed | default(false)
+
+- name: restart database
+  ansible.builtin.systemd_service:
+    name: "{{ node.service }}"
+    state: restarted
+    daemon_reload: true
+  when: not initdb_run.changed | default(false)

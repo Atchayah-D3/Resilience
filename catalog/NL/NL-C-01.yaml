@@ -1,0 +1,74 @@
+# NL-C-01 -- Immediate process termination (Framework §10.2, Tier 1, P0).
+# Fault injection: kill -9 postmaster under load. Acceptance: rpo_txn == 0;
+# rto_first_write_s <= 60; amcheck_errors == 0.
+#
+# The driver SIGKILLs the whole service cgroup -- postmaster and backends together (Arch §5).
+# Signalling the postmaster alone leaves its backends running, and the service manager then
+# holds the restart until they exit; that wait would be measured as recovery time.
+#
+# This is CRASH RECOVERY, not durability: a process kill leaves the OS page cache intact,
+# so it cannot validate the storage stack (§13.1). NL-D-02 covers that.
+#
+# The Framework gives no steady-state or workload numbers for this row. The values below are
+# re-baselined against measurement (Framework §14 note on check 3): the offered load is set
+# well inside what the qualified environment sustains, so the scenario measures crash
+# recovery rather than the target's throughput ceiling. NEEDS SIGN-OFF.
+id: NL-C-01
+name: Immediate process termination
+tier: node_local
+category: NL-C
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-C is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 150                   # floor, not a throughput target: the load offered is 200/s
+  p99_latency_ms_max: 300        # measured: median p99 4 ms, occasional flush stalls to ~270 ms
+  duration_s: 120
+
+workload:
+  profile: oltp_write_heavy
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 200                  # steady, comfortable load -- enough to expose lost commits
+
+fault:
+  type: process_kill
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:                        # engine capabilities this scenario needs (Arch §8)
+  - transactional_markers
+  - structural_integrity_check
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - rto_to_slo_s
+  - corruption_count
+  - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
+  - starts_unattended
+
+accept:
+  - rpo_txn == 0
+  - rto_first_write_s <= 60
+  - structural_integrity_errors == 0
+
+priority: P0
+
+description: >
+  The postmaster is terminated immediately under marker-instrumented write load. Recovery
+  must be unattended and committed transactions must survive WAL replay. Durability of the
+  storage stack is out of scope here and is covered by the NL-D category (Framework §13.1).

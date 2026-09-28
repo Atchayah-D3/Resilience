@@ -1,0 +1,69 @@
+# Local lab environment (Arch §3.1): the harness runs in this workstation's Linux
+# environment; the target is a VM managed by a local hypervisor.
+name: local-lab
+class: E2
+environment: lab
+
+database:
+  engine: postgresql             # adapter that serves this environment (Arch §8)
+
+storage_class: null              # workstation storage: certifies no storage class
+
+power_control:
+  driver: libvirt                # Arch §3.1 E2: virsh destroy on the hypervisor
+  uri: qemu+ssh://root@172.19.159.252:2222/system
+
+os_ssh:
+  driver: os_ssh                 # process, systemd and filesystem faults over SSH (Arch §5)
+
+noisy_neighbour:
+  injectable: false
+  driver: null
+
+storage_fault:
+  dm_shim: false
+
+reset:
+  driver: none
+
+sla_tier_target: platinum
+
+driver_host:                     # separate from the target (Arch §6.2)
+  host: 172.19.159.252
+  run_dir: /home/gowrihangarar/resilience-runs
+
+nodes:
+  - name: shakti-target-01
+    role: standalone
+    topology_role: primary
+    ssh: {host: 192.168.122.136, port: 22, user: harness}
+    db: {host: 192.168.122.136, port: 5432, dbname: resilience, user: harness}
+    client: {host: 192.168.122.136, port: 5432, dbname: resilience, user: harness}
+    pgdata: /mnt/pgdata/data
+    pg_bin: /opt/shaktidb/bin
+    os_user: postgres
+    service: shaktidb.service
+    log_file: /mnt/pgdata/data/logfile
+    power_domain: shakti-target-01
+    client_source_cidr: 192.168.122.0/24   # traffic is translated on the way to this node
+
+safety:
+  allowlist:
+    hostname_pattern: '^shakti-target-01$'
+    inventory_tag: local-nested-kvm
+  sentinel_table: resilience.harness_target
+
+phase_timeouts_s:
+  reset: 600
+  init: 180
+  baseline: 300
+  pre_fault: 300
+  fault_inject: 120
+  recovery: 900
+  validate: 1800
+  report: 120
+  cleanup: 600
+
+disclosures:
+  - "Target is a VM on a workstation: results certify no product storage class."
+  - "Baseline reset is not configured here: the target is not rolled back to a snapshot before a run."

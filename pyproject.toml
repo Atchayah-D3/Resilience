@@ -1,0 +1,25 @@
+# Technology stack is fixed by the Architecture document §12 -- do not substitute.
+[project]
+name = "resilience"
+version = "0.1.0"
+description = "Resilience test harness for ShaktiDB and DistDB (implements Unified Resilience Testing Framework v1.0)"
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg>=0.29",
+    "asyncssh>=2.14",
+    "pydantic>=2.6,<3",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["catalog*", "resilience_tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"

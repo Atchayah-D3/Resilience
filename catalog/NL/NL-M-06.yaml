@@ -1,0 +1,72 @@
+# NL-M-06 -- Rolling minor-version restart (Framework §10.7, Tier 1, P1).
+# Fault injection: restart under load with -m fast. Acceptance: availability gap <= 5 s per
+# node; rpo_txn == 0.
+#
+# Planned change is in scope because it is a leading source of unplanned outage
+# (Framework §2.3). Unlike NL-C-01 this is a graceful stop and start: the database flushes
+# and shuts down cleanly, so it tests the availability gap, not crash recovery. The restart
+# goes through the service manager; the driver's preflight refuses unless the unit's stop
+# action is a FAST shutdown (a smart shutdown would wait on the workload's connections and
+# test something else). The minor-version binary swap itself is not performed.
+#
+# The Framework gives no steady-state or workload numbers for this row; the values below
+# match NL-C-01 so the two are comparable on the same target. NEEDS SIGN-OFF.
+id: NL-M-06
+name: Rolling minor-version restart
+tier: node_local
+category: NL-M
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-M is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 150
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: oltp_write_heavy
+  concurrency: 64
+  transaction_markers: true      # required for any RPO-measuring scenario (Framework §6.4)
+  rate_tps: 200
+
+fault:
+  type: service_restart
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:                        # engine capabilities this scenario needs (Arch §8)
+  - transactional_markers
+  - structural_integrity_check
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s            # the availability gap: restart requested -> writes accepted
+  - rto_to_slo_s
+  - corruption_count
+  - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
+  - starts_unattended
+
+accept:
+  - rpo_txn == 0
+  - rto_first_write_s <= 5       # Framework §10.7: availability gap <= 5 s per node
+
+priority: P1
+
+description: >
+  The service is restarted under marker-instrumented write load, as during a minor-version
+  upgrade. The stop is graceful, so no committed transaction may be lost and the gap in
+  service must stay within the documented budget. Crash recovery is out of scope here and is
+  covered by the NL-C category.

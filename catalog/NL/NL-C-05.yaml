@@ -1,0 +1,146 @@
+# NL-C-05 -- Repeated crash cycles (Framework §10.2, Tier 1, P1).
+# Fault injection: 10 x (kill -9, restart) at 5 s intervals.
+# Acceptance: recovery_s at cycle 10 <= 1.5 x cycle 1; no cumulative bloat.
+#
+# One crash proves the database recovers. Ten prove it recovers REPEATABLY: that nothing is
+# carried from one crash into the next -- no growing replay, no space left behind. The driver
+# SIGKILLs the whole service cgroup each cycle (Arch §5), waits for a write to succeed again
+# before starting the next, and settles for interval_s so every cycle begins from a
+# comparable state rather than from the tail of the previous recovery.
+#
+# "No cumulative bloat" carries no number in the Framework, so it is defined here as a
+# measurement rather than a judgement, sampled before the first crash and after every cycle:
+#
+#   bloat_ratio                 bytes per live row of the CHURN table at the last cycle over
+#                               the first. REPORTED, NOT GATED -- see the calibration below.
+#   wal_ratio_of_max_wal_size   write-ahead log bytes against the server's OWN max_wal_size,
+#                               read from pg_settings. Checkpoints should hold it near that
+#                               bound; 2.0 is the point past which recycling is not keeping up.
+#
+# WHY BLOAT IS MEASURED BUT NOT GATED. It was gated, at 1.10 and then 1.15, until the
+# threshold was calibrated instead of assumed. Measured on PostgreSQL 17.10 under this
+# scenario's own warm-up and cycle count, three healthy runs against two with autovacuum
+# disabled on the churn table:
+#
+#     healthy  (autovacuum on)    1.0176   1.1463   1.2303
+#     bloating (autovacuum off)   1.2344   1.2356
+#
+# The distributions overlap. The spread among healthy runs is autovacuum PHASE -- whether it
+# happens to fire inside a 50 s window -- not whether the database leaks, and no threshold
+# separates the two. One set above the healthy maximum would pass the genuinely bloating case.
+#
+# The cause is the window, not the instrument: ten cycles at 5 s is ~50 seconds, against an
+# autovacuum naptime of 60 s. Over one oscillation you cannot tell a normal sawtooth from the
+# start of unbounded growth. A real bloat gate needs a longer soak than Framework 10.2
+# specifies, or requires tuning the test environment's configuration (e.g. setting
+# autovacuum_naptime = 5s and autovacuum_vacuum_cost_delay = 0 in postgresql.conf during
+# qualification), which brings healthy bloat_ratio down to <= 1.05 and enables a defensible
+# gate at 1.15.
+#
+# So the figures are reported as evidence -- the per-cycle footprint curve is in the summary
+# and in facts.bloat -- and a human reads them. What is gated is what this window CAN answer:
+# that every cycle recovered, that recovery did not slow down, and that the write-ahead log
+# stayed inside the server's own ceiling.
+#
+# Two dead ends worth not repeating. Comparing against a freshly seeded table measures the
+# warm-up curve: a churned table settles at ~1.12x its seeded density and then plateaus, so
+# the number says only how early the run stopped. And n_dead_tup, which separates the two
+# cases by 8x, is useless after a crash -- PostgreSQL discards its statistics on crash
+# recovery, so it reads ~0 however much garbage is physically on disk. Only bytes survive.
+#
+# The churn workload stays regardless: an append-only load leaves no dead rows at all, and a
+# crash over update and delete traffic is a harder thing to recover than a crash over inserts.
+#
+# The Framework's criterion compares cycle 10 with cycle 1, which passes trivially if cycle 1
+# happened to be slow. recovery_slope_s_per_cycle and recovery_s_median are therefore measured
+# and reported as supporting evidence, without gating the verdict.
+#
+# Recovery time is a function of how much write-ahead log the crash left to replay, and
+# PostgreSQL checkpoints at the end of every recovery -- so each cycle starts from a fresh
+# redo point and replays only the few seconds since. The distance is therefore SAMPLED at each
+# cycle's T0 (pg_control_checkpoint) and reported beside the time, as bytes and as bytes per
+# second. Two cycles' recovery times are comparable only because that work is known; without
+# it the ratio compares process startup with process startup and calls the difference a trend.
+id: NL-C-05
+name: Repeated crash cycles
+tier: node_local
+category: NL-C
+
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-C is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 150                   # floor, not a target: the load offered is 200/s
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: mixed                 # markers (append-only, for RPO) PLUS update/delete churn
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 200
+
+fault:
+  type: process_kill
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+
+repeat:
+  cycles: 10                     # Framework §10.2: 10 x (kill -9, restart)
+  interval_s: 5                  # ... at 5 s intervals, measured from each recovery
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:
+  - transactional_markers
+  - workload_churn               # without it there are no dead rows and bloat cannot fail
+  - structural_integrity_check
+
+measure:
+  - cycles_run
+  - cycles_recovered
+  - recovery_s_first
+  - recovery_s_last
+  - recovery_s_median
+  - recovery_s_max
+  - recovery_ratio_last_over_first
+  - recovery_slope_s_per_cycle    # reported, not gated: catches steady degradation
+  - bloat_ratio                   # reported, not gated: the window cannot separate the cases
+  - wal_ratio_of_max_wal_size
+  - bytes_unexplained_by_rows     # reported: growth the rows do not explain
+  - wal_replayed_bytes_max        # reported: the replay work each crash actually left
+  - wal_replayed_bytes_median
+  - replay_bytes_per_s_min        # reported: recovery normalised by the work it did
+  - rpo_txn                       # reported: data loss across ten crashes
+  - indeterminate_txn
+  - failed_transactions_max_per_cycle
+  - dropped_connections_max_per_cycle
+  - structural_integrity_errors
+  - corruption_count
+
+accept:
+  - cycles_recovered == cycles_run          # every cycle must come back on its own;
+                                            # the count is declared once, in `repeat`
+  - recovery_ratio_last_over_first <= 1.5   # Framework §10.2
+  - wal_ratio_of_max_wal_size <= 2.0        # against the server's own ceiling
+
+priority: P1
+
+description: >
+  The database is killed and left to restart itself ten times in succession, under
+  marker-instrumented write load. Each cycle is measured on its own: the time from the kill
+  to the first accepted write, and the on-disk footprint once service returns. Recovery must
+  not slow down across the ten, and nothing may accumulate on disk that the inserted rows do
+  not explain. Crash recovery of a single failure is covered by NL-C-01.
+
+see_also: [NL-C-01]
