@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 from catalog.schema import Workload
 from resilience_tests.adapters.base import BaseDatabaseAdapter, Capability, DatabaseSession, TransactionOutcome
+from resilience_tests.execution.workload.history_writer import HistoryWriter
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.observability.event_stream import EventStream
 
@@ -111,6 +112,7 @@ class WorkloadDriver:
         workload: Workload,
         journals: MarkerJournals,
         stream: EventStream,
+        history: HistoryWriter | None = None,
     ) -> None:
         if workload.profile not in ("oltp_write_heavy", "mixed") or not workload.transaction_markers:
             raise UnsupportedWorkload(
@@ -137,6 +139,7 @@ class WorkloadDriver:
         self.adapter = adapter
         self.workload = workload
         self.journals = journals
+        self.history = history
         self.stream = stream
         self.limiter = RateLimiter(workload.rate_tps)
         self._churn_rng = random.Random(0xC0FFEE)   # seeded: the same key sequence every run
@@ -233,11 +236,11 @@ class WorkloadDriver:
                     if ever_connected:
                         self._count(reconnects=1)
                     ever_connected = True
-                session = await self._one_transaction(session)
+                session = await self._one_transaction(session, worker_id)
         finally:
             await _discard(session)
 
-    async def _one_transaction(self, session: DatabaseSession) -> DatabaseSession | None:
+    async def _one_transaction(self, session: DatabaseSession, worker_id: int = 0) -> DatabaseSession | None:
         """One marker transaction. Returns the session to reuse, or None if it was lost."""
         await self.limiter.acquire()
         seq, marker_id = self.journals.next_marker()
@@ -247,11 +250,16 @@ class WorkloadDriver:
         tj = time.monotonic()
         await self.journals.written(seq, marker_id, time.time())
         t0 = time.monotonic()
+        t0_mono_ns = time.monotonic_ns()
         journal_ms = (t0 - tj) * 1000
+
+        key = self._churn_rng.randrange(1, self.churn_keys + 1) if self.churn else (seq % 100 + 1)
+        if self.history is not None:
+            self.history.record_invoke(worker_id, key, seq, t0_mono_ns)
+
         try:
             async with asyncio.timeout(TXN_TIMEOUT_S):
                 if self.churn:
-                    key = self._churn_rng.randrange(1, self.churn_keys + 1)
                     # one in CHURN_REPLACE_EVERY replaces the row instead of updating it,
                     # so line pointers churn as well as tuples
                     replace = self._churn_rng.randrange(CHURN_REPLACE_EVERY) == 0
@@ -262,19 +270,28 @@ class WorkloadDriver:
             outcome = TransactionOutcome.UNKNOWN
         except Exception:  # noqa: BLE001 -- anything the adapter did not classify is unknown
             outcome = TransactionOutcome.UNKNOWN
+
+        t_end_ns = time.monotonic_ns()
         if outcome is TransactionOutcome.DEFINITELY_ABORTED:
+            if self.history is not None:
+                self.history.record_fail(worker_id, key, seq, error="aborted", t_mono_ns=t_end_ns)
             self._count(errors=1)
             return session
         if outcome is TransactionOutcome.UNKNOWN:
             # stays in written - acked (indeterminate); the connection was lost or is no
             # longer trustworthy, so it is discarded -- a dropped connection for the client
+            if self.history is not None:
+                self.history.record_info(worker_id, key, seq, error="indeterminate", t_mono_ns=t_end_ns)
             self._count(indeterminate=1, drops=1)
             await _discard(session)
             return None
+
         latency_ms = (time.monotonic() - t0) * 1000
         # 3. only on acknowledgement
         t2 = time.monotonic()
         await self.journals.acknowledged(marker_id, time.time())
+        if self.history is not None:
+            self.history.record_ok(worker_id, key, seq, observed_values=[seq], t_mono_ns=t_end_ns)
         journal_ms += (time.monotonic() - t2) * 1000
         self._count(commits=1, latency_ms=latency_ms, journal_ms=journal_ms)
         return session

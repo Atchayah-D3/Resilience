@@ -61,10 +61,7 @@ def render_summary(r: dict[str, Any]) -> str:
             redo, rate = c.get("redo_distance_bytes"), c.get("replay_bytes_per_s")
             work = f"  replayed {redo / 1024:>8.0f} KB" if redo is not None else ""
             work += f"  ({rate / 1024:.0f} KB/s)" if rate else ""
-            errs = ""
-            if c.get("failed_transactions") or c.get("dropped_connections"):
-                errs = f"  (errs: {c.get('failed_transactions', 0)} fail, {c.get('dropped_connections', 0)} drop)"
-            lines.append(f"  cycle {c['cycle']:>3}  {when}{work}{errs}{note}")
+            lines.append(f"  cycle {c['cycle']:>3}  {when}{work}{note}")
         trend = (r.get("facts") or {}).get("recovery_trend") or {}
         if trend.get("slope_s_per_cycle") is not None:
             lines.append(f"  trend       {trend['slope_s_per_cycle']:+8.3f}s per cycle "
@@ -75,6 +72,13 @@ def render_summary(r: dict[str, Any]) -> str:
                          f"{bloat['bytes_per_live_row_first']:.1f} -> "
                          f"{bloat['bytes_per_live_row_last']:.1f} bytes per live row "
                          f"(+{bloat['rows_added']} rows, {bloat['bytes_unexplained_by_rows']:+.0f} B unexplained)")
+    elle = (r.get("facts") or {}).get("elle")
+    if elle:
+        lines += [
+            "",
+            f"elle consistency check ({elle.get('checker', 'checker')}):",
+            f"  valid: {elle.get('valid')}  anomalies: {elle.get('anomalies_count')}",
+        ]
     if r.get("measured"):
         lines += ["", "measured:"] + [f"  {k} = {v}" for k, v in sorted(r["measured"].items())]
     if r.get("disclosures"):

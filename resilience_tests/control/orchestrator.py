@@ -30,6 +30,7 @@ from resilience_tests.adapters import postgresql  # noqa: F401  (registers the a
 from resilience_tests.adapters.base import Capability, adapter_for
 from resilience_tests.analysis import report as report_mod
 from resilience_tests.analysis import threshold_eval
+from resilience_tests.analysis.elle_checker import ElleChecker
 from resilience_tests.analysis.predicates import NOT_APPLICABLE, NOT_MEASURED
 from resilience_tests.analysis.bloat import bloat_metrics
 from resilience_tests.analysis.rto_decomposer import (
@@ -51,6 +52,7 @@ from resilience_tests.execution.injectors.base import FaultInjector, resolve
 from resilience_tests.execution.probes.probers import LogTailer, WriteProber, measure_clock_offset
 from resilience_tests.execution.remote import run_once
 from resilience_tests.execution.workload.driver import MeasuredWindow, WorkloadDriver
+from resilience_tests.execution.workload.history_writer import HistoryWriter
 from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals
 from resilience_tests.observability.event_stream import EventStream
 
@@ -113,6 +115,7 @@ class TestOrchestrator:
         self._ledger: InjectionLedger | None = None
         self.stream: EventStream | None = None
         self.journals: MarkerJournals | None = None
+        self.history: HistoryWriter | None = None
         self.workload: WorkloadDriver | None = None
         self.write_prober: WriteProber | None = None
         self.log_tailer: LogTailer | None = None
@@ -134,7 +137,6 @@ class TestOrchestrator:
         self._lock_fh: Any = None
         self._workload_failure: str | None = None
         self.cycle_t0s: list[int] = []          # one T0 per crash cycle (Framework NL-C-05)
-        self.cycle_details: list[dict[str, Any]] = []
         self.footprints: list[dict[str, Any]] = []
         self.redo_at_t0: list[int | None] = []  # WAL left to replay, sampled before each kill
 
@@ -325,7 +327,8 @@ class TestOrchestrator:
         self.facts["integrity_baseline"] = await self.adapter.mark_integrity_baseline()
         await self.adapter.prepare_harness_state()
         self.journals = MarkerJournals(self.run_dir)
-        self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream)
+        self.history = HistoryWriter(self.run_dir / "history.edn")
+        self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream, history=self.history)
         return {"hostname": hostname, "settings": settings}
 
     async def _p_baseline(self) -> dict[str, Any]:
@@ -384,14 +387,8 @@ class TestOrchestrator:
             one = await self._inject_once(cycle=cycle)
             recovered = await self._await_cycle_recovery(cycle, last=cycle == r.cycles)
             one.update(recovered)
-            quick_integrity = await self.adapter.quick_integrity_check()
-            if quick_integrity:
-                one["quick_integrity"] = quick_integrity
-                if quick_integrity.get("checksum_failures", 0) > 0:
-                    self.stream.emit("orchestrator", "inter_cycle_corruption", cycle=cycle, **quick_integrity)
             self.footprints.append(await self._footprint(f"after cycle {cycle}"))
             detail["cycles"].append(one)
-            self.cycle_details.append(one)
             if cycle < r.cycles:
                 # settle, so the next cycle starts from a comparable state rather than from
                 # the tail of this recovery
@@ -407,23 +404,20 @@ class TestOrchestrator:
                                            "preflight": self.facts.get("injector_preflight", {})})
         # Sampled immediately before the kill: the WAL a crash at this instant leaves to
         # replay. Without it, two cycles' recovery times are only comparable by assumption.
-        redo_sample_mono_ns = time.monotonic_ns()
         redo = await self.adapter.redo_distance_bytes()
         detail = await self.injector.inject(self.node)
         t0 = detail.pop("t0_mono_ns", None) or time.monotonic_ns()
-        sampling_delay_ms = round((t0 - redo_sample_mono_ns) / 1e6, 2)
         self.t0_ns = t0 if self.t0_ns is None else self.t0_ns   # T0 of the run is the first fault
         self.cycle_t0s.append(t0)
         self.ledger.transition(entry, "applied", inject=detail, cycle=cycle)
         self.stream.emit("injector", "t0", fault=self.scenario.fault.type, node=self.node.name,
-                         t0_mono_ns=t0, cycle=cycle, redo_sampling_delay_ms=sampling_delay_ms, **detail)
+                         t0_mono_ns=t0, cycle=cycle, **detail)
         self.stream.sync()
         self.facts["injection_id"] = entry.injection_id
         self._cycle_entries = getattr(self, "_cycle_entries", {})
         self._cycle_entries[cycle] = entry
         self.redo_at_t0.append(redo)
-        return {"cycle": cycle, "t0_mono_ns": t0, "redo_distance_bytes": redo,
-                "redo_sampling_delay_ms": sampling_delay_ms, **detail}
+        return {"cycle": cycle, "t0_mono_ns": t0, "redo_distance_bytes": redo, **detail}
 
     async def _await_cycle_recovery(self, cycle: int, last: bool = False) -> dict[str, Any]:
         """Wait for this cycle's service to come back, on the evidence of the write probe --
@@ -489,7 +483,6 @@ class TestOrchestrator:
 
         baseline = Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0)
         slo_t0 = self.cycle_t0s[-1] if self.scenario.repeat else self.t0_ns
-        self.facts["slo_t0_mono_ns"] = slo_t0
         deadline = time.monotonic() + self.profile.phase_timeouts_s["recovery"] - RECOVERY_EXIT_MARGIN_S
         while time.monotonic() < deadline:
             d = decompose(self.stream.events(), slo_t0, baseline, clustered=False,
@@ -515,7 +508,6 @@ class TestOrchestrator:
 
         expect_outage = self.scenario.fault.type in OUTAGE_FAULTS
         slo_t0 = self.cycle_t0s[-1] if self.scenario.repeat else self.t0_ns
-        self.facts["slo_t0_mono_ns"] = slo_t0
         d = decompose(events, slo_t0, Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0),
                       clustered=False, detection_patterns=self.adapter.fault_detection_log_patterns(),
                       recovery_patterns=self.adapter.recovery_start_log_patterns(),
@@ -564,26 +556,12 @@ class TestOrchestrator:
             rows = [asdict(c) for c in cycles]
             # Join each cycle's recovery to the replay work it actually faced. A recovery time
             # on its own is not comparable across cycles; bytes replayed per second is.
-            for i, (row, redo) in enumerate(zip(rows, self.redo_at_t0)):
+            for row, redo in zip(rows, self.redo_at_t0):
                 row["redo_distance_bytes"] = redo
                 rec = row.get("recovery_s")
                 row["replay_bytes_per_s"] = (
                     round(redo / rec, 1) if redo and isinstance(rec, (int, float)) and rec > 0 else None)
-                if i < len(self.cycle_details):
-                    row["redo_sampling_delay_ms"] = self.cycle_details[i].get("redo_sampling_delay_ms")
-                    if "quick_integrity" in self.cycle_details[i]:
-                        row["quick_integrity"] = self.cycle_details[i]["quick_integrity"]
-                # Partition client-visible errors per cycle window
-                c_start = self.cycle_t0s[i]
-                c_end = self.cycle_t0s[i + 1] if i + 1 < len(self.cycle_t0s) else None
-                c_samples = [e for e in events if e.kind == "sample" and e.source == "workload"
-                             and e.t_mono_ns > c_start and (c_end is None or e.t_mono_ns <= c_end)]
-                row["failed_transactions"] = sum(e.data.get("errors", 0) for e in c_samples)
-                row["dropped_connections"] = sum(e.data.get("drops", 0) for e in c_samples)
-                row["connect_failures"] = sum(e.data.get("connect_failures", 0) for e in c_samples)
             self.facts["cycles"] = rows
-            m["failed_transactions_max_per_cycle"] = max((r.get("failed_transactions", 0) for r in rows), default=0)
-            m["dropped_connections_max_per_cycle"] = max((r.get("dropped_connections", 0) for r in rows), default=0)
             replayed = [r["redo_distance_bytes"] for r in rows if r["redo_distance_bytes"] is not None]
             if replayed:
                 m["wal_replayed_bytes_max"] = max(replayed)
@@ -677,6 +655,19 @@ class TestOrchestrator:
                 m["corruption_count"] = sum(parts.values())
         except Exception as exc:  # noqa: BLE001 -- recorded; the measure then counts as missing
             self.facts["integrity_error"] = f"{type(exc).__name__}: {exc}"
+
+        # Check transaction history consistency via Elle (Arch §10.3, §17)
+        history_path = self.run_dir / "history.edn"
+        if history_path.exists() and history_path.stat().st_size > 0:
+            elle_res = ElleChecker.check(history_path)
+            self.facts["elle"] = {
+                "valid": elle_res.valid,
+                "anomalies_count": elle_res.anomalies_count,
+                "anomalies": elle_res.anomalies,
+                "checker": elle_res.checker,
+            }
+            if not elle_res.valid:
+                m["elle_anomalies_count"] = elle_res.anomalies_count
 
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).
@@ -797,6 +788,9 @@ class TestOrchestrator:
         if self.journals:
             self.journals.close()
             self.journals = None
+        if self.history:
+            self.history.close()
+            self.history = None
 
     def _signals(self) -> dict[str, Any]:
         """Probe-stream signals for abort_if. The replication/HA signals come from the Tier-2

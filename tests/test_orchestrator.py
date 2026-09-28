@@ -7,6 +7,7 @@ ledger says an injection is undone, and which failures stop a verdict being issu
 """
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -193,6 +194,34 @@ def test_kill_run_measures_the_real_outage_and_passes(env):
     rto = results["measured"]["rto_first_write_s"]
     assert OUTAGE_S - 0.05 <= rto <= OUTAGE_S + 1.0
     assert results["facts"]["outage_observed"] is True and results["measured"]["starts_unattended"] is True
+
+
+def test_checkpoint_crash_nlc02_passes_verdict(env):
+    results = run(env, "NL-C-02")
+    assert results["status"] == "passed", why(results)
+    assert results["measured"]["corruption_count"] == 0
+    assert results["measured"]["structural_integrity_errors"] == 0
+    assert results["measured"]["starts_unattended"] is True
+    assert results["measured"]["rpo_txn"] == 0
+
+
+def test_large_transaction_crash_nlc03_passes_verdict(env):
+    results = run(env, "NL-C-03")
+    assert results["status"] == "passed", why(results)
+    assert results["measured"]["corruption_count"] == 0
+    assert results["measured"]["structural_integrity_errors"] == 0
+    assert results["measured"]["starts_unattended"] is True
+    assert results["measured"]["rpo_txn"] == 0
+    assert "elle" in results["facts"]
+    assert results["facts"]["elle"]["valid"] is True
+    hist_file = Path(results["evidence_dir"]) / "history.edn"
+    assert hist_file.stat().st_size > 0
+    summary_file = Path(results["evidence_dir"]) / "summary.txt"
+    print(f"\n[LOCAL TEST NL-C-03 RUN: {results['run_id']}]")
+    print(f"history.edn lines: {len(hist_file.read_text().splitlines())}")
+    print(f"elle facts: {results['facts']['elle']}")
+    print(f"\n--- summary.txt ---\n{summary_file.read_text()}")
+
 
 
 def test_kill_that_interrupted_nothing_cannot_pass(env):
