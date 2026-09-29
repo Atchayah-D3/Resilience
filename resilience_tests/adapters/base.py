@@ -165,11 +165,6 @@ class BaseDatabaseAdapter(ABC):
         """Structural and checksum verification, as far as the engine supports it. Counters
         are reported relative to `mark_integrity_baseline` when it was called."""
 
-    async def quick_integrity_check(self) -> dict[str, Any]:
-        """A sub-second integrity check (e.g. cumulative checksum failure delta) suitable for
-        running between repeated cycles without delaying recovery cadence. Returns {} if unsupported."""
-        return {}
-
     @abstractmethod
     async def server_version(self) -> str: ...
 
@@ -188,6 +183,19 @@ class BaseDatabaseAdapter(ABC):
         """Regexes matching the lines a replacement process writes when it begins recovering
         (e.g. crash recovery after an unclean stop). Reported as `recovery_started_s`."""
         return ()
+
+    async def create_index_concurrently(self, table: str, column: str, index_name: str) -> None:
+        """Launch a concurrent index build. Used by NL-C-06."""
+        pass
+
+    async def get_index_status(self, index_name: str) -> dict[str, Any] | None:
+        """Check index existence and validity in catalog. Returns {'is_valid': bool, 'is_ready': bool} or None."""
+        return None
+
+    async def cleanup_index(self, index_name: str) -> bool:
+        """Drop or rebuild an index. Returns True if cleanup succeeded."""
+        return True
+
 
 
 # --- registry ----------------------------------------------------------------------------

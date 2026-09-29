@@ -405,7 +405,16 @@ class TestOrchestrator:
         # Sampled immediately before the kill: the WAL a crash at this instant leaves to
         # replay. Without it, two cycles' recovery times are only comparable by assumption.
         redo = await self.adapter.redo_distance_bytes()
+        index_task = None
+        if self.scenario.id == "NL-C-06" or getattr(self.scenario.fault, "timing", "") == "during_concurrent_index_build":
+            index_task = asyncio.create_task(
+                self.adapter.create_index_concurrently("resilience.markers", "ts", "idx_nlc06_concurrent")
+            )
+            await asyncio.sleep(0.05)
+
         detail = await self.injector.inject(self.node)
+        if index_task is not None and not index_task.done():
+            index_task.cancel()
         t0 = detail.pop("t0_mono_ns", None) or time.monotonic_ns()
         self.t0_ns = t0 if self.t0_ns is None else self.t0_ns   # T0 of the run is the first fault
         self.cycle_t0s.append(t0)
@@ -417,6 +426,7 @@ class TestOrchestrator:
         self._cycle_entries = getattr(self, "_cycle_entries", {})
         self._cycle_entries[cycle] = entry
         self.redo_at_t0.append(redo)
+
         return {"cycle": cycle, "t0_mono_ns": t0, "redo_distance_bytes": redo, **detail}
 
     async def _await_cycle_recovery(self, cycle: int, last: bool = False) -> dict[str, Any]:
@@ -668,6 +678,14 @@ class TestOrchestrator:
             }
             if not elle_res.valid:
                 m["elle_anomalies_count"] = elle_res.anomalies_count
+
+        if self.scenario.id == "NL-C-06" or getattr(self.scenario.fault, "timing", "") == "during_concurrent_index_build":
+            idx_status = await self.adapter.get_index_status("idx_nlc06_concurrent")
+            rebuild_ok = await self.adapter.cleanup_index("idx_nlc06_concurrent")
+            self.facts["concurrent_index"] = {
+                "post_recovery_status": idx_status,
+                "cleanup_or_rebuild_succeeded": rebuild_ok,
+            }
 
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).

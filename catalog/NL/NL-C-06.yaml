@@ -1,0 +1,73 @@
+# NL-C-06 -- Crash during CREATE INDEX CONCURRENTLY (Framework §10.2, Tier 1, P1).
+# Fault injection: kill -9 mid-build during concurrent index creation.
+# Acceptance: rpo_txn == 0; structural_integrity_errors == 0; starts_unattended == true.
+#
+# A background concurrent index build is interrupted by SIGKILL. The interrupted index must
+# be left marked INVALID without corrupting existing relations, and crash recovery must restore
+# normal write operation unattended (Arch §5).
+#
+# Durability of the underlying storage stack is covered by category NL-D (Framework §13.1).
+id: NL-C-06
+name: Crash during CREATE INDEX CONCURRENTLY
+tier: node_local
+category: NL-C
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-C is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 150                   # floor, not a throughput target
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: oltp_write_heavy
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 200
+
+fault:
+  type: process_kill
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:                        # engine capabilities this scenario needs (Arch §8)
+  - transactional_markers
+  - structural_integrity_check
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - rto_to_slo_s
+  - corruption_count
+  - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
+  - starts_unattended
+
+accept:
+  - starts_unattended == true
+  - rpo_txn == 0
+  - corruption_count == 0
+  - structural_integrity_errors == 0
+
+priority: P1
+
+description: >
+  The primary database is killed via SIGKILL in the middle of a CREATE INDEX CONCURRENTLY
+  build operation under active transaction load. Crash recovery must complete cleanly,
+  leaving the table accessible and structurally intact. Durability of the storage stack is
+  covered by category NL-D (Framework §13.1).
+
+see_also: [NL-C-01, NL-C-05]

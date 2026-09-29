@@ -254,6 +254,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         conn = await self._connect(timeout_s=120.0)   # the churn seed is 20k rows
         try:
             await conn.execute(HARNESS_DDL)
+            await conn.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_nlc06_concurrent")
             await conn.execute(TRUNCATE)
             # Seeded every run, after the truncate: the churn table starts from a freshly
             # written, unfragmented state, so the first footprint sample is a real floor and
@@ -262,6 +263,58 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             await conn.execute("VACUUM (ANALYZE) resilience.churn")
         finally:
             await conn.close()
+
+    async def create_index_concurrently(self, table: str, column: str, index_name: str) -> None:
+        """Launch a CREATE INDEX CONCURRENTLY statement. When crash occurs mid-build, this will raise
+        a connection error which is expected."""
+        conn = await self._connect(timeout_s=120.0, command_timeout=None)
+        try:
+            await conn.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} ON {table} ({column})")
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+    async def get_index_status(self, index_name: str) -> dict[str, Any] | None:
+        """Query pg_class and pg_index to inspect whether index exists, and if it is marked valid/ready."""
+        try:
+            conn = await self._connect(timeout_s=10.0)
+        except Exception:
+            return None
+        try:
+            row = await conn.fetchrow(
+                "SELECT c.relname, i.indisvalid, i.indisready "
+                "FROM pg_class c JOIN pg_index i ON c.oid = i.indexrelid "
+                "WHERE c.relname = $1",
+                index_name,
+            )
+            if row:
+                return {"name": row["relname"], "is_valid": row["indisvalid"], "is_ready": row["indisready"]}
+            return None
+        except Exception:
+            return None
+        finally:
+            await conn.close()
+
+    async def cleanup_index(self, index_name: str) -> bool:
+        """Drop the index concurrently or directly. Returns True if dropped or non-existent."""
+        try:
+            conn = await self._connect(timeout_s=30.0)
+        except Exception:
+            return False
+        try:
+            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
+            return True
+        except Exception:
+            try:
+                await conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+                return True
+            except Exception:
+                return False
+        finally:
+            await conn.close()
+
 
     async def redo_distance_bytes(self) -> int | None:
         try:
@@ -366,16 +419,6 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
 
     def integrity_databases(self) -> list[str]:
         return list(self.node.integrity_databases or [self.node.db.dbname])
-
-    async def quick_integrity_check(self) -> dict[str, Any]:
-        """Query pg_stat_database.checksum_failures to verify no block corruptions occurred
-        during this cycle, taking < 1 ms without the cost of a full pg_amcheck."""
-        try:
-            stats = await self._checksum_stats()
-            failures = checksum_failures_since(self._checksum_baseline, stats)
-            return {"checksum_failures": failures, "ok": failures == 0}
-        except Exception as exc:  # noqa: BLE001
-            return {"error": str(exc), "ok": False}
 
     async def integrity_check(self, timeout_s: float) -> IntegrityResult:
         """pg_amcheck --heapallindexed over the configured databases (Arch §10.1, Framework

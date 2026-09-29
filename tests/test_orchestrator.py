@@ -223,6 +223,18 @@ def test_large_transaction_crash_nlc03_passes_verdict(env):
     print(f"\n--- summary.txt ---\n{summary_file.read_text()}")
 
 
+def test_concurrent_index_crash_nlc06_passes_verdict(env):
+    results = run(env, "NL-C-06")
+    assert results["status"] == "passed", why(results)
+    assert results["measured"]["corruption_count"] == 0
+    assert results["measured"]["structural_integrity_errors"] == 0
+    assert results["measured"]["starts_unattended"] is True
+    assert results["measured"]["rpo_txn"] == 0
+    assert "concurrent_index" in results["facts"]
+    assert results["facts"]["concurrent_index"]["cleanup_or_rebuild_succeeded"] is True
+
+
+
 
 def test_kill_that_interrupted_nothing_cannot_pass(env):
     """Was: rto_first_write_s was the first write after T0 -- ~0.2 s -- and the run passed."""
