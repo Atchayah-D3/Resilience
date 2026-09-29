@@ -1,0 +1,76 @@
+# NL-C-02 -- Crash during checkpoint (Framework §10.2, Tier 1, P0).
+# Fault injection: kill -9 while the checkpointer is active.
+# Acceptance: corruption_count == 0; recovery completes unattended; rpo_txn == 0; structural_integrity_errors == 0.
+#
+# A checkpoint flushes dirty shared buffers to disk, syncs relation files, and advances the
+# control file's redo point. Terminating the service immediately with SIGKILL while the
+# checkpointer is actively writing/syncing tests that crash recovery properly resumes from
+# the prior valid checkpoint's redo point, replays all intervening WAL, repairs any torn
+# or partial page writes via full-page writes (FPW), and recovers unattended without corruption
+# (Framework §10.2, Arch §5).
+#
+# Durability of the underlying storage stack is covered by category NL-D (Framework §13.1).
+id: NL-C-02
+name: Crash during checkpoint
+tier: node_local
+category: NL-C
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-C is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 150                   # floor, not a throughput target: the load offered is 200/s
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: oltp_write_heavy
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 200
+
+fault:
+  type: process_kill
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:                        # engine capabilities this scenario needs (Arch §8)
+  - transactional_markers
+  - structural_integrity_check
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - rto_to_slo_s
+  - corruption_count
+  - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
+  - starts_unattended
+
+accept:
+  - corruption_count == 0
+  - starts_unattended == true
+  - rpo_txn == 0
+  - structural_integrity_errors == 0
+
+priority: P0
+
+description: >
+  The primary database postmaster and checkpointer are terminated immediately with SIGKILL
+  while a checkpoint is actively in progress under write load. Recovery must complete unattended,
+  replay the write-ahead log from the prior valid checkpoint's redo point, resolve any torn pages
+  without corruption, and preserve all acknowledged transactions (Framework §10.2, Arch §5).
+  Durability of the storage stack is covered by category NL-D (Framework §13.1).
+
+see_also: [NL-C-01, NL-C-03]

@@ -6,8 +6,10 @@ page-checksum counters and the durability settings. The rest of the harness know
 
 from __future__ import annotations
 
+import asyncio
 import re
 import shlex
+import time
 from typing import Any
 
 import asyncpg
@@ -43,6 +45,10 @@ CREATE TABLE IF NOT EXISTS resilience.churn (
     v       bigint NOT NULL DEFAULT 0,
     ts      timestamptz NOT NULL DEFAULT clock_timestamp(),
     payload text NOT NULL
+) WITH (
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_vacuum_threshold = 50,
+    autovacuum_vacuum_cost_delay = 0
 );
 CREATE INDEX IF NOT EXISTS churn_v_idx ON resilience.churn (v);
 """
@@ -230,6 +236,8 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
     def __init__(self, node: Node) -> None:
         super().__init__(node)
         self._checksum_baseline: ChecksumStats | None = None
+        self._scenario_config_applied: dict[str, str] = {}
+        self._scenario_config_error: str | None = None
 
     async def _connect(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0,
                        command_timeout: float | None = _SAME_AS_CONNECT) -> asyncpg.Connection:
@@ -251,6 +259,20 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         return PostgreSQLSession(await self._connect(endpoint or self.node.client, timeout_s, command_timeout=None))
 
     async def prepare_harness_state(self) -> None:
+        # Pre-grant required roles to harness user if running against a cluster with SSH access.
+        # PostgreSQL 15+ restricts CHECKPOINT to superusers and members of 'pg_checkpoint',
+        # and pg_stat_activity detailed monitoring to 'pg_read_all_stats'.
+        try:
+            async with RemoteHost(self.node.ssh) as host:
+                grant_cmd = (
+                    f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -p {self.node.db.port} "
+                    f"-d {shlex.quote(self.node.db.dbname)} -c "
+                    f"{shlex.quote(f'GRANT pg_checkpoint, pg_read_all_stats TO {self.node.db.user};')}"
+                )
+                await host.run(as_user(self.node.os_user, grant_cmd), timeout_s=10.0, check=False)
+        except Exception:
+            pass  # Best effort: fake adapters, unit tests, or environments without SSH
+
         conn = await self._connect(timeout_s=120.0)   # the churn seed is 20k rows
         try:
             await conn.execute(HARNESS_DDL)
@@ -420,6 +442,353 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
     def integrity_databases(self) -> list[str]:
         return list(self.node.integrity_databases or [self.node.db.dbname])
 
+    # Both idle states of the checkpointer process. The poll loop must wait until the
+    # checkpointer leaves ALL of these before declaring it "active". CheckpointerMain is the
+    # main-loop sleep when no checkpoint is pending; CheckpointDelay is the inter-checkpoint
+    # sleep. Either one means the checkpointer is NOT flushing dirty buffers.
+    _CHECKPOINTER_IDLE_EVENTS = frozenset({"CheckpointerMain", "CheckpointDelay"})
+
+    # Wait events that positively confirm the checkpointer is doing checkpoint I/O.
+    # We require one of these rather than merely "not idle", so a transient NULL or an
+    # unrecognised future event does not produce a false positive.
+    _CHECKPOINTER_ACTIVE_EVENTS = frozenset({
+        "CheckpointWriteDelay",   # Timeout: throttling between buffer writes
+        "CheckpointSync",         # IO: syncing relation files to storage (older PG)
+        "DataFileSync",           # IO: syncing relation files to storage (PG 10+)
+        "DataFileWrite",          # IO: writing data pages
+        "WalSync",                # IO: flushing WAL during checkpoint
+        "WALSync",                # IO: capitalization variation
+        "SlruWrite",              # IO: writing SLRU pages
+        "SlruSync",               # IO: syncing SLRU pages
+        "SLRUSync",               # IO: capitalization variation
+        "ControlFileWrite",       # IO: writing control file
+        "ControlFileSync",        # IO: syncing control file
+        "ControlFileSyncUpdate",  # IO: updating control file
+        "BufFileWrite",           # IO: writing temp buffers (rare during checkpoint)
+    })
+    _CHECKPOINTER_ACTIVE_TYPES = frozenset({"IO", "Timeout"})
+
+    async def trigger_checkpoint_and_await_active(self, timeout_s: float = 10.0) -> dict[str, Any]:
+        """Trigger a checkpoint under the current write workload and deterministically synchronize
+        until the checkpointer process is actively writing/syncing buffers (Arch §5, Framework §10.2).
+
+        In industry-standard resilience engineering, guessing sleep intervals is replaced by
+        observing internal state transitions. The checkpointer sits in one of two idle states
+        (CheckpointerMain or CheckpointDelay). Under write load, issuing CHECKPOINT wakes it,
+        transitioning it to active buffer flushing and syncing (wait_event_type IO or Timeout with
+        events like CheckpointWriteDelay, CheckpointSync, DataFileWrite). We capture pre-checkpoint
+        LSN, start an asynchronous CHECKPOINT, and poll pg_stat_activity until the checkpointer is
+        confirmed active. If the timeout expires without seeing active I/O, we report
+        checkpointer_active=False so the orchestrator can abort (fail closed).
+        """
+        baseline_cp: dict[str, Any] = {}
+        checkpointer_pid: int | None = None
+        stat_table: str | None = "pg_stat_checkpointer"
+        buf_col: str = "buffers_written"
+        baseline_buffers: int | None = None
+        baseline_io_writes: int | None = None  # pg_stat_io: immediate per-IO tracking
+
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                "SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE backend_type = 'checkpointer'"
+            )
+            if row and row["pid"]:
+                checkpointer_pid = int(row["pid"])
+            try:
+                cp_row = await conn.fetchrow("SELECT checkpoint_lsn, redo_lsn, checkpoint_time::text FROM pg_control_checkpoint()")
+                if cp_row:
+                    baseline_cp = dict(cp_row)
+            except Exception:
+                pass
+
+            # Sample baseline buffers written to enable quantitative progress verification
+            try:
+                val = await conn.fetchval("SELECT buffers_written FROM pg_stat_checkpointer")
+                if val is not None:
+                    baseline_buffers = int(val)
+            except Exception:
+                stat_table = "pg_stat_bgwriter"
+                buf_col = "buffers_checkpoint"
+                try:
+                    val = await conn.fetchval("SELECT buffers_checkpoint FROM pg_stat_bgwriter")
+                    if val is not None:
+                        baseline_buffers = int(val)
+                except Exception:
+                    stat_table = None
+
+            # pg_stat_io tracks individual write operations immediately (not batched post-
+            # checkpoint like pg_stat_checkpointer.buffers_written), so it provides a reliable
+            # secondary instrument even for small working sets where the cumulative counter
+            # hasn't been flushed to shared memory yet.
+            try:
+                val = await conn.fetchval(
+                    "SELECT writes FROM pg_stat_io "
+                    "WHERE backend_type = 'checkpointer' AND context = 'normal' AND object = 'relation'"
+                )
+                if val is not None:
+                    baseline_io_writes = int(val)
+            except Exception:
+                pass  # pg_stat_io may not exist on older PG or custom builds
+
+            self._checkpoint_baseline = baseline_cp
+            self._checkpointer_pid = checkpointer_pid
+        finally:
+            await conn.close()
+
+        # Dedicated connection executing CHECKPOINT asynchronously
+        cp_conn = await self._connect()
+        self._checkpoint_conn = cp_conn
+
+        # Poll connection established in advance to avoid connection latency delaying detection
+        poll_conn = await self._connect()
+
+        checkpoint_error: str | None = None
+
+        async def _run_checkpoint() -> str:
+            nonlocal checkpoint_error
+            try:
+                await cp_conn.execute("CHECKPOINT")
+            except Exception as e:
+                err_str = str(e)
+                checkpoint_error = err_str
+                # If SQL connection lacks privileges (e.g. pg_checkpoint role not granted to harness user),
+                # attempt to grant role and trigger CHECKPOINT over SSH as cluster OS user (postgres).
+                if "permission denied" in err_str.lower() or "insufficientprivilege" in err_str.lower():
+                    try:
+                        async with RemoteHost(self.node.ssh) as host:
+                            grant_cmd = (
+                                f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -p {self.node.db.port} "
+                                f"-d {shlex.quote(self.node.db.dbname)} -c "
+                                f"{shlex.quote(f'GRANT pg_checkpoint, pg_read_all_stats TO {self.node.db.user};')}"
+                            )
+                            await host.run(as_user(self.node.os_user, grant_cmd), timeout_s=10.0, check=False)
+                            cp_cmd = (
+                                f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -p {self.node.db.port} "
+                                f"-d {shlex.quote(self.node.db.dbname)} -c 'CHECKPOINT;'"
+                            )
+                            r = await host.run(as_user(self.node.os_user, cp_cmd), timeout_s=30.0, check=False)
+                            if r.exit_status == 0:
+                                checkpoint_error = None
+                                return "completed"
+                            checkpoint_error = f"{err_str} (SSH fallback psql exit {r.exit_status}: {r.stderr.strip()})"
+                    except Exception as ssh_exc:
+                        checkpoint_error = f"{err_str} (SSH fallback failed: {ssh_exc})"
+                return checkpoint_error or "completed"
+            return "completed"
+
+        self._checkpoint_task = asyncio.create_task(_run_checkpoint())
+
+        # Poll until checkpointer is confirmed active (doing checkpoint I/O), or timeout.
+        active_event: str | None = None
+        active_type: str | None = None
+        buffers_flushed: int | None = None
+        io_writes_delta: int | None = None
+        confirmed_active = False
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        try:
+            while asyncio.get_running_loop().time() < deadline:
+                # Early abort if CHECKPOINT command errored out
+                if self._checkpoint_task.done():
+                    res = self._checkpoint_task.result()
+                    if res != "completed" and checkpoint_error:
+                        return {
+                            "checkpointer_active": False,
+                            "error": f"CHECKPOINT failed: {checkpoint_error}",
+                            "checkpointer_pid": checkpointer_pid,
+                            "wait_event_type": active_type,
+                            "wait_event": active_event,
+                            "buffers_written_during_cp": None,
+                            "prior_checkpoint": baseline_cp,
+                            "t_active_mono_ns": time.monotonic_ns(),
+                        }
+
+                row = None
+                current_buffers: int | None = None
+                current_io_writes: int | None = None
+                if stat_table and checkpointer_pid:
+                    try:
+                        row = await poll_conn.fetchrow(
+                            f"SELECT a.wait_event_type, a.wait_event, c.{buf_col} AS buffers "
+                            f"FROM pg_stat_activity a, {stat_table} c "
+                            f"WHERE a.pid = $1",
+                            checkpointer_pid,
+                        )
+                        if row and "buffers" in row and row["buffers"] is not None:
+                            current_buffers = int(row["buffers"])
+                    except Exception:
+                        row = None
+                # pg_stat_io: immediate per-IO write tracking (not batched post-checkpoint)
+                if baseline_io_writes is not None:
+                    try:
+                        io_val = await poll_conn.fetchval(
+                            "SELECT writes FROM pg_stat_io "
+                            "WHERE backend_type = 'checkpointer' AND context = 'normal' AND object = 'relation'"
+                        )
+                        if io_val is not None:
+                            current_io_writes = int(io_val)
+                    except Exception:
+                        pass
+
+                if not row:
+                    if checkpointer_pid:
+                        row = await poll_conn.fetchrow(
+                            "SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
+                            checkpointer_pid,
+                        )
+                    else:
+                        row = await poll_conn.fetchrow(
+                            "SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE backend_type = 'checkpointer'"
+                        )
+                        if row and row["pid"]:
+                            checkpointer_pid = int(row["pid"])
+                            self._checkpointer_pid = checkpointer_pid
+                    if row and "buffers" in row and row["buffers"] is not None:
+                        current_buffers = int(row["buffers"])
+
+                if row:
+                    w_type = row["wait_event_type"]
+                    w_event = row["wait_event"]
+                    buffers_delta = (
+                        (current_buffers - baseline_buffers)
+                        if (current_buffers is not None and baseline_buffers is not None)
+                        else None
+                    )
+                    io_delta = (
+                        (current_io_writes - baseline_io_writes)
+                        if (current_io_writes is not None and baseline_io_writes is not None)
+                        else None
+                    )
+
+                    # 1. Positive proof: checkpointer is in a known active I/O wait event
+                    if w_event in self._CHECKPOINTER_ACTIVE_EVENTS:
+                        active_type = w_type
+                        active_event = w_event
+                        buffers_flushed = buffers_delta
+                        io_writes_delta = io_delta
+                        confirmed_active = True
+                        break
+
+                    # 2. Positive proof: wait_event_type is IO or Timeout and not idle
+                    if (w_type in self._CHECKPOINTER_ACTIVE_TYPES
+                            and w_event not in self._CHECKPOINTER_IDLE_EVENTS):
+                        active_type = w_type
+                        active_event = w_event
+                        buffers_flushed = buffers_delta
+                        io_writes_delta = io_delta
+                        confirmed_active = True
+                        break
+
+                    # 3. Positive quantitative proof: checkpointer has genuinely written
+                    #    buffers (stat counter) or IO operations (pg_stat_io)
+                    if (buffers_delta is not None and buffers_delta > 0) or \
+                       (io_delta is not None and io_delta > 0):
+                        active_type = w_type
+                        active_event = w_event
+                        buffers_flushed = buffers_delta
+                        io_writes_delta = io_delta
+                        confirmed_active = True
+                        break
+
+                    # NOTE: A NULL/NULL wait event (running on CPU) is intentionally NOT treated
+                    # as active unless confirmed by buffers_delta > 0, because the checkpointer may be
+                    # running its main loop initialization before flushing any buffers.
+                await asyncio.sleep(0.005)  # 5ms poll — fast enough to catch the transition
+        finally:
+            await poll_conn.close()
+
+        err_msg: str | None = None
+        if not confirmed_active:
+            if checkpoint_error:
+                err_msg = f"CHECKPOINT failed: {checkpoint_error}"
+            elif self._checkpoint_task.done() and self._checkpoint_task.result() == "completed":
+                err_msg = "CHECKPOINT finished before an active write/sync wait event or buffer flush was sampled"
+            else:
+                err_msg = f"checkpointer timed out waiting for active state (last wait event: {active_event or 'CheckpointerMain'})"
+
+        return {
+            "checkpointer_active": confirmed_active,
+            "checkpointer_pid": checkpointer_pid,
+            "error": err_msg,
+            "wait_event_type": active_type,
+            "wait_event": active_event,
+            "buffers_written_during_cp": buffers_flushed,
+            "io_writes_during_cp": io_writes_delta,
+            "prior_checkpoint": baseline_cp,
+            "t_active_mono_ns": time.monotonic_ns(),
+        }
+
+    async def verify_checkpoint_aborted(self) -> dict[str, Any]:
+        """Verify that the in-flight checkpoint was aborted by the crash and that recovery
+        replayed WAL from the prior valid checkpoint's REDO point.
+
+        Verification logic: after crash recovery, pg_control_checkpoint() reports the
+        end-of-recovery checkpoint. If the in-flight checkpoint had actually completed before
+        the kill arrived, pg_control's checkpoint_lsn would have advanced to a value BETWEEN
+        the pre-kill baseline and the end-of-recovery checkpoint. We compare the post-recovery
+        checkpoint_time against the pre-kill checkpoint_time: if the post-recovery checkpoint
+        is newer than the pre-kill one AND the pre-kill checkpoint_lsn is still the most recent
+        checkpoint before the end-of-recovery one, the in-flight checkpoint was indeed aborted.
+
+        If no baseline was captured (e.g. pg_control_checkpoint not available), we cannot verify
+        and report checkpoint_aborted as None (unknown) rather than a false True.
+        """
+        if hasattr(self, "_checkpoint_task"):
+            self._checkpoint_task.cancel()
+        if hasattr(self, "_checkpoint_conn"):
+            try:
+                await self._checkpoint_conn.close()
+            except Exception:
+                pass
+
+        baseline = getattr(self, "_checkpoint_baseline", None)
+        detail: dict[str, Any] = {}
+        try:
+            conn = await self._connect()
+            try:
+                row = await conn.fetchrow(
+                    "SELECT checkpoint_lsn, redo_lsn, checkpoint_time::text FROM pg_control_checkpoint()"
+                )
+                if row:
+                    current_cp = dict(row)
+                    detail["current_checkpoint"] = current_cp
+                    if baseline:
+                        detail["prior_checkpoint"] = baseline
+                        # The pre-kill checkpoint_lsn is what was in pg_control BEFORE we
+                        # issued CHECKPOINT. After crash recovery, pg_control holds the
+                        # end-of-recovery checkpoint. If the in-flight checkpoint had
+                        # completed, there would be an intermediate checkpoint_lsn between
+                        # the baseline and the end-of-recovery one. Since crash recovery
+                        # replays from the redo_lsn of the LAST COMPLETED checkpoint, we
+                        # check: did the post-recovery redo_lsn advance past the baseline
+                        # checkpoint_lsn? If so, the baseline was still the last valid
+                        # checkpoint (the in-flight one was aborted).
+                        baseline_cp_lsn = baseline.get("checkpoint_lsn")
+                        current_cp_lsn = current_cp.get("checkpoint_lsn")
+                        current_redo_lsn = current_cp.get("redo_lsn")
+                        if baseline_cp_lsn is not None and current_cp_lsn is not None:
+                            # Both are ints (pg_lsn cast to bigint by asyncpg)
+                            aborted = int(current_cp_lsn) > int(baseline_cp_lsn)
+                            detail["checkpoint_aborted"] = aborted
+                            if current_redo_lsn is not None:
+                                detail["redo_advanced"] = int(current_redo_lsn) > int(baseline_cp_lsn)
+                        else:
+                            # Cannot compare: report unknown rather than false True
+                            detail["checkpoint_aborted"] = None
+                            detail["note"] = "LSN comparison not possible: missing baseline or current checkpoint_lsn"
+                    else:
+                        detail["checkpoint_aborted"] = None
+                        detail["note"] = "no pre-kill checkpoint baseline was captured"
+                else:
+                    detail["checkpoint_aborted"] = None
+                    detail["note"] = "pg_control_checkpoint() returned no data after recovery"
+            finally:
+                await conn.close()
+        except Exception as exc:
+            detail["error"] = str(exc)
+            detail["checkpoint_aborted"] = None
+        return detail
+
     async def integrity_check(self, timeout_s: float) -> IntegrityResult:
         """pg_amcheck --heapallindexed over the configured databases (Arch §10.1, Framework
         NL-I-07). Runs as the cluster's OS user over SSH, so the harness role needs no
@@ -465,3 +834,172 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             detail={"exit_status": result.exit_status, "databases": databases,
                     "checksum_baseline_taken": baseline is not None},
         )
+
+    async def configure_for_scenario(self, scenario_id: str) -> dict[str, str]:
+        """Apply temporary configuration specific to a scenario before workload starts.
+
+        For NL-C-05 (Repeated crash cycles): Option A tunes autovacuum (autovacuum_naptime = 5s,
+        autovacuum_vacuum_cost_delay = 0) so autovacuum cycles rapidly within the ~50s test window.
+        This bounds healthy bloat to <= 1.05 and enables a strict, defensible acceptance gate
+        at bloat_ratio <= 1.15.
+
+        Settings are written to postgresql.auto.conf (ALTER SYSTEM) so they persist across all
+        10 SIGKILL crash restarts during the run, and are restored cleanly in
+        restore_scenario_configuration() at cleanup.
+
+        For other scenarios: any leftover autovacuum tuning from a previous run is actively
+        cleaned up to ensure baseline and recovery are not contaminated."""
+        if scenario_id != "NL-C-05":
+            await self.cleanup_leftover_configuration()
+            return {}
+        try:
+            conn = await self._connect(timeout_s=10.0)
+            try:
+                naptime = await conn.fetchval("SHOW autovacuum_naptime")
+                cost_delay = await conn.fetchval("SHOW autovacuum_vacuum_cost_delay")
+                self._scenario_config_applied = {
+                    "autovacuum_naptime": str(naptime),
+                    "autovacuum_vacuum_cost_delay": str(cost_delay),
+                }
+                await conn.execute("ALTER SYSTEM SET autovacuum_naptime = '5s'")
+                await conn.execute("ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '0'")
+                await conn.execute("SELECT pg_reload_conf()")
+                return {"autovacuum_naptime": "5s", "autovacuum_vacuum_cost_delay": "0"}
+            finally:
+                await conn.close()
+        except Exception as exc:
+            # Fallback to SSH execution as os_user (postgres superuser). Each ALTER SYSTEM
+            # must run as its own statement: psql -c wraps a multi-statement string in a
+            # single implicit transaction, and ALTER SYSTEM refuses to run inside one.
+            try:
+                async with RemoteHost(self.node.ssh) as host:
+                    psql = shlex.quote(self.node.pg_bin + '/psql')
+                    statements = (
+                        "ALTER SYSTEM SET autovacuum_naptime = '5s';",
+                        "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '0';",
+                        "SELECT pg_reload_conf();",
+                    )
+                    parts = [
+                        f"{psql} -X -p {self.node.db.port} "
+                        f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(stmt)}"
+                        for stmt in statements
+                    ]
+                    cmd = "cd /tmp && " + " && ".join(parts)
+                    r = await host.run(as_user(self.node.os_user, cmd), timeout_s=15.0, check=False)
+                    if r.exit_status == 0:
+                        self._scenario_config_applied = {
+                            "autovacuum_naptime": "5s",
+                            "autovacuum_vacuum_cost_delay": "0",
+                        }
+                        return {"autovacuum_naptime": "5s", "autovacuum_vacuum_cost_delay": "0"}
+                    self._scenario_config_error = f"ssh fallback exited {r.exit_status}: {r.stderr.strip()[:200]}"
+            except Exception as fb_exc:
+                self._scenario_config_error = f"{type(fb_exc).__name__}: {fb_exc}"
+        return {}
+
+    async def config_deviations(self) -> dict[str, str]:
+        """Detect any parameters set in postgresql.auto.conf (ALTER SYSTEM deviations)."""
+        deviations: dict[str, str] = {}
+        try:
+            conn = await self._connect(timeout_s=10.0)
+            try:
+                rows = await conn.fetch(
+                    "SELECT name, setting FROM pg_file_settings "
+                    "WHERE sourcefile LIKE '%postgresql.auto.conf' AND error IS NULL"
+                )
+                if isinstance(rows, list):
+                    for r in rows:
+                        try:
+                            deviations[r["name"]] = str(r["setting"])
+                        except (KeyError, TypeError):
+                            pass
+            finally:
+                await conn.close()
+        except Exception:
+            try:
+                async with RemoteHost(self.node.ssh) as host:
+                    sql_cmd = (
+                        "SELECT name, setting FROM pg_file_settings "
+                        "WHERE sourcefile LIKE '%postgresql.auto.conf' AND error IS NULL;"
+                    )
+                    cmd = (
+                        f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -At -F '=' -p {self.node.db.port} "
+                        f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(sql_cmd)}"
+                    )
+                    r = await host.run(as_user(self.node.os_user, cmd), timeout_s=15.0, check=False)
+                    if r.exit_status == 0 and r.stdout:
+                        for line in r.stdout.strip().splitlines():
+                            if "=" in line:
+                                k, v = line.split("=", 1)
+                                deviations[k.strip()] = v.strip()
+            except Exception:
+                pass
+        return deviations
+
+    async def cleanup_leftover_configuration(self) -> dict[str, str]:
+        """Reset any scenario-tuning parameters that may have leaked into postgresql.auto.conf
+        from previous failed runs."""
+        deviations = await self.config_deviations()
+        scenario_params = {"autovacuum_naptime", "autovacuum_vacuum_cost_delay"}
+        leftover = {k: v for k, v in deviations.items() if k in scenario_params}
+        if not leftover:
+            return {}
+        try:
+            conn = await self._connect(timeout_s=10.0)
+            try:
+                for k in leftover:
+                    await conn.execute(f"ALTER SYSTEM RESET {k}")
+                await conn.execute("SELECT pg_reload_conf()")
+            finally:
+                await conn.close()
+        except Exception:
+            try:
+                async with RemoteHost(self.node.ssh) as host:
+                    psql = shlex.quote(self.node.pg_bin + '/psql')
+                    statements = [f"ALTER SYSTEM RESET {k};" for k in leftover] + ["SELECT pg_reload_conf();"]
+                    parts = [
+                        f"{psql} -X -p {self.node.db.port} "
+                        f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(stmt)}"
+                        for stmt in statements
+                    ]
+                    cmd = "cd /tmp && " + " && ".join(parts)
+                    await host.run(as_user(self.node.os_user, cmd), timeout_s=15.0, check=False)
+            except Exception:
+                pass
+        return leftover
+
+    async def restore_scenario_configuration(self) -> None:
+        """Revert any temporary configuration applied by configure_for_scenario(),
+        ensuring the database is restored cleanly without leaving altered settings."""
+        if not self._scenario_config_applied:
+            return
+        try:
+            conn = await self._connect(timeout_s=10.0)
+            try:
+                await conn.execute("ALTER SYSTEM RESET autovacuum_naptime")
+                await conn.execute("ALTER SYSTEM RESET autovacuum_vacuum_cost_delay")
+                await conn.execute("SELECT pg_reload_conf()")
+                self._scenario_config_applied.clear()
+            finally:
+                await conn.close()
+        except Exception:
+            # Fallback to SSH execution as os_user
+            try:
+                async with RemoteHost(self.node.ssh) as host:
+                    psql = shlex.quote(self.node.pg_bin + '/psql')
+                    statements = (
+                        "ALTER SYSTEM RESET autovacuum_naptime;",
+                        "ALTER SYSTEM RESET autovacuum_vacuum_cost_delay;",
+                        "SELECT pg_reload_conf();",
+                    )
+                    parts = [
+                        f"{psql} -X -p {self.node.db.port} "
+                        f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(stmt)}"
+                        for stmt in statements
+                    ]
+                    cmd = "cd /tmp && " + " && ".join(parts)
+                    r = await host.run(as_user(self.node.os_user, cmd), timeout_s=15.0, check=False)
+                    if r.exit_status == 0:
+                        self._scenario_config_applied.clear()
+            except Exception:
+                pass

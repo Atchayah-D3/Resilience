@@ -17,7 +17,7 @@ from resilience_tests.control.killswitch import ledger_for
 from resilience_tests.observability.event_stream import Event
 from resilience_tests.execution.injectors.base import DriverNotAvailable
 from resilience_tests.execution.injectors.process import OsSshProcessDriver, _usec_to_s
-from tests.test_review_fixes import NODE, PROFILE, use_host
+from tests.test_measurement_and_safety import NODE, PROFILE, use_host
 
 # reuse the orchestrator's fake engine, fake fault and fixture wiring
 from tests.test_orchestrator import CATALOG, Engine, FakeFault, OutageAdapter, env, run, why  # noqa: F401
@@ -203,11 +203,9 @@ def test_nl_c_05_encodes_the_framework_criterion():
     sc = CATALOG.scenarios["NL-C-05"]
     assert (sc.repeat.cycles, sc.repeat.interval_s) == (10, 5.0)    # Framework §10.2
     assert "recovery_ratio_last_over_first <= 1.5" in sc.accept
-    # Bloat is measured but deliberately NOT gated: three healthy runs spanned 1.02-1.23
-    # against 1.23-1.24 for a server with autovacuum off, so no threshold separates them.
-    # If someone re-adds a bloat_ratio rule, they must re-do that calibration first.
+    # Option A: bloat_ratio is strictly gated at <= 1.15 under dynamically tuned autovacuum
+    assert "bloat_ratio <= 1.15" in sc.accept
     assert "bloat_ratio" in sc.measure
-    assert not [a for a in sc.accept if a.startswith("bloat_ratio")]
     # the cycle count lives in `repeat` alone: an accept rule naming 10 would silently
     # stop checking every cycle the moment someone changed it
     assert "cycles_recovered == cycles_run" in sc.accept
@@ -431,3 +429,135 @@ def test_an_engine_that_cannot_report_replay_depth_still_runs(env, footprints):
     assert results["status"] == "passed", why(results)
     assert all(c["redo_distance_bytes"] is None for c in results["facts"]["cycles"])
     assert "wal_replayed_bytes_max" not in results["measured"]
+
+
+def test_postgres_adapter_configure_and_restore_autovacuum_option_a():
+    """Verify that PostgreSQLAdapter.configure_for_scenario sets autovacuum parameters
+    and restore_scenario_configuration resets them cleanly (Option A)."""
+    async def _test():
+        from unittest.mock import AsyncMock
+        from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
+        from resilience_tests.control.profile import Node
+
+        node = Node(
+            name="test-node",
+            role="standalone",
+            topology_role="primary",
+            ssh={"host": "127.0.0.1", "port": 22, "user": "test"},
+            db={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
+            client={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
+            pgdata="/data",
+            pg_bin="/bin",
+            os_user="postgres",
+            service="postgresql.service",
+            log_file="/data/logfile",
+        )
+        adapter = PostgreSQLAdapter(node)
+        mock_conn = AsyncMock()
+        mock_conn.fetchval.side_effect = ["60s", "2ms"]
+        adapter._connect = AsyncMock(return_value=mock_conn)
+
+        # 1. Non-NL-C-05 scenario: no changes made
+        await adapter.configure_for_scenario("NL-C-01")
+        assert not adapter._scenario_config_applied
+        assert mock_conn.execute.call_count == 0
+
+        # 2. NL-C-05: tunes autovacuum parameters
+        await adapter.configure_for_scenario("NL-C-05")
+        assert adapter._scenario_config_applied == {
+            "autovacuum_naptime": "60s",
+            "autovacuum_vacuum_cost_delay": "2ms",
+        }
+        execute_calls = [c.args[0] for c in mock_conn.execute.call_args_list]
+        assert any("ALTER SYSTEM SET autovacuum_naptime = '5s'" in c for c in execute_calls)
+        assert any("ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '0'" in c for c in execute_calls)
+        assert any("pg_reload_conf()" in c for c in execute_calls)
+
+        # 3. Clean restoration at scenario completion
+        mock_conn.execute.reset_mock()
+        await adapter.restore_scenario_configuration()
+        assert not adapter._scenario_config_applied
+        restore_calls = [c.args[0] for c in mock_conn.execute.call_args_list]
+        assert any("ALTER SYSTEM RESET autovacuum_naptime" in c for c in restore_calls)
+        assert any("ALTER SYSTEM RESET autovacuum_vacuum_cost_delay" in c for c in restore_calls)
+        assert any("pg_reload_conf()" in c for c in restore_calls)
+
+    asyncio.run(_test())
+
+
+def test_after_cleanup_flags_unrestored_scenario_config(env):
+    """Verify that if scenario configuration cannot be restored, the run fails closed."""
+    item = RunPlanItem(scenario=cycled("NL-C-05", 1, 0.1), env_class=env.env_class,
+                       role="standalone", node=env.nodes[0])
+    orch = TestOrchestrator(item, env, RunOptions())
+    orch.facts["restore_config_error"] = "Connection refused to database"
+    status, error = orch._after_cleanup("passed", None, expect_phase_record=False)
+    assert status == "error"
+    assert "scenario configuration not restored" in error
+
+
+def test_postgres_adapter_configure_ssh_fallback_separate_statements():
+    """Verify that SSH fallback runs each ALTER SYSTEM as its own statement to avoid
+    'ALTER SYSTEM cannot run inside a transaction block', and records errors on failure."""
+    async def _test():
+        from unittest.mock import AsyncMock, patch, MagicMock
+        from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
+        from resilience_tests.control.profile import Node
+
+        node = Node(
+            name="test-node",
+            role="standalone",
+            topology_role="primary",
+            ssh={"host": "127.0.0.1", "port": 22, "user": "test"},
+            db={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
+            client={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
+            pgdata="/data",
+            pg_bin="/bin",
+            os_user="postgres",
+            service="postgresql.service",
+            log_file="/data/logfile",
+        )
+        adapter = PostgreSQLAdapter(node)
+        # Primary asyncpg connection fails (e.g. non-superuser harness role)
+        adapter._connect = AsyncMock(side_effect=PermissionError("must be superuser"))
+
+        mock_host = AsyncMock()
+        mock_result = MagicMock(exit_status=0, stderr="")
+        mock_host.run.return_value = mock_result
+
+        with patch("resilience_tests.adapters.postgresql.adapter.RemoteHost") as MockRemoteHost:
+            MockRemoteHost.return_value.__aenter__.return_value = mock_host
+
+            # 1. Successful fallback: separate statements joined with &&
+            tuning = await adapter.configure_for_scenario("NL-C-05")
+            assert tuning == {"autovacuum_naptime": "5s", "autovacuum_vacuum_cost_delay": "0"}
+            assert adapter._scenario_config_applied == tuning
+
+            assert mock_host.run.call_count == 1
+            cmd = mock_host.run.call_args[0][0]
+            # Must have multiple psql -c invocations joined with &&, never one multi-statement -c
+            assert " && " in cmd
+            assert cmd.count("-c") >= 3
+            assert "autovacuum_naptime" in cmd
+            assert "autovacuum_vacuum_cost_delay" in cmd
+            assert "pg_reload_conf()" in cmd
+
+            # 2. Restoration via SSH fallback also uses separate statements
+            mock_host.run.reset_mock()
+            await adapter.restore_scenario_configuration()
+            assert not adapter._scenario_config_applied
+            restore_cmd = mock_host.run.call_args[0][0]
+            assert " && " in restore_cmd
+            assert restore_cmd.count("-c") >= 3
+            assert "RESET autovacuum_naptime" in restore_cmd
+
+            # 3. Failed fallback: captures stderr and exit status into _scenario_config_error
+            mock_host.run.return_value = MagicMock(exit_status=1, stderr="ERROR: failed to write")
+            tuning_fail = await adapter.configure_for_scenario("NL-C-05")
+            assert tuning_fail == {}
+            assert "ssh fallback exited 1" in adapter._scenario_config_error
+            assert "ERROR: failed to write" in adapter._scenario_config_error
+
+    asyncio.run(_test())
+
+

@@ -79,8 +79,58 @@ def render_summary(r: dict[str, Any]) -> str:
             f"elle consistency check ({elle.get('checker', 'checker')}):",
             f"  valid: {elle.get('valid')}  anomalies: {elle.get('anomalies_count')}",
         ]
+    cp = (r.get("facts") or {}).get("checkpoint_injection")
+    if cp:
+        w_event = cp.get("wait_event")
+        w_type = cp.get("wait_event_type")
+        if w_event and w_type:
+            event_desc = f"{w_event} ({w_type})"
+        elif w_event or w_type:
+            event_desc = str(w_event or w_type)
+        else:
+            event_desc = "none (checkpointer running, not waiting)"
+
+        lines += [
+            "",
+            "checkpoint fault injection (NL-C-02):",
+            f"  checkpointer active at kill: {cp.get('checkpointer_active')}",
+            f"  checkpointer pid: {cp.get('checkpointer_pid')}",
+            f"  wait event: {event_desc}",
+        ]
+        if cp.get("buffers_written_during_cp") is not None:
+            lines.append(f"  stat counter delta (pg_stat_checkpointer.buffers_written): {cp['buffers_written_during_cp']}")
+        if cp.get("io_writes_during_cp") is not None:
+            lines.append(f"  io writes delta (pg_stat_io): {cp['io_writes_during_cp']}")
     if r.get("measured"):
-        lines += ["", "measured:"] + [f"  {k} = {v}" for k, v in sorted(r["measured"].items())]
+        rendered = []
+        for k, v in sorted(r["measured"].items()):
+            if v is None:
+                rendered.append(f"  {k} = None (determination failed / not reached)")
+            else:
+                rendered.append(f"  {k} = {v}")
+        lines += ["", "measured:"] + rendered
+    tuning = (r.get("facts") or {}).get("scenario_tuning")
+    tuning_err = (r.get("facts") or {}).get("scenario_tuning_error")
+    deviations = (r.get("facts") or {}).get("config_deviations")
+    if tuning:
+        lines += [
+            "",
+            "scenario tuning (Option A):",
+            *[f"  {k} = {v}" for k, v in sorted(tuning.items())],
+            "  note: baseline, TPS floor, and SLO recovery were measured under this tuning",
+        ]
+    elif tuning_err:
+        lines += [
+            "",
+            "scenario tuning (Option A):",
+            f"  FAILED: {tuning_err}",
+        ]
+    elif deviations:
+        lines += [
+            "",
+            "config deviations (postgresql.auto.conf):",
+            *[f"  {k} = {v}" for k, v in sorted(deviations.items())],
+        ]
     if r.get("disclosures"):
         lines += ["", "disclosures (evidence limitations):"] + [f"  - {d}" for d in r["disclosures"]]
     return "\n".join(lines) + "\n"

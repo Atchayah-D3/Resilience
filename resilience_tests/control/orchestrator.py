@@ -137,6 +137,7 @@ class TestOrchestrator:
         self._lock_fh: Any = None
         self._workload_failure: str | None = None
         self.cycle_t0s: list[int] = []          # one T0 per crash cycle (Framework NL-C-05)
+        self.cycle_details: list[dict[str, Any]] = []
         self.footprints: list[dict[str, Any]] = []
         self.redo_at_t0: list[int | None] = []  # WAL left to replay, sampled before each kill
 
@@ -296,7 +297,9 @@ class TestOrchestrator:
     async def _p_reset(self) -> dict[str, Any]:
         detail = await resolve_reset(self.profile).reset(self.node)
         if "disclosure" in detail:
-            self.disclosures.append(detail["disclosure"])
+            disc = detail["disclosure"]
+            if not any("baseline reset" in d.lower() for d in self.disclosures) or "baseline reset" not in disc.lower():
+                self.disclosures.append(disc)
         return detail
 
     async def _p_init(self) -> dict[str, Any]:
@@ -326,9 +329,33 @@ class TestOrchestrator:
         # Integrity counters are cumulative in most engines; the run is judged on its own delta.
         self.facts["integrity_baseline"] = await self.adapter.mark_integrity_baseline()
         await self.adapter.prepare_harness_state()
+        if hasattr(self.adapter, "configure_for_scenario"):
+            tuning = await self.adapter.configure_for_scenario(self.scenario.id)
+            if tuning and isinstance(tuning, dict):
+                self.facts["scenario_tuning"] = tuning
+                self.disclosures.append(
+                    f"Scenario tuning applied (Option A): {', '.join(f'{k}={v}' for k, v in sorted(tuning.items()))} "
+                    f"(baseline, TPS floor, and SLO recovery measured under this tuning)"
+                )
+            elif self.scenario.id == "NL-C-05":
+                err = getattr(self.adapter, "_scenario_config_error", None) or "returned empty"
+                self.facts["scenario_tuning_error"] = err
+                self.disclosures.append(f"Scenario tuning failed for NL-C-05: {err}")
+        if hasattr(self.adapter, "config_deviations"):
+            deviations = await self.adapter.config_deviations()
+            self.facts["config_deviations"] = deviations
+            if deviations and not self.facts.get("scenario_tuning"):
+                self.disclosures.append(
+                    f"Configuration deviation in postgresql.auto.conf: "
+                    f"{', '.join(f'{k}={v}' for k, v in sorted(deviations.items()))}"
+                )
         self.journals = MarkerJournals(self.run_dir)
-        self.history = HistoryWriter(self.run_dir / "history.edn")
-        self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream, history=self.history)
+        try:
+            self.history = HistoryWriter(self.run_dir / "history.edn")
+            self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream, history=self.history)
+        except TypeError:
+            self.history = None
+            self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream)
         return {"hostname": hostname, "settings": settings}
 
     async def _p_baseline(self) -> dict[str, Any]:
@@ -387,8 +414,14 @@ class TestOrchestrator:
             one = await self._inject_once(cycle=cycle)
             recovered = await self._await_cycle_recovery(cycle, last=cycle == r.cycles)
             one.update(recovered)
+            quick_integrity = await self.adapter.quick_integrity_check()
+            if quick_integrity:
+                one["quick_integrity"] = quick_integrity
+                if quick_integrity.get("checksum_failures", 0) > 0:
+                    self.stream.emit("orchestrator", "inter_cycle_corruption", cycle=cycle, **quick_integrity)
             self.footprints.append(await self._footprint(f"after cycle {cycle}"))
             detail["cycles"].append(one)
+            self.cycle_details.append(one)
             if cycle < r.cycles:
                 # settle, so the next cycle starts from a comparable state rather than from
                 # the tail of this recovery
@@ -404,7 +437,25 @@ class TestOrchestrator:
                                            "preflight": self.facts.get("injector_preflight", {})})
         # Sampled immediately before the kill: the WAL a crash at this instant leaves to
         # replay. Without it, two cycles' recovery times are only comparable by assumption.
+        redo_sample_mono_ns = time.monotonic_ns()
         redo = await self.adapter.redo_distance_bytes()
+
+        checkpoint_detail: dict[str, Any] = {}
+        if self.scenario.id == "NL-C-02":
+            # Deterministic synchronization (Framework §10.2, Arch §5):
+            # Industry-level harnesses eliminate timing guessing by synchronizing with the database
+            # internal state. Ensure checkpointer is actively flushing/syncing buffers before kill.
+            try:
+                checkpoint_detail = await self.adapter.trigger_checkpoint_and_await_active()
+            except Exception as exc:
+                self.facts["checkpoint_trigger_error"] = f"{type(exc).__name__}: {exc}"
+                checkpoint_detail = {"checkpointer_active": False, "error": str(exc)}
+            active = checkpoint_detail.get("checkpointer_active", False)
+            self.facts["checkpoint_active_at_kill"] = active
+            self.facts["checkpoint_injection"] = checkpoint_detail
+            if not active:
+                raise PhaseAbort(f"checkpointer was not active: {checkpoint_detail.get('error', 'wait event indicates idle checkpointer')}")
+
         index_task = None
         if self.scenario.id == "NL-C-06" or getattr(self.scenario.fault, "timing", "") == "during_concurrent_index_build":
             index_task = asyncio.create_task(
@@ -416,18 +467,22 @@ class TestOrchestrator:
         if index_task is not None and not index_task.done():
             index_task.cancel()
         t0 = detail.pop("t0_mono_ns", None) or time.monotonic_ns()
+        sampling_delay_ms = round((t0 - redo_sample_mono_ns) / 1e6, 2)
         self.t0_ns = t0 if self.t0_ns is None else self.t0_ns   # T0 of the run is the first fault
         self.cycle_t0s.append(t0)
+        if checkpoint_detail:
+            detail["checkpoint"] = checkpoint_detail
         self.ledger.transition(entry, "applied", inject=detail, cycle=cycle)
         self.stream.emit("injector", "t0", fault=self.scenario.fault.type, node=self.node.name,
-                         t0_mono_ns=t0, cycle=cycle, **detail)
+                         t0_mono_ns=t0, cycle=cycle, redo_sampling_delay_ms=sampling_delay_ms, **detail)
         self.stream.sync()
         self.facts["injection_id"] = entry.injection_id
         self._cycle_entries = getattr(self, "_cycle_entries", {})
         self._cycle_entries[cycle] = entry
         self.redo_at_t0.append(redo)
 
-        return {"cycle": cycle, "t0_mono_ns": t0, "redo_distance_bytes": redo, **detail}
+        return {"cycle": cycle, "t0_mono_ns": t0, "redo_distance_bytes": redo,
+                "redo_sampling_delay_ms": sampling_delay_ms, **detail}
 
     async def _await_cycle_recovery(self, cycle: int, last: bool = False) -> dict[str, Any]:
         """Wait for this cycle's service to come back, on the evidence of the write probe --
@@ -493,6 +548,7 @@ class TestOrchestrator:
 
         baseline = Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0)
         slo_t0 = self.cycle_t0s[-1] if self.scenario.repeat else self.t0_ns
+        self.facts["slo_t0_mono_ns"] = slo_t0
         deadline = time.monotonic() + self.profile.phase_timeouts_s["recovery"] - RECOVERY_EXIT_MARGIN_S
         while time.monotonic() < deadline:
             d = decompose(self.stream.events(), slo_t0, baseline, clustered=False,
@@ -505,6 +561,8 @@ class TestOrchestrator:
             await asyncio.sleep(RECOVERY_POLL_S)
         detail["slo_reached_s"] = None
         detail["note"] = "service did not return to SLO within the recovery bound"
+        bound_s = self.profile.phase_timeouts_s.get("recovery", 900)
+        self.disclosures.append(f"Recovery limitation: {detail['note']} ({bound_s}s timeout)")
         return detail
 
     async def _p_validate(self) -> dict[str, Any]:
@@ -518,6 +576,7 @@ class TestOrchestrator:
 
         expect_outage = self.scenario.fault.type in OUTAGE_FAULTS
         slo_t0 = self.cycle_t0s[-1] if self.scenario.repeat else self.t0_ns
+        self.facts["slo_t0_mono_ns"] = slo_t0
         d = decompose(events, slo_t0, Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0),
                       clustered=False, detection_patterns=self.adapter.fault_detection_log_patterns(),
                       recovery_patterns=self.adapter.recovery_start_log_patterns(),
@@ -566,12 +625,26 @@ class TestOrchestrator:
             rows = [asdict(c) for c in cycles]
             # Join each cycle's recovery to the replay work it actually faced. A recovery time
             # on its own is not comparable across cycles; bytes replayed per second is.
-            for row, redo in zip(rows, self.redo_at_t0):
+            for i, (row, redo) in enumerate(zip(rows, self.redo_at_t0)):
                 row["redo_distance_bytes"] = redo
                 rec = row.get("recovery_s")
                 row["replay_bytes_per_s"] = (
                     round(redo / rec, 1) if redo and isinstance(rec, (int, float)) and rec > 0 else None)
+                if i < len(self.cycle_details):
+                    row["redo_sampling_delay_ms"] = self.cycle_details[i].get("redo_sampling_delay_ms")
+                    if "quick_integrity" in self.cycle_details[i]:
+                        row["quick_integrity"] = self.cycle_details[i]["quick_integrity"]
+                # Partition client-visible errors per cycle window
+                c_start = self.cycle_t0s[i]
+                c_end = self.cycle_t0s[i + 1] if i + 1 < len(self.cycle_t0s) else None
+                c_samples = [e for e in events if e.kind == "sample" and e.source == "workload"
+                             and e.t_mono_ns > c_start and (c_end is None or e.t_mono_ns <= c_end)]
+                row["failed_transactions"] = sum(e.data.get("errors", 0) for e in c_samples)
+                row["dropped_connections"] = sum(e.data.get("drops", 0) for e in c_samples)
+                row["connect_failures"] = sum(e.data.get("connect_failures", 0) for e in c_samples)
             self.facts["cycles"] = rows
+            m["failed_transactions_max_per_cycle"] = max((r.get("failed_transactions", 0) for r in rows), default=0)
+            m["dropped_connections_max_per_cycle"] = max((r.get("dropped_connections", 0) for r in rows), default=0)
             replayed = [r["redo_distance_bytes"] for r in rows if r["redo_distance_bytes"] is not None]
             if replayed:
                 m["wal_replayed_bytes_max"] = max(replayed)
@@ -687,6 +760,21 @@ class TestOrchestrator:
                 "cleanup_or_rebuild_succeeded": rebuild_ok,
             }
 
+        if self.scenario.id == "NL-C-02":
+            try:
+                aborted_detail = await self.adapter.verify_checkpoint_aborted()
+                self.facts["checkpoint_verification"] = aborted_detail
+                aborted = aborted_detail.get("checkpoint_aborted")
+                self.facts["checkpoint_aborted"] = aborted
+                if aborted is None:
+                    self.not_measured["checkpoint_aborted"] = (
+                        "could not verify whether the in-flight checkpoint was aborted: "
+                        + aborted_detail.get("note", "no LSN baseline available"))
+            except Exception as exc:
+                self.facts["checkpoint_verify_error"] = f"{type(exc).__name__}: {exc}"
+                self.facts["checkpoint_aborted"] = None
+            m["checkpoint_active_at_kill"] = self.facts.get("checkpoint_active_at_kill", False)
+
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).
         self.facts["declared_not_produced"] = sorted(set(self.scenario.measure) - set(m))
@@ -707,6 +795,11 @@ class TestOrchestrator:
         if self.log_tailer:
             await self.log_tailer.stop()
         reverted = await revert_outstanding(self.profile, self.ledger, run_id=self.run_id)
+        try:
+            if hasattr(self.adapter, "restore_scenario_configuration"):
+                await self.adapter.restore_scenario_configuration()
+        except Exception as exc:
+            self.facts["restore_config_error"] = f"{type(exc).__name__}: {exc}"
         return {"reverted": [(e.injection_id, outcome) for e, outcome in reverted]}
 
     def _after_cleanup(self, status: str, error: str | None, *,
@@ -734,6 +827,8 @@ class TestOrchestrator:
         if outstanding:
             problems.append("injections not reverted: "
                             + ", ".join(f"{e.fault_type} on {e.node} ({e.state})" for e in outstanding))
+        if self.facts.get("restore_config_error"):
+            problems.append(f"scenario configuration not restored: {self.facts['restore_config_error']}")
         self.facts["cleanup_outstanding"] = [
             {"injection_id": e.injection_id, "fault_type": e.fault_type, "node": e.node, "state": e.state}
             for e in outstanding
@@ -845,7 +940,14 @@ class TestOrchestrator:
             "run_id": self.run_id,
             "status": status,
             "error": error,
-            "scenario": {"id": sc.id, "name": sc.name, "priority": sc.priority, "category": sc.category},
+            "scenario": {
+                "id": sc.id,
+                "name": sc.name,
+                "priority": sc.priority,
+                "category": sc.category,
+                "measure": list(sc.measure),
+                "accept": list(sc.accept),
+            },
             "environment": {"profile": self.profile.name, "class": self.profile.env_class,
                             "environment": self.profile.environment, "storage_class": self.profile.storage_class},
             "target": {"node": self.node.name, "role": self.node.role, "topology_role": self.node.topology_role},
@@ -859,7 +961,7 @@ class TestOrchestrator:
                 "passed": self.verdict.passed, "results": [asdict(r) for r in self.verdict.results]},
             "abort_checks": self.abort_checks,
             "facts": self.facts,
-            "disclosures": self.disclosures,
+            "disclosures": list(dict.fromkeys(self.disclosures)),
             "evidence_dir": str(self.run_dir),
         }
 

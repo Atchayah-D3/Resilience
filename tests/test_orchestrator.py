@@ -8,6 +8,7 @@ ledger says an injection is undone, and which failures stop a verdict being issu
 
 import asyncio
 from pathlib import Path
+import time
 from typing import Any
 
 import pytest
@@ -95,6 +96,30 @@ class OutageAdapter(FakeAdapter):
 
     async def integrity_check(self, timeout_s: float) -> IntegrityResult:
         return IntegrityResult(structural_errors=0, checksum_failures=0)
+
+    async def trigger_checkpoint_and_await_active(self, timeout_s: float = 10.0) -> dict[str, Any]:
+        """Simulate a successfully synchronized checkpoint for NL-C-02 tests."""
+        self._checkpoint_baseline = {"checkpoint_lsn": 1000000, "redo_lsn": 1000000,
+                                     "checkpoint_time": "2026-01-01 00:00:00"}
+        return {
+            "checkpointer_active": True,
+            "checkpointer_pid": 9999,
+            "wait_event_type": "Timeout",
+            "wait_event": "CheckpointWriteDelay",
+            "prior_checkpoint": self._checkpoint_baseline,
+            "t_active_mono_ns": time.monotonic_ns(),
+        }
+
+    async def verify_checkpoint_aborted(self) -> dict[str, Any]:
+        """Simulate verified checkpoint abort with LSN comparison."""
+        baseline = getattr(self, "_checkpoint_baseline", {"checkpoint_lsn": 1000000, "redo_lsn": 1000000})
+        return {
+            "checkpoint_aborted": True,
+            "current_checkpoint": {"checkpoint_lsn": 2000000, "redo_lsn": 1500000,
+                                   "checkpoint_time": "2026-01-01 00:00:05"},
+            "prior_checkpoint": baseline,
+            "redo_advanced": True,
+        }
 
 
 class FakeFault(FaultInjector):

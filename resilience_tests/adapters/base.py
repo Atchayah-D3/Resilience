@@ -165,6 +165,50 @@ class BaseDatabaseAdapter(ABC):
         """Structural and checksum verification, as far as the engine supports it. Counters
         are reported relative to `mark_integrity_baseline` when it was called."""
 
+    async def trigger_checkpoint_and_await_active(self, timeout_s: float = 10.0) -> dict[str, Any]:
+        """Trigger a checkpoint under the current workload and wait until the checkpointer is
+        actively writing/syncing buffers (not idle), returning checkpointer evidence (PID, wait
+        event, active state).
+
+        Used by NL-C-02 to guarantee fault injection lands precisely while the checkpointer
+        is active, replacing arbitrary sleep guessing with deterministic state synchronization.
+
+        Default: returns checkpointer_active=False, which causes the orchestrator to abort
+        (fail closed). Subclasses must override with engine-specific synchronization."""
+        return {"checkpointer_active": False, "method": "default (not implemented)"}
+
+    async def verify_checkpoint_aborted(self) -> dict[str, Any]:
+        """Verify that the checkpoint interrupted by the crash was indeed aborted and not
+        completed before the crash, and that recovery resumed from the prior REDO point.
+
+        Default: returns checkpoint_aborted=None (unknown). Subclasses must override with
+        engine-specific verification logic."""
+        return {"checkpoint_aborted": None, "method": "default (not implemented)"}
+
+    async def configure_for_scenario(self, scenario_id: str) -> dict[str, str]:
+        """Apply temporary engine configuration specific to a scenario before workload starts
+        (e.g. tuning autovacuum for rapid repeated-cycle bloat testing in NL-C-05).
+        Default: no-op, returns empty dict. Subclasses override for engine-specific tuning."""
+        return {}
+
+    async def restore_scenario_configuration(self) -> None:
+        """Revert any temporary configuration applied by configure_for_scenario, ensuring the
+        database is restored to its original configuration without stranding modified settings.
+        Default: no-op."""
+        pass
+
+    async def config_deviations(self) -> dict[str, str]:
+        """Detect any configuration deviations currently active on the database that diverge
+        from standard baseline (e.g. settings in postgresql.auto.conf).
+        Default: returns empty dict."""
+        return {}
+
+    async def cleanup_leftover_configuration(self) -> dict[str, str]:
+        """Clean up any leftover configuration from previous failed runs (e.g. resetting
+        stranded postgresql.auto.conf parameters).
+        Default: returns empty dict."""
+        return {}
+
     @abstractmethod
     async def server_version(self) -> str: ...
 
