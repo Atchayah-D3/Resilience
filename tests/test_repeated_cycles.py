@@ -561,3 +561,40 @@ def test_postgres_adapter_configure_ssh_fallback_separate_statements():
     asyncio.run(_test())
 
 
+def test_postgres_adapter_quick_integrity_check():
+    """Verify that PostgreSQLAdapter.quick_integrity_check correctly reports checksum failure deltas."""
+    async def _test():
+        from unittest.mock import AsyncMock
+        from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
+        from resilience_tests.control.profile import Node
+
+        node = Node(
+            name="test-node",
+            role="standalone",
+            topology_role="primary",
+            ssh={"host": "127.0.0.1", "port": 22, "user": "test"},
+            db={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
+            client={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
+            pgdata="/data",
+            pg_bin="/bin",
+            os_user="postgres",
+            service="postgresql.service",
+            log_file="/data/logfile",
+        )
+        adapter = PostgreSQLAdapter(node)
+        adapter._checksum_baseline = {"resilience": (0, "2026-09-30 00:00:00")}
+
+        # 1. No failures
+        adapter._checksum_stats = AsyncMock(return_value={"resilience": (0, "2026-09-30 00:00:00")})
+        res1 = await adapter.quick_integrity_check()
+        assert res1 == {"checksum_failures": 0, "ok": True}
+
+        # 2. Checksum failures increased
+        adapter._checksum_stats = AsyncMock(return_value={"resilience": (2, "2026-09-30 00:00:00")})
+        res2 = await adapter.quick_integrity_check()
+        assert res2 == {"checksum_failures": 2, "ok": False}
+
+    asyncio.run(_test())
+
+
+

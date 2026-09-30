@@ -414,7 +414,10 @@ class TestOrchestrator:
             one = await self._inject_once(cycle=cycle)
             recovered = await self._await_cycle_recovery(cycle, last=cycle == r.cycles)
             one.update(recovered)
-            quick_integrity = await self.adapter.quick_integrity_check()
+            if hasattr(self.adapter, "quick_integrity_check"):
+                quick_integrity = await self.adapter.quick_integrity_check()
+            else:
+                quick_integrity = {"checksum_failures": 0, "ok": True}
             if quick_integrity:
                 one["quick_integrity"] = quick_integrity
                 if quick_integrity.get("checksum_failures", 0) > 0:

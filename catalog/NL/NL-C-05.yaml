@@ -129,5 +129,3 @@ description: >
   to the first accepted write, and the on-disk footprint once service returns. Recovery must
   not slow down across the ten, and nothing may accumulate on disk that the inserted rows do
   not explain. Crash recovery of a single failure is covered by NL-C-01.
-
-see_also: [NL-C-01]

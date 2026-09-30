@@ -72,5 +72,3 @@ description: >
   replay the write-ahead log from the prior valid checkpoint's redo point, resolve any torn pages
   without corruption, and preserve all acknowledged transactions (Framework §10.2, Arch §5).
   Durability of the storage stack is covered by category NL-D (Framework §13.1).
-
-see_also: [NL-C-01, NL-C-03]

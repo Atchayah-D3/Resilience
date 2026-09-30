@@ -68,5 +68,3 @@ description: >
   transaction. Upon crash recovery, the interrupted transaction must be cleanly and fully
   rolled back, with zero partial rows, no orphaned tuple versions, and no structural
   integrity violations. Durability of the storage stack is covered by category NL-D (Framework §13.1).
-
-see_also: [NL-C-01, NL-C-02]

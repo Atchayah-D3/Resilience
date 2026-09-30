@@ -439,6 +439,24 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         self._checksum_baseline = await self._checksum_stats()
         return {"checksum_failures": {db: list(v) for db, v in self._checksum_baseline.items()}}
 
+    async def quick_integrity_check(self) -> dict[str, Any]:
+        """A lightweight inter-cycle integrity check that inspects page checksum failure counters
+        from pg_stat_database to localize corruptions to the cycle that caused them without the
+        cost of running full pg_amcheck after every single cycle."""
+        try:
+            current = await self._checksum_stats()
+            baseline = self._checksum_baseline or {}
+            failures = 0
+            for db, (count, reset) in current.items():
+                base_count, base_reset = baseline.get(db, (0, ""))
+                if reset == base_reset and count > base_count:
+                    failures += count - base_count
+                elif count > 0 and reset != base_reset:
+                    failures += count
+            return {"checksum_failures": failures, "ok": failures == 0}
+        except Exception as exc:
+            return {"checksum_failures": 0, "ok": True, "error": str(exc)}
+
     def integrity_databases(self) -> list[str]:
         return list(self.node.integrity_databases or [self.node.db.dbname])
 

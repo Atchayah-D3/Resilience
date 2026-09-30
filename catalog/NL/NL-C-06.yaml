@@ -69,5 +69,3 @@ description: >
   build operation under active transaction load. Crash recovery must complete cleanly,
   leaving the table accessible and structurally intact. Durability of the storage stack is
   covered by category NL-D (Framework §13.1).
-
-see_also: [NL-C-01, NL-C-05]
