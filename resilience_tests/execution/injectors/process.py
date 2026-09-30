@@ -117,7 +117,7 @@ class OsSshProcessDriver(FaultInjector):
     `config_reload`   -- change a parameter and SIGHUP under load: clients must not notice
                          (NL-M-07)."""
 
-    fault_types = frozenset({"process_kill", "service_restart", "config_reload"})
+    fault_types = frozenset({"process_kill", "service_restart", "config_reload", "idle_in_transaction"})
     driver_name = "os_ssh"
 
     # ------------------------------------------------------------------ helpers
@@ -189,6 +189,10 @@ class OsSshProcessDriver(FaultInjector):
                     detail["auto_conf_leftover"] = prior
                     prior = None
                 detail["auto_conf_prior"] = prior
+            if self.fault_type == "idle_in_transaction":
+                res = await host.run(self._psql(node, "SHOW idle_in_transaction_session_timeout"),
+                                     timeout_s=SSH_TIMEOUT_S, check=False)
+                detail["idle_timeout"] = res.stdout.strip()
         return detail
 
     async def _check_restart_cadence(self, host: RemoteHost, node: Node) -> dict[str, Any]:
@@ -225,7 +229,24 @@ class OsSshProcessDriver(FaultInjector):
             return await self._restart(node)
         if self.fault_type == "config_reload":
             return await self._reload(node)
+        if self.fault_type == "idle_in_transaction":
+            return await self._inject_idle(node)
         return await self._kill(node)
+
+    async def _inject_idle(self, node: Node) -> dict[str, Any]:
+        """Inject an idle-in-transaction holding back vacuum xmin (NL-M-05)."""
+        async with RemoteHost(node.ssh) as host:
+            sql = "BEGIN; SELECT txid_current();"
+            cmd = (
+                f"cd /tmp && nohup bash -c '("
+                f"echo {shlex.quote(sql)}; sleep 7200"
+                f") | {q(node.pg_bin + '/psql')} -X -p {node.db.port} "
+                f"-d {q(node.db.dbname)}' >/dev/null 2>&1 & echo $!"
+            )
+            r = await host.run(as_user(node.os_user, cmd), timeout_s=SSH_TIMEOUT_S, check=False)
+            bg_pid = int(r.stdout.strip()) if r.stdout.strip().isdigit() else None
+            t0_mono_ns = time.monotonic_ns()
+        return {"action": "idle_in_transaction", "pid": bg_pid, "t0_mono_ns": t0_mono_ns}
 
     async def _reload(self, node: Node) -> dict[str, Any]:
         """Change a parameter, then SIGHUP. A reload-only parameter is used deliberately: the
@@ -285,6 +306,8 @@ class OsSshProcessDriver(FaultInjector):
         otherwise make sure the service is running (waiting out a start already in progress)."""
         if self.fault_type == "config_reload":
             return await self._revert_reload(node, detail or {})
+        if self.fault_type == "idle_in_transaction":
+            return await self._revert_idle(node, detail or {})
         deadline = time.monotonic() + REVERT_TOTAL_BUDGET_S
         async with RemoteHost(node.ssh) as host:
             state = await self._settled_state(host, node, deadline)
@@ -342,6 +365,20 @@ class OsSshProcessDriver(FaultInjector):
             raise RuntimeError(f"{node.name}: {RELOAD_PROBE_PARAM} in postgresql.auto.conf is {after!r} after revert, "
                                f"expected {target!r}")
         return {"action": statement, "restored": target, "prior_known": prior_known}
+
+    async def _revert_idle(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
+        """Terminate any background psql session holding an idle transaction."""
+        inject = detail.get("inject") or {}
+        pid = inject.get("pid")
+        async with RemoteHost(node.ssh) as host:
+            if pid:
+                await host.run(as_root(f"kill -9 {pid} 2>/dev/null || true"), timeout_s=SSH_TIMEOUT_S, check=False)
+            term_sql = (
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE state LIKE 'idle in transaction%' AND pid <> pg_backend_pid()"
+            )
+            await host.run(self._psql(node, term_sql), timeout_s=SSH_TIMEOUT_S, check=False)
+        return {"action": "terminated idle transactions", "pid": pid}
 
 
 register("os_ssh", OsSshProcessDriver)
