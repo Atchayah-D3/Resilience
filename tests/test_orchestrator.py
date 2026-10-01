@@ -180,6 +180,7 @@ def env(tmp_path, monkeypatch):
     # flaky test rather than as the timing mistake it is.
     timeouts = dict(BASE_PROFILE.phase_timeouts_s, recovery=12.0)   # loop runs ~7 s
     monkeypatch.setattr(rto_decomposer, "SLO_SUSTAIN_S", 2.0)       # reachable: exercises the early exit
+    monkeypatch.setattr(orch, "IDLE_TRANSACTION_MIN_SOAK_S", 2.0)
     profile = BASE_PROFILE.model_copy(update={
         "database": BASE_PROFILE.database.model_copy(update={"engine": "orch-fake"}),
         "driver_host": BASE_PROFILE.driver_host.model_copy(update={"host": "127.0.0.1", "run_dir": str(tmp_path)}),
