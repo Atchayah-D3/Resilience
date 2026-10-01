@@ -1085,13 +1085,28 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             if explicit_count > 0:
                 rejections_explicit = True
 
+        # Verify if superuser reserved slot is honoured under connection exhaustion
         superuser_slot_honoured = False
-        try:
-            su_conn = await self._connect(self.node.db, timeout_s=2.0, command_timeout=None)
-            superuser_slot_honoured = True
-            await su_conn.close()
-        except Exception:
-            superuser_slot_honoured = False
+        if self._holding_conns:
+            # 1. First probe via SSH as node.os_user (postgres superuser)
+            try:
+                async with RemoteHost(self.node.ssh) as host:
+                    psql = shlex.quote(self.node.pg_bin + '/psql')
+                    su_cmd = f"cd /tmp && {psql} -X -p {self.node.db.port} -d {shlex.quote(self.node.db.dbname)} -c 'SELECT 1;'"
+                    r = await host.run(as_user(self.node.os_user, su_cmd), timeout_s=5.0, check=False)
+                    if r.exit_status == 0:
+                        superuser_slot_honoured = True
+            except Exception:
+                superuser_slot_honoured = False
+
+            # 2. Fallback to direct asyncpg connect if SSH probe is not available
+            if not superuser_slot_honoured:
+                try:
+                    su_conn = await self._connect(self.node.db, timeout_s=2.0, command_timeout=None)
+                    superuser_slot_honoured = True
+                    await su_conn.close()
+                except Exception:
+                    superuser_slot_honoured = False
 
         held_count = len(self._holding_conns)
 
