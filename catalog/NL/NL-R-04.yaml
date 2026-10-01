@@ -1,0 +1,80 @@
+# NL-R-04 -- Connection exhaustion (Framework §10.5, Tier 1, P1).
+# Fault injection: Open max_connections + 50% concurrent sessions under active load.
+# Acceptance: rejections_explicit == true; superuser_slot_honoured == true;
+#             existing_sessions_unaffected == true; rpo_txn == 0; corruption_count == 0;
+#             structural_integrity_errors == 0; starts_unattended == true.
+#
+# The primary database is subjected to connection exhaustion beyond max_connections.
+# New regular client connections must be explicitly rejected with standard SQLSTATE errors,
+# superuser reserved connection slots must remain accessible, and already-connected
+# workload sessions must continue processing without drops or aborts (Arch §5).
+#
+# Durability of the underlying storage stack is covered by category NL-D (Framework §13.1).
+id: NL-R-04
+name: Connection exhaustion
+tier: node_local
+category: NL-R
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false
+
+steady_state:
+  tps_min: 150
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: oltp_write_heavy
+  concurrency: 16
+  transaction_markers: true
+  rate_tps: 200
+
+fault:
+  type: connection_exhaustion
+  driver: os_ssh
+  target: primary
+  duration: 10.0
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:
+  - transactional_markers
+  - structural_integrity_check
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - rto_to_slo_s
+  - corruption_count
+  - structural_integrity_errors
+  - starts_unattended
+  - rejections_explicit
+  - superuser_slot_honoured
+  - existing_sessions_unaffected
+
+accept:
+  - rejections_explicit == true
+  - superuser_slot_honoured == true
+  - existing_sessions_unaffected == true
+  - rpo_txn == 0
+  - corruption_count == 0
+  - structural_integrity_errors == 0
+  - starts_unattended == true
+
+priority: P1
+
+description: >
+  The primary database is subjected to connection exhaustion by opening connections beyond
+  max_connections under active transaction load. Rejections must be explicit with standard
+  SQLSTATE errors, superuser reserved connection slots must be honoured, and existing active
+  client sessions must remain unaffected without transaction aborts or connection drops.
+  Durability of the storage stack is covered by category NL-D (Framework §13.1).

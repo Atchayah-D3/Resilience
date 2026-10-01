@@ -245,6 +245,16 @@ class BaseDatabaseAdapter(ABC):
         Default: returns empty dict."""
         return {}
 
+    async def exhaust_connections(self, hold_duration_s: float = 2.0) -> dict[str, Any]:
+        """Exhaust the connection pool to test connection saturation handling (NL-R-04).
+        Default: returns empty dict."""
+        return {}
+
+    async def revert_exhaust_connections(self) -> dict[str, Any]:
+        """Drain and release any connections held during connection exhaustion.
+        Default: returns empty dict."""
+        return {}
+
 
 
 # --- registry ----------------------------------------------------------------------------

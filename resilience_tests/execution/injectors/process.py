@@ -117,7 +117,7 @@ class OsSshProcessDriver(FaultInjector):
     `config_reload`   -- change a parameter and SIGHUP under load: clients must not notice
                          (NL-M-07)."""
 
-    fault_types = frozenset({"process_kill", "service_restart", "config_reload"})
+    fault_types = frozenset({"process_kill", "service_restart", "config_reload", "connection_exhaustion"})
     driver_name = "os_ssh"
 
     # ------------------------------------------------------------------ helpers
@@ -225,7 +225,17 @@ class OsSshProcessDriver(FaultInjector):
             return await self._restart(node)
         if self.fault_type == "config_reload":
             return await self._reload(node)
+        if self.fault_type == "connection_exhaustion":
+            return await self._exhaust_connections(node)
         return await self._kill(node)
+
+    async def _exhaust_connections(self, node: Node) -> dict[str, Any]:
+        """Connection exhaustion under load (NL-R-04)."""
+        from resilience_tests.adapters.base import adapter_for
+        engine = getattr(self.profile.database, "engine", "postgresql") if hasattr(self, "profile") and self.profile and hasattr(self.profile, "database") else "postgresql"
+        adapter = adapter_for(engine, node)
+        self._adapter = adapter
+        return await adapter.exhaust_connections(hold_duration_s=5.0)
 
     async def _reload(self, node: Node) -> dict[str, Any]:
         """Change a parameter, then SIGHUP. A reload-only parameter is used deliberately: the
@@ -285,6 +295,13 @@ class OsSshProcessDriver(FaultInjector):
         otherwise make sure the service is running (waiting out a start already in progress)."""
         if self.fault_type == "config_reload":
             return await self._revert_reload(node, detail or {})
+        if self.fault_type == "connection_exhaustion":
+            if hasattr(self, "_adapter") and self._adapter:
+                return await self._adapter.revert_exhaust_connections()
+            from resilience_tests.adapters.base import adapter_for
+            engine = getattr(self.profile.database, "engine", "postgresql") if hasattr(self, "profile") and self.profile and hasattr(self.profile, "database") else "postgresql"
+            adapter = adapter_for(engine, node)
+            return await adapter.revert_exhaust_connections()
         deadline = time.monotonic() + REVERT_TOTAL_BUDGET_S
         async with RemoteHost(node.ssh) as host:
             state = await self._settled_state(host, node, deadline)

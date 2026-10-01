@@ -67,7 +67,7 @@ RECOVERY_EXIT_MARGIN_S = 5.0  # leave the recovery loop before its phase timeout
 OUTAGE_FAULTS = frozenset({"process_kill", "service_restart", "host_power_loss"})
 # Faults the service recovers from on its own; the ledger entry stays outstanding until
 # cleanup's revert has confirmed the node is back in its pre-fault state.
-UNATTENDED_FAULTS = frozenset({"process_kill", "service_restart", "config_reload"})
+UNATTENDED_FAULTS = frozenset({"process_kill", "service_restart", "config_reload", "connection_exhaustion"})
 
 
 class TargetBusy(RuntimeError):
@@ -480,6 +480,8 @@ class TestOrchestrator:
                          t0_mono_ns=t0, cycle=cycle, redo_sampling_delay_ms=sampling_delay_ms, **detail)
         self.stream.sync()
         self.facts["injection_id"] = entry.injection_id
+        if self.scenario.fault.type == "connection_exhaustion":
+            self.facts["connection_exhaustion"] = detail
         self._cycle_entries = getattr(self, "_cycle_entries", {})
         self._cycle_entries[cycle] = entry
         self.redo_at_t0.append(redo)
@@ -620,6 +622,12 @@ class TestOrchestrator:
         if expect_outage:
             recovered = recovered and isinstance(d.rto_first_write_s, (int, float))
         m["starts_unattended"] = recovered
+
+        if self.scenario.id == "NL-R-04" or self.scenario.fault.type == "connection_exhaustion":
+            exhaust_facts = self.facts.get("connection_exhaustion", {})
+            m["rejections_explicit"] = bool(exhaust_facts.get("rejections_explicit", False))
+            m["superuser_slot_honoured"] = bool(exhaust_facts.get("superuser_slot_honoured", False))
+            m["existing_sessions_unaffected"] = (m.get("dropped_connections", 0) == 0 and m.get("failed_transactions", 0) == 0)
 
         if self.scenario.repeat is not None:
             cycles = per_cycle_recovery(events, self.cycle_t0s, expect_outage=expect_outage)

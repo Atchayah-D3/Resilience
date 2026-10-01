@@ -1014,3 +1014,108 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         except Exception as exc:
             return {"checksum_failures": 0, "ok": False, "error": str(exc)}
 
+    async def exhaust_connections(self, hold_duration_s: float = 2.0) -> dict[str, Any]:
+        """Connection exhaustion under load (NL-R-04: max_connections + 50% concurrent attempts)."""
+        t0_mono_ns = time.monotonic_ns()
+        max_conn = 100
+        su_reserved = 3
+
+        # Query live database GUC settings for max_connections and superuser_reserved_connections
+        try:
+            conn = await self._connect(timeout_s=5.0)
+            try:
+                row = await conn.fetchrow("SHOW max_connections")
+                if row and str(row[0]).isdigit():
+                    max_conn = int(row[0])
+                row2 = await conn.fetchrow("SHOW superuser_reserved_connections")
+                if row2 and str(row2[0]).isdigit():
+                    su_reserved = int(row2[0])
+            finally:
+                await conn.close()
+        except Exception:
+            # Fallback to SSH psql if direct connection is blocked
+            try:
+                async with RemoteHost(self.node.ssh) as host:
+                    res = await host.run(
+                        f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -At -p {self.node.db.port} "
+                        f"-d {shlex.quote(self.node.db.dbname)} -c 'SHOW max_connections; SHOW superuser_reserved_connections;'",
+                        timeout_s=10.0, check=False
+                    )
+                    if res.exit_status == 0:
+                        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip().isdigit()]
+                        if len(lines) >= 1:
+                            max_conn = int(lines[0])
+                        if len(lines) >= 2:
+                            su_reserved = int(lines[1])
+            except Exception:
+                pass
+
+        # Framework §10.5: Open max_connections + 50% concurrent sessions under active load
+        total_flood_target = max(10, int(max_conn * 1.5))
+        self._holding_conns = []
+        rejection_errors: list[str] = []
+
+        async def _flood_worker():
+            try:
+                return await self._connect(self.node.client, timeout_s=3.0, command_timeout=None)
+            except asyncpg.TooManyConnectionsError as exc:
+                rejection_errors.append(str(exc))
+                return None
+            except Exception as exc:
+                rejection_errors.append(str(exc))
+                return None
+
+        try:
+            tasks = [_flood_worker() for _ in range(total_flood_target)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for c in results:
+                if c is not None and not isinstance(c, Exception):
+                    self._holding_conns.append(c)
+        except Exception:
+            pass
+
+        rejections_explicit = False
+        rejection_error = ""
+        if self._holding_conns and rejection_errors:
+            rejection_error = rejection_errors[0]
+            explicit_count = sum(
+                1 for err in rejection_errors
+                if "53300" in err or "too many clients" in err.lower() or "remaining connection slots are reserved" in err.lower()
+            )
+            if explicit_count > 0:
+                rejections_explicit = True
+
+        superuser_slot_honoured = False
+        try:
+            su_conn = await self._connect(self.node.db, timeout_s=2.0, command_timeout=None)
+            superuser_slot_honoured = True
+            await su_conn.close()
+        except Exception:
+            superuser_slot_honoured = False
+
+        held_count = len(self._holding_conns)
+
+        return {
+            "action": "connection_exhaustion",
+            "t0_mono_ns": t0_mono_ns,
+            "max_connections": max_conn,
+            "superuser_reserved": su_reserved,
+            "attempted_connections": total_flood_target,
+            "held_connections": held_count,
+            "rejected_connections": len(rejection_errors),
+            "rejections_explicit": rejections_explicit,
+            "rejection_error": rejection_error,
+            "superuser_slot_honoured": superuser_slot_honoured,
+        }
+
+    async def revert_exhaust_connections(self) -> dict[str, Any]:
+        drained = 0
+        for c in getattr(self, "_holding_conns", []):
+            try:
+                await c.close()
+                drained += 1
+            except Exception:
+                pass
+        self._holding_conns = []
+        return {"action": "connection_exhaustion_drained", "drained": drained, "state": "active"}
+

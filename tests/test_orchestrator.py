@@ -121,12 +121,27 @@ class OutageAdapter(FakeAdapter):
             "redo_advanced": True,
         }
 
+    async def exhaust_connections(self, hold_duration_s: float = 2.0) -> dict[str, Any]:
+        return {
+            "action": "connection_exhaustion",
+            "t0_mono_ns": time.monotonic_ns(),
+            "max_connections": 100,
+            "superuser_reserved": 3,
+            "held_connections": 97,
+            "rejections_explicit": True,
+            "rejection_error": "FATAL: remaining connection slots are reserved for roles with the SUPERUSER attribute",
+            "superuser_slot_honoured": True,
+        }
+
+    async def revert_exhaust_connections(self) -> dict[str, Any]:
+        return {"action": "connection_exhaustion_drained", "state": "active"}
+
 
 class FakeFault(FaultInjector):
     """`process_kill` takes the engine down for OUTAGE_S; `config_reload` disturbs nothing.
     `lands=False` models a kill that never took effect."""
 
-    fault_types = frozenset({"process_kill", "config_reload"})
+    fault_types = frozenset({"process_kill", "config_reload", "connection_exhaustion"})
     driver_name = "os_ssh"
     lands = True
     reverts: list[dict[str, Any]] = []
@@ -138,6 +153,17 @@ class FakeFault(FaultInjector):
         if self.fault_type == "process_kill" and self.lands:
             Engine.down = True
             asyncio.get_running_loop().call_later(OUTAGE_S, lambda: setattr(Engine, "down", False))
+        if self.fault_type == "connection_exhaustion":
+            return {
+                "action": "connection_exhaustion",
+                "t0_mono_ns": time.monotonic_ns(),
+                "max_connections": 100,
+                "superuser_reserved": 3,
+                "held_connections": 97,
+                "rejections_explicit": True,
+                "rejection_error": "FATAL: remaining connection slots are reserved",
+                "superuser_slot_honoured": True,
+            }
         return {"action": self.fault_type}
 
     async def revert(self, node, detail=None):

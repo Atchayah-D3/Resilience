@@ -58,7 +58,7 @@ Environment = Literal["lab", "staging"]  # Framework §7.1: never production
 
 # Arch §5 -- fault types (one FaultInjector interface; the env profile picks the driver).
 FaultType = Literal[
-    "process_kill", "service_restart", "config_reload", "resource_limit", "resource_stress", "network_delay", "network_loss",
+    "process_kill", "service_restart", "config_reload", "connection_exhaustion", "resource_limit", "resource_stress", "network_delay", "network_loss",
     "network_rate", "network_partition", "proxy_fault", "storage_write_loss", "storage_latency",
     "filesystem_full", "host_power_loss", "clock_skew", "data_corruption", "counter_preseed",
 ]
