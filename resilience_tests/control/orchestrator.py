@@ -67,7 +67,7 @@ RECOVERY_EXIT_MARGIN_S = 5.0  # leave the recovery loop before its phase timeout
 OUTAGE_FAULTS = frozenset({"process_kill", "service_restart", "host_power_loss"})
 # Faults the service recovers from on its own; the ledger entry stays outstanding until
 # cleanup's revert has confirmed the node is back in its pre-fault state.
-UNATTENDED_FAULTS = frozenset({"process_kill", "service_restart", "config_reload", "connection_exhaustion"})
+UNATTENDED_FAULTS = frozenset({"process_kill", "service_restart", "config_reload", "connection_exhaustion", "idle_in_transaction"})
 
 
 class TargetBusy(RuntimeError):
@@ -333,10 +333,21 @@ class TestOrchestrator:
             tuning = await self.adapter.configure_for_scenario(self.scenario.id)
             if tuning and isinstance(tuning, dict):
                 self.facts["scenario_tuning"] = tuning
-                self.disclosures.append(
-                    f"Scenario tuning applied (Option A): {', '.join(f'{k}={v}' for k, v in sorted(tuning.items()))} "
-                    f"(baseline, TPS floor, and SLO recovery measured under this tuning)"
-                )
+                if self.scenario.id == "NL-M-05":
+                    # SHOW-only: the value was observed, not written. Never word this as
+                    # "tuning applied", and cleanup must not restore (RESET) it.
+                    observed = {k.replace("observed_", ""): v for k, v in tuning.items()
+                                if k.startswith("observed_")}
+                    self.facts["scenario_observed"] = observed
+                    self.disclosures.append(
+                        f"Observed deployment configuration (not modified): "
+                        f"{', '.join(f'{k}={v}' for k, v in sorted(observed.items()))}"
+                    )
+                else:
+                    self.disclosures.append(
+                        f"Scenario tuning applied (Option A): {', '.join(f'{k}={v}' for k, v in sorted(tuning.items()))} "
+                        f"(baseline, TPS floor, and SLO recovery measured under this tuning)"
+                    )
             elif self.scenario.id == "NL-C-05":
                 err = getattr(self.adapter, "_scenario_config_error", None) or "returned empty"
                 self.facts["scenario_tuning_error"] = err
@@ -466,15 +477,42 @@ class TestOrchestrator:
             )
             await asyncio.sleep(0.05)
 
-        detail = await self.injector.inject(self.node)
-        if index_task is not None and not index_task.done():
-            index_task.cancel()
+        idle_detail: dict[str, Any] = {}
+        idle_supports = False
+        if self.scenario.id == "NL-M-05" or self.scenario.fault.type == "idle_in_transaction":
+            try:
+                idle_detail = await self.adapter.inject_idle_transaction()
+            except Exception as exc:
+                self.facts["idle_injection_error"] = f"{type(exc).__name__}: {exc}"
+                idle_detail = {"supported": False, "error": str(exc)}
+            self.facts["idle_transaction"] = idle_detail
+            idle_supports = bool(idle_detail.get("supported"))
+
+        if idle_supports:
+            # The adapter session IS the injection for idle_in_transaction (it is the session
+            # the harness later observes in check_idle_transaction). Injecting the same fault
+            # again through the generic SSH injector would open a second lingering transaction
+            # that is never measured -- and, using pg_sleep, would never even be `idle in
+            # transaction` state. T0 is the moment that session became idle.
+            detail = dict(idle_detail)
+            detail.pop("t0_mono_ns", None)
+            detail["t0_mono_ns"] = time.monotonic_ns()
+            sampling_delay_ms = round((detail["t0_mono_ns"] - redo_sample_mono_ns) / 1e6, 2)
+        else:
+            if idle_detail:
+                # injection unsupported: never read a missing backend as a timeout enforcement
+                self.facts["idle_injection_unsupported"] = True
+            detail = await self.injector.inject(self.node)
+            if index_task is not None and not index_task.done():
+                index_task.cancel()
+            sampling_delay_ms = round(((detail.get("t0_mono_ns") or time.monotonic_ns()) - redo_sample_mono_ns) / 1e6, 2)
         t0 = detail.pop("t0_mono_ns", None) or time.monotonic_ns()
-        sampling_delay_ms = round((t0 - redo_sample_mono_ns) / 1e6, 2)
         self.t0_ns = t0 if self.t0_ns is None else self.t0_ns   # T0 of the run is the first fault
         self.cycle_t0s.append(t0)
         if checkpoint_detail:
             detail["checkpoint"] = checkpoint_detail
+        if idle_detail:
+            detail["idle_transaction"] = idle_detail
         self.ledger.transition(entry, "applied", inject=detail, cycle=cycle)
         self.stream.emit("injector", "t0", fault=self.scenario.fault.type, node=self.node.name,
                          t0_mono_ns=t0, cycle=cycle, redo_sampling_delay_ms=sampling_delay_ms, **detail)
@@ -724,7 +762,8 @@ class TestOrchestrator:
 
         try:
             integrity = await self.adapter.integrity_check(timeout_s=self.profile.phase_timeouts_s["validate"] / 2)
-            (self.run_dir / INTEGRITY_FILE).write_text(integrity.raw_output)
+            raw = (integrity.raw_output or "").strip()
+            (self.run_dir / INTEGRITY_FILE).write_text(f"{raw}\n" if raw else "pg_amcheck run clean (exit 0)\n")
             # A capability the engine lacks is NOT_APPLICABLE, never zero: a criterion that
             # depends on it then fails rather than passing on a measurement nobody took.
             structural = (integrity.structural_errors
@@ -786,6 +825,54 @@ class TestOrchestrator:
                 self.facts["checkpoint_aborted"] = None
             m["checkpoint_active_at_kill"] = self.facts.get("checkpoint_active_at_kill", False)
 
+        if self.scenario.id == "NL-M-05" or self.scenario.fault.type == "idle_in_transaction":
+            idle_fact = self.facts.get("idle_transaction") or {}
+            idle_pid = idle_fact.get("pid")
+            idle_injected = bool(idle_fact.get("supported"))
+            if not idle_injected:
+                self.facts["idle_injection_unsupported"] = True
+            try:
+                idle_check = await self.adapter.check_idle_transaction(idle_pid)
+            except Exception as exc:
+                self.facts["idle_check_error"] = f"{type(exc).__name__}: {exc}"
+                idle_check = {"terminated_by_timeout": False, "still_idle": False, "error": str(exc)}
+            try:
+                bloat_check = await self.adapter.evaluate_vacuum_bloat()
+            except Exception as exc:
+                self.facts["vacuum_bloat_error"] = f"{type(exc).__name__}: {exc}"
+                bloat_check = {"dead_tuple_ratio": 0.0, "unvacuumed_dead_tuples": 0, "bloat_alert_fired": False}
+
+            self.facts["idle_transaction_check"] = idle_check
+            self.facts["vacuum_bloat_check"] = bloat_check
+
+            self.disclosures.append(
+                "dead-tuple metrics are from pg_stat_user_tables planner statistics, "
+                "updated at analyze/vacuum and potentially stale while vacuum is blocked; "
+                "treated as an operational alert basis, not an exact count"
+            )
+            timing = {k: bloat_check.get(k) for k in ("last_vacuum", "last_autovacuum", "last_analyze", "last_autoanalyze") if bloat_check.get(k)}
+            if timing:
+                self.facts["vacuum_bloat_timing"] = timing
+            if not bloat_check.get("last_analyze") and not bloat_check.get("last_autoanalyze"):
+                self.disclosures.append(
+                    "No analyze ran during the hold; planner statistics may reflect pre-hold dead tuple estimates."
+                )
+
+            # Fail-closed on the injection itself: if no idle session was ever established, a
+            # missing backend CANNOT be read as "the engine enforced the timeout" -- that would
+            # report a passed path A for a fault that never existed. Similarly, Path B (bloat alert)
+            # must require that an idle session was actually injected and holding vacuum.
+            timeout_enforced = bool(idle_check.get("terminated_by_timeout", False)) and idle_injected and idle_pid is not None
+            bloat_alert = bool(bloat_check.get("bloat_alert_fired", False)) and idle_injected and idle_pid is not None
+
+            m["idle_in_transaction_session_timeout_enforced"] = timeout_enforced
+            m["bloat_alert_fired"] = bloat_alert
+            m["dead_tuple_ratio"] = float(bloat_check.get("dead_tuple_ratio", 0.0))
+            m["unvacuumed_dead_tuples"] = int(bloat_check.get("unvacuumed_dead_tuples", 0))
+            m["oldest_transaction_age_s"] = float(bloat_check.get("oldest_transaction_age_s", 0.0))
+            if "bloat_ratio" in bloat_check and bloat_check.get("bloat_ratio") is not None:
+                m["bloat_ratio"] = float(bloat_check["bloat_ratio"])
+
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).
         self.facts["declared_not_produced"] = sorted(set(self.scenario.measure) - set(m))
@@ -805,6 +892,11 @@ class TestOrchestrator:
         await self._stop_load()
         if self.log_tailer:
             await self.log_tailer.stop()
+        if hasattr(self.adapter, "close_idle_transaction"):
+            try:
+                await self.adapter.close_idle_transaction()
+            except Exception as exc:
+                self.facts["close_idle_error"] = f"{type(exc).__name__}: {exc}"
         reverted = await revert_outstanding(self.profile, self.ledger, run_id=self.run_id)
         try:
             if hasattr(self.adapter, "restore_scenario_configuration"):

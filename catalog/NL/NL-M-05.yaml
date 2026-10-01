@@ -1,0 +1,88 @@
+# NL-M-05 -- Idle-in-transaction blocking vacuum (Framework §10.7, Tier 1, P1).
+# Fault injection: An idle transaction held for 2 h under write load.
+# Acceptance: idle_in_transaction_session_timeout enforced, or a bloat alert fires.
+#
+# An open transaction holding an active snapshot pins the global vacuum horizon (backend_xmin
+# in pg_stat_activity), preventing autovacuum from removing dead row versions created by
+# concurrent write/churn activity. Under sustained write load, unvacuumed dead tuples accumulate,
+# resulting in relation and index bloat, storage growth, and buffer degradation.
+#
+# Production systems defend against this failure through two standard mechanisms:
+# 1. idle_in_transaction_session_timeout: The engine automatically terminates lingering idle
+#    sessions with FATAL (SQLSTATE 25P03/57P01), rolls back the transaction, and advances the
+#    xmin horizon so autovacuum can resume pruning dead tuples.
+# 2. Bloat alerting: In environments where timeout is unconfigured (0) or long, telemetry probes
+#    detect dead-tuple accumulation (dead_tuple_ratio >= 0.20 per Framework §10.7 NL-M-04) and
+#    raise an operational bloat alert before storage exhaustion occurs.
+#
+# In a test harness, holding for the full 2 h production duration is accelerated via calibrated
+# timeout evaluation or dead-tuple bloat accumulation measurement under active churn load.
+# All acknowledged writes must be preserved with rpo_txn == 0, and the database relations must
+# remain structurally intact with structural_integrity_errors == 0.
+id: NL-M-05
+name: Idle-in-transaction blocking vacuum
+tier: node_local
+category: NL-M
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-M is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 150
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: mixed                 # markers (append-only) PLUS update/delete churn to generate dead tuples
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 200
+
+fault:
+  type: idle_in_transaction
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:                        # engine capabilities this scenario needs (Arch §8)
+  - transactional_markers
+  - workload_churn               # without churn, no dead tuples are generated to block
+  - structural_integrity_check
+
+measure:
+  - idle_in_transaction_session_timeout_enforced  # Framework §10.7
+  - bloat_alert_fired                             # Framework §10.7
+  - oldest_transaction_age_s
+  - dead_tuple_ratio
+  - unvacuumed_dead_tuples
+  - bloat_ratio
+  - rpo_txn
+  - indeterminate_txn
+  - structural_integrity_errors
+  - corruption_count
+
+accept:
+  - idle_in_transaction_session_timeout_enforced == true or bloat_alert_fired == true
+  - rpo_txn == 0
+  - structural_integrity_errors == 0
+  - corruption_count == 0
+
+priority: P1
+
+description: >
+  An idle transaction with an open snapshot is held on the primary node under write load,
+  pinning the vacuum xmin horizon. Autovacuum is blocked from reclaiming dead tuples generated
+  by concurrent churn traffic. Either the server enforces idle_in_transaction_session_timeout
+  to terminate the session and advance the horizon, or an operational bloat alert fires as
+  dead tuples accumulate (Framework §10.7). Crash recovery and storage stack durability are
+  covered by categories NL-C and NL-D.

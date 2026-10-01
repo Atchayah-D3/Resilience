@@ -101,6 +101,20 @@ def render_summary(r: dict[str, Any]) -> str:
             lines.append(f"  stat counter delta (pg_stat_checkpointer.buffers_written): {cp['buffers_written_during_cp']}")
         if cp.get("io_writes_during_cp") is not None:
             lines.append(f"  io writes delta (pg_stat_io): {cp['io_writes_during_cp']}")
+    idle = (r.get("facts") or {}).get("idle_transaction")
+    if idle:
+        idle_chk = (r.get("facts") or {}).get("idle_transaction_check") or {}
+        bloat_chk = (r.get("facts") or {}).get("vacuum_bloat_check") or {}
+        lines += [
+            "",
+            "idle-in-transaction vacuum blocking (NL-M-05):",
+            f"  idle backend pid: {idle.get('pid')}",
+            f"  backend_xmin: {idle.get('backend_xmin')}",
+            f"  timeout enforced: {idle_chk.get('terminated_by_timeout')}",
+            f"  bloat alert fired: {bloat_chk.get('bloat_alert_fired')}",
+            f"  dead tuple ratio: {bloat_chk.get('dead_tuple_ratio')}",
+            f"  unvacuumed dead tuples: {bloat_chk.get('unvacuumed_dead_tuples')}",
+        ]
     if r.get("measured"):
         rendered = []
         for k, v in sorted(r["measured"].items()):
@@ -112,13 +126,15 @@ def render_summary(r: dict[str, Any]) -> str:
     tuning = (r.get("facts") or {}).get("scenario_tuning")
     tuning_err = (r.get("facts") or {}).get("scenario_tuning_error")
     deviations = (r.get("facts") or {}).get("config_deviations")
+    scenario_id = (r.get("scenario") or {}).get("id")
     if tuning:
         lines += [
             "",
             "scenario tuning (Option A):",
             *[f"  {k} = {v}" for k, v in sorted(tuning.items())],
-            "  note: baseline, TPS floor, and SLO recovery were measured under this tuning",
         ]
+        if scenario_id == "NL-C-05":
+            lines.append("  note: baseline, TPS floor, and SLO recovery were measured under this tuning")
     elif tuning_err:
         lines += [
             "",

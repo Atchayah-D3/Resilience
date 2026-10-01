@@ -238,6 +238,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         self._checksum_baseline: ChecksumStats | None = None
         self._scenario_config_applied: dict[str, str] = {}
         self._scenario_config_error: str | None = None
+        self._scenario_observed: dict[str, str] = {}
 
     async def _connect(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0,
                        command_timeout: float | None = _SAME_AS_CONNECT) -> asyncpg.Connection:
@@ -835,6 +836,238 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                     "checksum_baseline_taken": baseline is not None},
         )
 
+    async def inject_idle_transaction(self) -> dict[str, Any]:
+        """Inject an open idle-in-transaction holding back the vacuum xmin horizon (NL-M-05).
+        Opens a dedicated session, issues BEGIN, and runs a query to establish an active snapshot
+        and pin backend_xmin, then leaves the session idle."""
+        conn: Any = None
+        try:
+            conn = await self._connect(timeout_s=10.0)
+            pid = await conn.fetchval("SELECT pg_backend_pid()")
+            await conn.execute("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            try:
+                await conn.execute("SELECT txid_current()")
+            except Exception:
+                await conn.execute("SELECT 1")
+            row = await conn.fetchrow(
+                "SELECT pid, state, backend_xmin, backend_xid, "
+                "EXTRACT(EPOCH FROM (now() - xact_start)) AS xact_age_s "
+                "FROM pg_stat_activity WHERE pid = $1",
+                pid,
+            )
+            xmin = str(row["backend_xmin"]) if row and row.get("backend_xmin") else None
+            state = str(row["state"]) if row and row.get("state") else "idle in transaction"
+            self._idle_conn = conn
+            self._idle_pid = pid
+            self._idle_xmin = xmin
+            return {
+                "supported": True,
+                "pid": pid,
+                "backend_xmin": xmin,
+                "state": state,
+                "xact_age_s": float(row["xact_age_s"]) if row and row.get("xact_age_s") is not None else 0.0,
+            }
+        except Exception as exc:
+            # Latent double-session prevention: cleanly roll back and close any partially
+            # opened connection before falling back to SSH.
+            if conn is not None:
+                try:
+                    if not conn.is_closed():
+                        await conn.execute("ROLLBACK")
+                    await conn.close()
+                except Exception:
+                    pass
+                conn = None
+            self._idle_conn = None
+            self._idle_pid = None
+            self._idle_xmin = None
+            try:
+                async with RemoteHost(self.node.ssh) as host:
+                    psql = shlex.quote(self.node.pg_bin + '/psql')
+                    sql = "BEGIN; SELECT txid_current();"
+                    cmd = (
+                        f"cd /tmp && nohup bash -c '("
+                        f"echo {shlex.quote(sql)}; sleep 7200"
+                        f") | {psql} -X -p {self.node.db.port} -d {shlex.quote(self.node.db.dbname)}' "
+                        f">/dev/null 2>&1 & echo $!"
+                    )
+                    r = await host.run(as_user(self.node.os_user, cmd), timeout_s=10.0, check=False)
+                    bg_pid = int(r.stdout.strip()) if r.stdout.strip().isdigit() else None
+                    self._idle_pid = bg_pid
+                    return {"supported": True, "pid": bg_pid, "method": "ssh_background"}
+            except Exception as fb_exc:
+                return {"supported": False, "error": f"{type(exc).__name__}: {exc} (fallback: {fb_exc})"}
+
+    async def check_idle_transaction(self, pid: int | None = None) -> dict[str, Any]:
+        """Check status of the idle-in-transaction backend (NL-M-05).
+        Determines whether the session was terminated by idle_in_transaction_session_timeout
+        or is still alive in pg_stat_activity."""
+        target_pid = pid or getattr(self, "_idle_pid", None)
+        if target_pid is None:
+            # No session was ever established. "The backend is absent" must never be read as
+            # "the engine enforced idle_in_transaction_session_timeout" -- that is the
+            # fail-open a crashed or failed injection would otherwise report as path A.
+            return {
+                "pid": None,
+                "terminated_by_timeout": False,
+                "still_idle": False,
+                "conn_closed": False,
+                "note": "no idle transaction session was established (injection did not produce a backend pid)",
+            }
+
+        # Query pg_stat_activity first without touching the held session!
+        # Running SELECT 1 inside an open READ COMMITTED transaction takes a new snapshot
+        # and advances backend_xmin, mutating the very state we are measuring.
+        # Only probe the connection if the backend row is absent from pg_stat_activity.
+        try:
+            stat_conn = await self._connect(timeout_s=5.0)
+            try:
+                row = await stat_conn.fetchrow(
+                    "SELECT pid, state, backend_xmin, "
+                    "EXTRACT(EPOCH FROM (now() - xact_start)) AS xact_age_s, "
+                    "wait_event_type, wait_event "
+                    "FROM pg_stat_activity WHERE pid = $1",
+                    target_pid,
+                )
+                if row is not None:
+                    return {
+                        "pid": target_pid,
+                        "terminated_by_timeout": False,
+                        "still_idle": "idle" in str(row["state"]).lower(),
+                        "state": str(row["state"]),
+                        "backend_xmin": str(row["backend_xmin"]) if row.get("backend_xmin") else None,
+                        "age_s": float(row["xact_age_s"] or 0.0),
+                        "wait_event": row.get("wait_event"),
+                    }
+            finally:
+                await stat_conn.close()
+        except Exception:
+            pass
+
+        # Backend is not present in pg_stat_activity. Now probe the held session to confirm
+        # whether the server terminated it (Path A).
+        conn = getattr(self, "_idle_conn", None)
+        conn_closed = False
+        if conn is not None:
+            if conn.is_closed():
+                conn_closed = True
+            else:
+                try:
+                    await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=0.5)
+                except Exception as exc:
+                    conn_closed = True
+                    self._idle_conn_error = str(exc)
+
+        if conn_closed:
+            return {
+                "pid": target_pid,
+                "terminated_by_timeout": True,
+                "still_idle": False,
+                "conn_closed": True,
+                "note": "harness session was closed and the backend is no longer present "
+                        "(idle_in_transaction_session_timeout presumed)",
+            }
+        return {
+            "pid": target_pid,
+            "terminated_by_timeout": False,
+            "still_idle": False,
+            "conn_closed": False,
+            "note": "backend not present but the harness session did not close; "
+                    "timeout enforcement NOT confirmed",
+        }
+
+    async def close_idle_transaction(self) -> dict[str, Any]:
+        """Cleanly terminate or rollback any active idle-in-transaction connection (NL-M-05)."""
+        pid = getattr(self, "_idle_pid", None)
+        conn = getattr(self, "_idle_conn", None)
+        detail: dict[str, Any] = {"pid": pid}
+        if conn is not None:
+            try:
+                if not conn.is_closed():
+                    await conn.execute("ROLLBACK")
+                    await conn.close()
+                detail["conn_closed"] = True
+            except Exception as exc:
+                detail["conn_close_error"] = str(exc)
+            finally:
+                self._idle_conn = None
+        if pid is not None:
+            try:
+                stat_conn = await self._connect(timeout_s=5.0)
+                try:
+                    terminated = await stat_conn.fetchval("SELECT pg_terminate_backend($1)", pid)
+                    detail["pg_terminate_backend"] = terminated
+                finally:
+                    await stat_conn.close()
+            except Exception:
+                try:
+                    async with RemoteHost(self.node.ssh) as host:
+                        await host.run(as_root(f"kill -9 {pid} 2>/dev/null || true"), timeout_s=5.0, check=False)
+                        detail["killed_via_ssh"] = True
+                except Exception:
+                    pass
+            self._idle_pid = None
+        return detail
+
+    async def evaluate_vacuum_bloat(self) -> dict[str, Any]:
+        """Evaluate relation dead-tuple accumulation and operational bloat alert telemetry
+        under blocked vacuum (NL-M-05)."""
+        try:
+            conn = await self._connect(timeout_s=5.0)
+            try:
+                row = await conn.fetchrow(
+                    "SELECT COALESCE(SUM(n_live_tup), 0) AS live_tup, "
+                    "COALESCE(SUM(n_dead_tup), 0) AS dead_tup, "
+                    "MAX(last_vacuum)::text AS last_vacuum, "
+                    "MAX(last_autovacuum)::text AS last_autovacuum, "
+                    "MAX(last_analyze)::text AS last_analyze, "
+                    "MAX(last_autoanalyze)::text AS last_autoanalyze "
+                    "FROM pg_stat_user_tables "
+                    "WHERE schemaname = 'resilience' AND relname IN ('churn', 'markers')"
+                )
+                row_dict = dict(row) if row else {}
+                live = int(row_dict.get("live_tup", 0))
+                dead = int(row_dict.get("dead_tup", 0))
+                total = live + dead
+                ratio = round(dead / total, 4) if total > 0 else 0.0
+
+                max_age_row = await conn.fetchval(
+                    "SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (now() - xact_start))), 0) "
+                    "FROM pg_stat_activity "
+                    "WHERE state LIKE 'idle in transaction%'"
+                )
+                oldest_age = round(float(max_age_row or 0.0), 2)
+                # NL-M-04 sets the operational alert at dead_tuple_ratio >= 0.20. The idle
+                # session's age is reported on its own (oldest_transaction_age_s); making the
+                # "bloat alert" also fire merely because a session is old would conflate "the
+                # fault is still open" with "dead tuples are actually accumulating", and would
+                # pass a run that never produced any bloat at all.
+                bloat_alert = ratio >= 0.20
+                bloat_ratio = round((live + dead) / max(live, 1), 4)
+
+                return {
+                    "dead_tuple_ratio": ratio,
+                    "unvacuumed_dead_tuples": dead,
+                    "live_tuples": live,
+                    "bloat_ratio": bloat_ratio,
+                    "oldest_transaction_age_s": oldest_age,
+                    "bloat_alert_fired": bloat_alert,
+                    "last_vacuum": row_dict.get("last_vacuum"),
+                    "last_autovacuum": row_dict.get("last_autovacuum"),
+                    "last_analyze": row_dict.get("last_analyze"),
+                    "last_autoanalyze": row_dict.get("last_autoanalyze"),
+                }
+            finally:
+                await conn.close()
+        except Exception as exc:
+            return {
+                "dead_tuple_ratio": 0.0,
+                "unvacuumed_dead_tuples": 0,
+                "oldest_transaction_age_s": 0.0,
+                "bloat_alert_fired": False,
+                "error": str(exc),
+            }
+
     async def configure_for_scenario(self, scenario_id: str) -> dict[str, str]:
         """Apply temporary configuration specific to a scenario before workload starts.
 
@@ -843,12 +1076,31 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         This bounds healthy bloat to <= 1.05 and enables a strict, defensible acceptance gate
         at bloat_ratio <= 1.15.
 
+        For NL-M-05 (Idle-in-transaction blocking vacuum): inspects current
+        idle_in_transaction_session_timeout setting and records baseline for verification.
+
         Settings are written to postgresql.auto.conf (ALTER SYSTEM) so they persist across all
-        10 SIGKILL crash restarts during the run, and are restored cleanly in
+        crash restarts during the run, and are restored cleanly in
         restore_scenario_configuration() at cleanup.
 
         For other scenarios: any leftover autovacuum tuning from a previous run is actively
         cleaned up to ensure baseline and recovery are not contaminated."""
+        if scenario_id == "NL-M-05":
+            # Observed only, never applied: the harness must not claim "tuning applied" for a
+            # value it merely read, and cleanup must NOT ALTER SYSTEM RESET a deployment's
+            # idle_in_transaction_session_timeout that the harness never wrote.
+            try:
+                conn = await self._connect(timeout_s=10.0)
+                try:
+                    timeout = await conn.fetchval("SHOW idle_in_transaction_session_timeout")
+                    self._scenario_observed = {
+                        "idle_in_transaction_session_timeout": str(timeout),
+                    }
+                    return {"observed_idle_in_transaction_session_timeout": str(timeout)}
+                finally:
+                    await conn.close()
+            except Exception:
+                return {}
         if scenario_id != "NL-C-05":
             await self.cleanup_leftover_configuration()
             return {}
@@ -940,7 +1192,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         """Reset any scenario-tuning parameters that may have leaked into postgresql.auto.conf
         from previous failed runs."""
         deviations = await self.config_deviations()
-        scenario_params = {"autovacuum_naptime", "autovacuum_vacuum_cost_delay"}
+        scenario_params = {"autovacuum_naptime", "autovacuum_vacuum_cost_delay", "idle_in_transaction_session_timeout"}
         leftover = {k: v for k, v in deviations.items() if k in scenario_params}
         if not leftover:
             return {}
@@ -973,11 +1225,12 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         ensuring the database is restored cleanly without leaving altered settings."""
         if not self._scenario_config_applied:
             return
+        keys = list(self._scenario_config_applied.keys())
         try:
             conn = await self._connect(timeout_s=10.0)
             try:
-                await conn.execute("ALTER SYSTEM RESET autovacuum_naptime")
-                await conn.execute("ALTER SYSTEM RESET autovacuum_vacuum_cost_delay")
+                for k in keys:
+                    await conn.execute(f"ALTER SYSTEM RESET {k}")
                 await conn.execute("SELECT pg_reload_conf()")
                 self._scenario_config_applied.clear()
             finally:
@@ -987,11 +1240,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             try:
                 async with RemoteHost(self.node.ssh) as host:
                     psql = shlex.quote(self.node.pg_bin + '/psql')
-                    statements = (
-                        "ALTER SYSTEM RESET autovacuum_naptime;",
-                        "ALTER SYSTEM RESET autovacuum_vacuum_cost_delay;",
-                        "SELECT pg_reload_conf();",
-                    )
+                    statements = [f"ALTER SYSTEM RESET {k};" for k in keys] + ["SELECT pg_reload_conf();"]
                     parts = [
                         f"{psql} -X -p {self.node.db.port} "
                         f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(stmt)}"

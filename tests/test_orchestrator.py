@@ -121,6 +121,32 @@ class OutageAdapter(FakeAdapter):
             "redo_advanced": True,
         }
 
+    async def inject_idle_transaction(self) -> dict[str, Any]:
+        """Simulate idle transaction injection for NL-M-05."""
+        return {
+            "supported": True,
+            "pid": 8888,
+            "backend_xmin": "5000",
+            "state": "idle in transaction",
+            "xact_age_s": 0.1,
+        }
+
+    async def check_idle_transaction(self, pid: int | None = None) -> dict[str, Any]:
+        return {
+            "pid": pid or 8888,
+            "terminated_by_timeout": True,
+            "still_idle": False,
+        }
+
+    async def evaluate_vacuum_bloat(self) -> dict[str, Any]:
+        return {
+            "dead_tuple_ratio": 0.05,
+            "unvacuumed_dead_tuples": 10,
+            "live_tuples": 200,
+            "oldest_transaction_age_s": 0.0,
+            "bloat_alert_fired": False,
+        }
+
     async def exhaust_connections(self, hold_duration_s: float = 2.0) -> dict[str, Any]:
         return {
             "action": "connection_exhaustion",
@@ -141,7 +167,7 @@ class FakeFault(FaultInjector):
     """`process_kill` takes the engine down for OUTAGE_S; `config_reload` disturbs nothing.
     `lands=False` models a kill that never took effect."""
 
-    fault_types = frozenset({"process_kill", "config_reload", "connection_exhaustion"})
+    fault_types = frozenset({"process_kill", "config_reload", "connection_exhaustion", "idle_in_transaction"})
     driver_name = "os_ssh"
     lands = True
     reverts: list[dict[str, Any]] = []
@@ -417,3 +443,16 @@ def test_a_node_still_carrying_an_earlier_injection_is_refused(env):
     ledger.transition(stale, "reverted")
     results = run(env, "NL-C-01")
     assert results["status"] == "passed", why(results)
+
+
+def test_nl_m_05_execution(env):
+    """NL-M-05: idle-in-transaction blocking vacuum execution through orchestrator."""
+    results = run(env, "NL-M-05")
+    assert results["status"] == "passed", why(results)
+    m = results["measured"]
+    assert m["rpo_txn"] == 0
+    assert m["structural_integrity_errors"] == 0
+    assert m["corruption_count"] == 0
+    assert m["idle_in_transaction_session_timeout_enforced"] is True or m["bloat_alert_fired"] is True
+    assert "idle_transaction" in results["facts"]
+

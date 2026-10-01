@@ -185,6 +185,27 @@ class BaseDatabaseAdapter(ABC):
         engine-specific verification logic."""
         return {"checkpoint_aborted": None, "method": "default (not implemented)"}
 
+    async def inject_idle_transaction(self) -> dict[str, Any]:
+        """Inject an open idle-in-transaction holding back the vacuum xmin horizon (NL-M-05).
+        Default returns supported=False; subclasses must override."""
+        return {"supported": False, "method": "default (not implemented)"}
+
+    async def check_idle_transaction(self, pid: int | None = None) -> dict[str, Any]:
+        """Check status of the idle-in-transaction backend: whether it was terminated by
+        idle_in_transaction_session_timeout or remains open and holding xmin (NL-M-05)."""
+        return {"terminated_by_timeout": False, "still_idle": False}
+
+    async def close_idle_transaction(self) -> dict[str, Any]:
+        """Cleanly terminate or rollback any active idle-in-transaction connection injected
+        during fault testing (NL-M-05). Must be idempotent."""
+        return {}
+
+    async def evaluate_vacuum_bloat(self) -> dict[str, Any]:
+        """Evaluate relation dead-tuple accumulation and operational bloat alert telemetry
+        under blocked vacuum (NL-M-05). Default returns baseline counters."""
+        return {"dead_tuple_ratio": 0.0, "unvacuumed_dead_tuples": 0, "bloat_alert_fired": False,
+                "oldest_transaction_age_s": 0.0}
+
     async def configure_for_scenario(self, scenario_id: str) -> dict[str, str]:
         """Apply temporary engine configuration specific to a scenario before workload starts
         (e.g. tuning autovacuum for rapid repeated-cycle bloat testing in NL-C-05).
