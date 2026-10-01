@@ -160,12 +160,6 @@ class BaseDatabaseAdapter(ABC):
         evidence. Engines with no cumulative counters need not override it."""
         return {}
 
-    async def quick_integrity_check(self) -> dict[str, Any]:
-        """A lightweight inter-cycle integrity check to localize corruptions to the cycle
-        that caused them without running a full structural check.
-        Default: returns {"checksum_failures": 0, "ok": True}."""
-        return {"checksum_failures": 0, "ok": True}
-
     @abstractmethod
     async def integrity_check(self, timeout_s: float) -> IntegrityResult:
         """Structural and checksum verification, as far as the engine supports it. Counters
@@ -245,6 +239,11 @@ class BaseDatabaseAdapter(ABC):
     async def cleanup_index(self, index_name: str) -> bool:
         """Drop or rebuild an index. Returns True if cleanup succeeded."""
         return True
+
+    async def quick_integrity_check(self) -> dict[str, Any]:
+        """A fast inter-cycle checksum check to localize corruptions to the cycle that caused them.
+        Default: returns empty dict."""
+        return {}
 
 
 
