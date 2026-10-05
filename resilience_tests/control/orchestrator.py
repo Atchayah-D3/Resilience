@@ -17,6 +17,7 @@ import errno
 import fcntl
 import socket
 import os
+import re
 import sys
 import time
 import uuid
@@ -62,6 +63,33 @@ WORKLOAD_RAMP_S = 2.0  # connections established before the baseline window open
 RECOVERY_POLL_S = 1.0
 ABORT_POLL_S = 1.0
 RECOVERY_EXIT_MARGIN_S = 5.0  # leave the recovery loop before its phase timeout fires
+IDLE_TRANSACTION_GRACE_S = 2.0
+IDLE_TRANSACTION_MIN_SOAK_S = 30.0
+
+
+def parse_pg_interval_s(val: str | None) -> float:
+    """Parse PostgreSQL interval strings such as '30s', '1min', '2h', '500ms', '0' into seconds."""
+    if not val:
+        return 0.0
+    val = str(val).strip().lower()
+    if val in ("0", "disabled", "off", "none"):
+        return 0.0
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)?$", val)
+    if not m:
+        return 0.0
+    num = float(m.group(1))
+    unit = m.group(2) or "s"
+    if unit in ("ms", "millisecond", "milliseconds"):
+        return num / 1000.0
+    elif unit in ("s", "sec", "second", "seconds"):
+        return num
+    elif unit in ("min", "m", "minute", "minutes"):
+        return num * 60.0
+    elif unit in ("h", "hr", "hour", "hours"):
+        return num * 3600.0
+    elif unit in ("d", "day", "days"):
+        return num * 86400.0
+    return num
 # Faults that must interrupt writes. If the probes never see an outage for one of these, the
 # availability gap is not measured rather than reported as ~0 s.
 OUTAGE_FAULTS = frozenset({"process_kill", "service_restart", "host_power_loss"})
@@ -593,6 +621,40 @@ class TestOrchestrator:
         slo_t0 = self.cycle_t0s[-1] if self.scenario.repeat else self.t0_ns
         self.facts["slo_t0_mono_ns"] = slo_t0
         deadline = time.monotonic() + self.profile.phase_timeouts_s["recovery"] - RECOVERY_EXIT_MARGIN_S
+
+        if fault_type == "idle_in_transaction" or self.scenario.id == "NL-M-05":
+            observed_raw = (self.facts.get("scenario_observed") or {}).get("idle_in_transaction_session_timeout")
+            t_s = parse_pg_interval_s(observed_raw)
+            bound_s = float(self.profile.phase_timeouts_s.get("recovery", 900.0))
+            available_bound = max(1.0, bound_s - RECOVERY_EXIT_MARGIN_S)
+            testable = (0.0 < t_s) and ((t_s + IDLE_TRANSACTION_GRACE_S) < available_bound)
+
+            min_soak = min(IDLE_TRANSACTION_MIN_SOAK_S, available_bound)
+            if testable:
+                hold_s = min(max(min_soak, t_s + IDLE_TRANSACTION_GRACE_S), available_bound)
+            else:
+                hold_s = min_soak
+
+            self.facts["idle_hold_s"] = hold_s
+            self.facts["idle_timeout_testable"] = testable
+            self.facts["idle_timeout_parsed_s"] = t_s
+
+            start_mono = time.monotonic()
+            while (time.monotonic() - start_mono) < hold_s and time.monotonic() < deadline:
+                # SLO polling kept only as telemetry, never as the early exit condition for this fault
+                d = decompose(self.stream.events(), slo_t0, baseline, clustered=False,
+                              detection_patterns=self.adapter.fault_detection_log_patterns(),
+                              recovery_patterns=self.adapter.recovery_start_log_patterns(),
+                              expect_outage=False)
+                if d.rto_to_slo_s is not None:
+                    detail["slo_reached_s"] = d.rto_to_slo_s
+                await asyncio.sleep(RECOVERY_POLL_S)
+
+            if detail.get("slo_reached_s") is None:
+                detail["slo_reached_s"] = None
+                detail["note"] = "service did not return to SLO within the soak hold"
+            return detail
+
         while time.monotonic() < deadline:
             d = decompose(self.stream.events(), slo_t0, baseline, clustered=False,
                           detection_patterns=self.adapter.fault_detection_log_patterns(),
@@ -856,6 +918,13 @@ class TestOrchestrator:
             if not bloat_check.get("last_analyze") and not bloat_check.get("last_autoanalyze"):
                 self.disclosures.append(
                     "No analyze ran during the hold; planner statistics may reflect pre-hold dead tuple estimates."
+                )
+            t_s = float(self.facts.get("idle_timeout_parsed_s") or 0.0)
+            testable = bool(self.facts.get("idle_timeout_testable", False))
+            if t_s > 0 and not testable:
+                self.disclosures.append(
+                    f"Configured idle_in_transaction_session_timeout ({t_s:.1f}s) exceeds the recovery soak bound; "
+                    "timeout enforcement was untestable within this run and must be validated via Path B (bloat alerting)."
                 )
 
             # Fail-closed on the injection itself: if no idle session was ever established, a

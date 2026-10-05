@@ -1016,8 +1016,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             conn = await self._connect(timeout_s=5.0)
             try:
                 row = await conn.fetchrow(
-                    "SELECT COALESCE(SUM(n_live_tup), 0) AS live_tup, "
-                    "COALESCE(SUM(n_dead_tup), 0) AS dead_tup, "
+                    "SELECT "
+                    "COALESCE(SUM(CASE WHEN relname = 'churn' THEN n_live_tup END), SUM(n_live_tup), 0) AS live_tup, "
+                    "COALESCE(SUM(CASE WHEN relname = 'churn' THEN n_dead_tup END), SUM(n_dead_tup), 0) AS dead_tup, "
                     "MAX(last_vacuum)::text AS last_vacuum, "
                     "MAX(last_autovacuum)::text AS last_autovacuum, "
                     "MAX(last_analyze)::text AS last_analyze, "

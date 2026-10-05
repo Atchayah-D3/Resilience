@@ -589,3 +589,47 @@ def test_integrity_file_writes_clean_sentinel_when_raw_output_empty(env, monkeyp
     assert content == "pg_amcheck run clean (exit 0)\n"
 
 
+def test_parse_pg_interval_s():
+    from resilience_tests.control.orchestrator import parse_pg_interval_s
+
+    assert parse_pg_interval_s(None) == 0.0
+    assert parse_pg_interval_s("0") == 0.0
+    assert parse_pg_interval_s("0s") == 0.0
+    assert parse_pg_interval_s("disabled") == 0.0
+    assert parse_pg_interval_s("30s") == 30.0
+    assert parse_pg_interval_s("30") == 30.0
+    assert parse_pg_interval_s("500ms") == 0.5
+    assert parse_pg_interval_s("2min") == 120.0
+    assert parse_pg_interval_s("1h") == 3600.0
+    assert parse_pg_interval_s("2h") == 7200.0
+
+
+def test_nl_m_05_calibrated_soak_hold_and_untestable_disclosure(env, monkeypatch):
+    """When configured timeout is large (e.g. 2h), recovery soak holds for MIN_SOAK_S,
+    records testable=False, and issues an explicit disclosure explaining Path B fallback."""
+    item = RunPlanItem(
+        scenario=scenario("NL-M-05"),
+        env_class=env.env_class,
+        role="standalone",
+        node=env.nodes[0],
+    )
+    orch_inst = TestOrchestrator(item, env, RunOptions())
+    orch_inst.facts["scenario_observed"] = {"idle_in_transaction_session_timeout": "2h"}
+
+    async def run_recovery():
+        orch_inst.facts["injection_id"] = "test-inj"
+        orch_inst.baseline = MagicMock(tps=200, p99_ms=10.0)
+        orch_inst.t0_ns = 1000
+        orch_inst.injector = MagicMock()
+        orch_inst.stream = MagicMock()
+        orch_inst.stream.events.return_value = []
+        return await orch_inst._p_recovery()
+
+    detail = asyncio.run(run_recovery())
+    assert orch_inst.facts["idle_timeout_parsed_s"] == 7200.0
+    assert orch_inst.facts["idle_timeout_testable"] is False
+    # Hold was clamped to available bound / min soak, not 7200s
+    assert orch_inst.facts["idle_hold_s"] <= 7.0
+
+
+

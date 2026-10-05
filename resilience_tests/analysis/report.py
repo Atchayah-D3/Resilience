@@ -105,6 +105,7 @@ def render_summary(r: dict[str, Any]) -> str:
     if idle:
         idle_chk = (r.get("facts") or {}).get("idle_transaction_check") or {}
         bloat_chk = (r.get("facts") or {}).get("vacuum_bloat_check") or {}
+        thresh = bloat_chk.get("threshold", 0.20)
         lines += [
             "",
             "idle-in-transaction vacuum blocking (NL-M-05):",
@@ -112,7 +113,7 @@ def render_summary(r: dict[str, Any]) -> str:
             f"  backend_xmin: {idle.get('backend_xmin')}",
             f"  timeout enforced: {idle_chk.get('terminated_by_timeout')}",
             f"  bloat alert fired: {bloat_chk.get('bloat_alert_fired')}",
-            f"  dead tuple ratio: {bloat_chk.get('dead_tuple_ratio')}",
+            f"  dead tuple ratio: {bloat_chk.get('dead_tuple_ratio')} (alert threshold >= {thresh})",
             f"  unvacuumed dead tuples: {bloat_chk.get('unvacuumed_dead_tuples')}",
         ]
     if r.get("measured"):
