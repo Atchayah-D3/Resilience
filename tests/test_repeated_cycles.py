@@ -203,9 +203,11 @@ def test_nl_c_05_encodes_the_framework_criterion():
     sc = CATALOG.scenarios["NL-C-05"]
     assert (sc.repeat.cycles, sc.repeat.interval_s) == (10, 5.0)    # Framework §10.2
     assert "recovery_ratio_last_over_first <= 1.5" in sc.accept
-    # Option A: bloat_ratio is strictly gated at <= 1.15 under dynamically tuned autovacuum
-    assert "bloat_ratio <= 1.15" in sc.accept
-    assert "bloat_ratio" in sc.measure
+    # Framework §16.3: pg_amcheck clean after every Tier-1 scenario
+    assert "structural_integrity_errors == 0" in sc.accept and "corruption_count == 0" in sc.accept
+    # bloat and WAL growth are measured and reported, but nothing gates on a threshold that
+    # was never measured on an untuned server (Framework §13.7)
+    assert not [a for a in sc.accept if "bloat_ratio" in a or "wal_ratio" in a]
     # the cycle count lives in `repeat` alone: an accept rule naming 10 would silently
     # stop checking every cycle the moment someone changed it
     assert "cycles_recovered == cycles_run" in sc.accept
@@ -333,25 +335,24 @@ def test_inter_cycle_quick_integrity_check(env, footprints, monkeypatch):
 
 
 def test_a_footprint_the_engine_cannot_take_is_named_not_merely_absent(env, monkeypatch):
-    """A missing grant is the usual cause. The predicate must fail closed either way, but the
-    report has to say which measurement was impossible and why."""
+    """A missing grant is the usual cause. The figures are reported, not gated, but the report
+    has to say which measurement was impossible and why -- never a silent zero."""
     async def refuses(self) -> dict[str, Any]:
         raise PermissionError("permission denied for function pg_ls_waldir")
 
     monkeypatch.setattr(OutageAdapter, "storage_footprint", refuses)
     results = run_cycles(env)
-    assert results["status"] == "failed", why(results)
-    outcome = {r["predicate"]: r for r in results["verdict"]["results"]}
-    assert outcome["wal_ratio_of_max_wal_size <= 2.0"]["outcome"] == "not_measured"
-    assert "pg_ls_waldir" in outcome["wal_ratio_of_max_wal_size <= 2.0"]["reason"]
+    assert str(results["measured"]["wal_ratio_of_max_wal_size"]) == "NOT_MEASURED"
+    assert "pg_ls_waldir" in results["facts"]["not_measured"]["wal_ratio_of_max_wal_size"]
     assert str(results["measured"]["bloat_ratio"]) == "NOT_MEASURED"
     assert "two are needed" in results["facts"]["not_measured"]["bloat_ratio"]
     # the cycles themselves were still measured: one unreadable number is not a lost run
     assert results["measured"]["cycles_recovered"] == 3
+    assert results["status"] == "passed", why(results)
 
 
 def test_wal_that_cannot_be_read_is_not_reported_as_a_wal_that_never_grew(env, monkeypatch):
-    """Was the temptation: coalesce the WAL columns to 0. A zero passes `<= 2.0` forever."""
+    """Was the temptation: coalesce the WAL columns to 0, which reads as a WAL that never grew."""
     async def no_wal(self) -> dict[str, Any]:
         no_wal.n = getattr(no_wal, "n", 0) + 1
         return {"churn_live_rows": 1000 * no_wal.n, "churn_bytes": 100_000 * no_wal.n,
@@ -361,9 +362,21 @@ def test_wal_that_cannot_be_read_is_not_reported_as_a_wal_that_never_grew(env, m
     results = run_cycles(env)
     assert results["measured"]["bloat_ratio"] == 1.0                  # the table side still works
     assert str(results["measured"]["wal_ratio_of_max_wal_size"]) == "NOT_MEASURED"
-    (wal,) = [r for r in results["verdict"]["results"] if r["predicate"].startswith("wal_ratio")]
-    assert wal["outcome"] == "not_measured" and "pg_ls_waldir" in wal["reason"]
+    assert "pg_ls_waldir" in results["facts"]["not_measured"]["wal_ratio_of_max_wal_size"]
+
+
+def test_corruption_after_the_cycles_fails_the_run(env, footprints, monkeypatch):
+    """Was: NL-C-05 measured pg_amcheck but did not gate it (Framework §16.3 requires it)."""
+    from resilience_tests.adapters.base import IntegrityResult
+
+    async def corrupt(self, timeout_s: float):
+        return IntegrityResult(structural_errors=2, checksum_failures=0)
+
+    monkeypatch.setattr(OutageAdapter, "integrity_check", corrupt)
+    results = run_cycles(env)
     assert results["status"] == "failed", why(results)
+    failed = {r["predicate"] for r in results["verdict"]["results"] if r["outcome"] != "pass"}
+    assert failed == {"structural_integrity_errors == 0", "corruption_count == 0"}
 
 
 def test_the_summary_shows_every_cycle_not_just_the_ratio(env, footprints):
@@ -431,134 +444,20 @@ def test_an_engine_that_cannot_report_replay_depth_still_runs(env, footprints):
     assert "wal_replayed_bytes_max" not in results["measured"]
 
 
-def test_postgres_adapter_configure_and_restore_autovacuum_option_a():
-    """Verify that PostgreSQLAdapter.configure_for_scenario sets autovacuum parameters
-    and restore_scenario_configuration resets them cleanly (Option A)."""
-    async def _test():
-        from unittest.mock import AsyncMock
-        from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
-        from resilience_tests.control.profile import Node
+def test_the_harness_never_retunes_the_server_for_nl_c_05(env, footprints, monkeypatch):
+    """Was: ALTER SYSTEM set autovacuum_naptime = 5s and cost_delay = 0 before the run, so the
+    bloat figure described a server configuration the customer does not run."""
+    observed: list[str] = []
 
-        node = Node(
-            name="test-node",
-            role="standalone",
-            topology_role="primary",
-            ssh={"host": "127.0.0.1", "port": 22, "user": "test"},
-            db={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
-            client={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
-            pgdata="/data",
-            pg_bin="/bin",
-            os_user="postgres",
-            service="postgresql.service",
-            log_file="/data/logfile",
-        )
-        adapter = PostgreSQLAdapter(node)
-        mock_conn = AsyncMock()
-        mock_conn.fetchval.side_effect = ["60s", "2ms"]
-        adapter._connect = AsyncMock(return_value=mock_conn)
+    async def observe(self, fault_type):
+        observed.append(fault_type)
+        return {}
 
-        # 1. Non-NL-C-05 scenario: no changes made
-        await adapter.configure_for_scenario("NL-C-01")
-        assert not adapter._scenario_config_applied
-        assert mock_conn.execute.call_count == 0
-
-        # 2. NL-C-05: tunes autovacuum parameters
-        await adapter.configure_for_scenario("NL-C-05")
-        assert adapter._scenario_config_applied == {
-            "autovacuum_naptime": "60s",
-            "autovacuum_vacuum_cost_delay": "2ms",
-        }
-        execute_calls = [c.args[0] for c in mock_conn.execute.call_args_list]
-        assert any("ALTER SYSTEM SET autovacuum_naptime = '5s'" in c for c in execute_calls)
-        assert any("ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '0'" in c for c in execute_calls)
-        assert any("pg_reload_conf()" in c for c in execute_calls)
-
-        # 3. Clean restoration at scenario completion
-        mock_conn.execute.reset_mock()
-        await adapter.restore_scenario_configuration()
-        assert not adapter._scenario_config_applied
-        restore_calls = [c.args[0] for c in mock_conn.execute.call_args_list]
-        assert any("ALTER SYSTEM RESET autovacuum_naptime" in c for c in restore_calls)
-        assert any("ALTER SYSTEM RESET autovacuum_vacuum_cost_delay" in c for c in restore_calls)
-        assert any("pg_reload_conf()" in c for c in restore_calls)
-
-    asyncio.run(_test())
-
-
-def test_after_cleanup_flags_unrestored_scenario_config(env):
-    """Verify that if scenario configuration cannot be restored, the run fails closed."""
-    item = RunPlanItem(scenario=cycled("NL-C-05", 1, 0.1), env_class=env.env_class,
-                       role="standalone", node=env.nodes[0])
-    orch = TestOrchestrator(item, env, RunOptions())
-    orch.facts["restore_config_error"] = "Connection refused to database"
-    status, error = orch._after_cleanup("passed", None, expect_phase_record=False)
-    assert status == "error"
-    assert "scenario configuration not restored" in error
-
-
-def test_postgres_adapter_configure_ssh_fallback_separate_statements():
-    """Verify that SSH fallback runs each ALTER SYSTEM as its own statement to avoid
-    'ALTER SYSTEM cannot run inside a transaction block', and records errors on failure."""
-    async def _test():
-        from unittest.mock import AsyncMock, patch, MagicMock
-        from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
-        from resilience_tests.control.profile import Node
-
-        node = Node(
-            name="test-node",
-            role="standalone",
-            topology_role="primary",
-            ssh={"host": "127.0.0.1", "port": 22, "user": "test"},
-            db={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
-            client={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
-            pgdata="/data",
-            pg_bin="/bin",
-            os_user="postgres",
-            service="postgresql.service",
-            log_file="/data/logfile",
-        )
-        adapter = PostgreSQLAdapter(node)
-        # Primary asyncpg connection fails (e.g. non-superuser harness role)
-        adapter._connect = AsyncMock(side_effect=PermissionError("must be superuser"))
-
-        mock_host = AsyncMock()
-        mock_result = MagicMock(exit_status=0, stderr="")
-        mock_host.run.return_value = mock_result
-
-        with patch("resilience_tests.adapters.postgresql.adapter.RemoteHost") as MockRemoteHost:
-            MockRemoteHost.return_value.__aenter__.return_value = mock_host
-
-            # 1. Successful fallback: separate statements joined with &&
-            tuning = await adapter.configure_for_scenario("NL-C-05")
-            assert tuning == {"autovacuum_naptime": "5s", "autovacuum_vacuum_cost_delay": "0"}
-            assert adapter._scenario_config_applied == tuning
-
-            assert mock_host.run.call_count == 1
-            cmd = mock_host.run.call_args[0][0]
-            # Must have multiple psql -c invocations joined with &&, never one multi-statement -c
-            assert " && " in cmd
-            assert cmd.count("-c") >= 3
-            assert "autovacuum_naptime" in cmd
-            assert "autovacuum_vacuum_cost_delay" in cmd
-            assert "pg_reload_conf()" in cmd
-
-            # 2. Restoration via SSH fallback also uses separate statements
-            mock_host.run.reset_mock()
-            await adapter.restore_scenario_configuration()
-            assert not adapter._scenario_config_applied
-            restore_cmd = mock_host.run.call_args[0][0]
-            assert " && " in restore_cmd
-            assert restore_cmd.count("-c") >= 3
-            assert "RESET autovacuum_naptime" in restore_cmd
-
-            # 3. Failed fallback: captures stderr and exit status into _scenario_config_error
-            mock_host.run.return_value = MagicMock(exit_status=1, stderr="ERROR: failed to write")
-            tuning_fail = await adapter.configure_for_scenario("NL-C-05")
-            assert tuning_fail == {}
-            assert "ssh fallback exited 1" in adapter._scenario_config_error
-            assert "ERROR: failed to write" in adapter._scenario_config_error
-
-    asyncio.run(_test())
+    monkeypatch.setattr(OutageAdapter, "observe_fault_settings", observe)
+    results = run_cycles(env)
+    assert observed == ["process_kill"]
+    assert "scenario_tuning" not in results["facts"]
+    assert not any("tuning" in d.lower() for d in results["disclosures"])
 
 
 def test_postgres_adapter_quick_integrity_check():

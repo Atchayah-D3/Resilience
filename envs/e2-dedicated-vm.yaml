@@ -47,6 +47,7 @@ safety:                          # Arch §15: default deny, plus an operator-cre
     hostname_pattern: '^BDB-QA-U22-30$'
     inventory_tag: resilience-lab-e2
   sentinel_table: resilience.harness_target
+  max_data_fs_used_pct: 90        # standing abort: stop before the data filesystem fills (operator-owned margin)
 
 phase_timeouts_s:                # every phase is bounded; an unbounded wait is a defect (Arch §15)
   reset: 600

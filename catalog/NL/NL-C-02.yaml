@@ -9,6 +9,14 @@
 # or partial page writes via full-page writes (FPW), and recovers unattended without corruption
 # (Framework §10.2, Arch §5).
 #
+# The fault is only real if the checkpoint had NOT finished when the kill landed. Seeing the
+# checkpointer busy before the kill is not enough -- an immediate CHECKPOINT on a small dirty
+# set can finish in the time an SSH command takes. So the run proves it after the fact: the
+# replacement postmaster logs "redo starts at <LSN>", and that LSN must equal the redo point
+# read from pg_control BEFORE the CHECKPOINT was issued. Had the checkpoint completed, recovery
+# would start from its newer redo point instead. A run that cannot show this is aborted -- it
+# did not test a crash during a checkpoint -- rather than scored (checkpoint_in_flight_at_kill).
+#
 # Durability of the underlying storage stack is covered by category NL-D (Framework §13.1).
 id: NL-C-02
 name: Crash during checkpoint
@@ -36,6 +44,7 @@ fault:
   driver: os_ssh                 # env-profile section; the profile picks the driver
   target: primary
   duration: permanent
+  during: checkpoint              # the state the kill must land inside
 
 blast_radius:
   max_nodes_affected: 1
@@ -57,6 +66,7 @@ measure:
   - corruption_count
   - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
   - starts_unattended
+  - checkpoint_in_flight_at_kill # fault verification: a run where this is not true is aborted
 
 accept:
   - corruption_count == 0

@@ -122,6 +122,12 @@ class ScriptedHost:
     async def __aexit__(self, *a):
         return None
 
+    async def connect(self):
+        self.calls.append("<connect>")
+
+    async def close(self):
+        self.calls.append("<close>")
+
     async def run(self, command, *, timeout_s, check=True):
         self.calls.append(command)
         for key, value in self.answers.items():

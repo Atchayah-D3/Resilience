@@ -1,20 +1,12 @@
-"""NL-M-05 -- Idle-in-transaction blocking vacuum: production-level resilience testing,
-vacuum horizon pinning, timeout enforcement, and operational bloat alerting.
+"""NL-M-05 -- Idle-in-transaction blocking vacuum (Framework §10.7).
 
-Framework §10.7, Arch §5, Arch §8, Arch §10.2:
-An industry-standard resilience test harness validating production database systems
-against lingering idle transactions must eliminate guesswork:
-1. Dirties relations continuously with high-concurrency transactional load and churn.
-2. Injects an open transaction that acquires an active snapshot and pins backend_xmin,
-   holding back the global vacuum horizon and blocking autovacuum from reclaiming dead tuples.
-3. Tests both standard production defenses:
-   - Path A: idle_in_transaction_session_timeout is enforced by the database engine,
-     terminating the lingering session with FATAL (SQLSTATE 25P03/57P01) and unblocking vacuum.
-   - Path B: When timeout is unconfigured (0), unvacuumed dead tuples accumulate under write load;
-     telemetry probes detect dead-tuple accumulation and trigger an operational bloat alert
-     (dead_tuple_ratio >= 0.20 per Framework §10.7 NL-M-04).
-4. Verifies zero transaction data loss (rpo_txn == 0) and zero relation/index corruption
-   (structural_integrity_errors == 0, corruption_count == 0).
+Each acceptance path is accepted only on evidence the harness observed:
+- Path A: the session ended AND the server said it was the idle-in-transaction timeout (its
+  log line, or SQLSTATE 25P03). A session that merely vanished is NOT_MEASURED.
+- Path B: VACUUM, run while the session is open, could not remove dead tuples at a cutoff no
+  newer than the session's xid (vacuum_blocked) AND monitoring alerted (bloat_alert_fired).
+  No alert source is connected, so bloat_alert_fired is NOT_MEASURED and path B cannot pass.
+The fault is confirmed by the server at injection, or the run aborts.
 """
 
 from __future__ import annotations
@@ -67,7 +59,8 @@ def test_nl_m_05_catalog_specification():
 
     # Acceptance criteria per Framework §10.7 table
     accept_text = " ".join(sc.accept)
-    assert "idle_in_transaction_session_timeout_enforced == true or bloat_alert_fired == true" in accept_text
+    assert ("idle_in_transaction_session_timeout_enforced == true or "
+            "(vacuum_blocked == true and bloat_alert_fired == true)") in accept_text
     assert "rpo_txn == 0" in accept_text
     assert "structural_integrity_errors == 0" in accept_text
     assert "corruption_count == 0" in accept_text
@@ -101,51 +94,67 @@ def test_nl_m_05_path_a_timeout_enforced(env):
     assert facts["idle_transaction_check"].get("terminated_by_timeout") is True
 
 
-def test_nl_m_05_path_b_bloat_alert_fires(env, monkeypatch):
-    """End-to-end execution of Path B: timeout is disabled; dead tuples accumulate and bloat alert fires."""
-    # Simulate timeout NOT enforced (session still lingering)
-    async def lingering_check(self, pid: int | None = None):
-        return {
-            "pid": pid or 8888,
-            "terminated_by_timeout": False,
-            "still_idle": True,
-            "backend_xmin": "5000",
-            "age_s": 75.0,
-        }
+def _run_nlm05(env):
+    item = RunPlanItem(scenario=scenario("NL-M-05"), env_class=env.env_class,
+                       role="standalone", node=env.nodes[0])
+    return asyncio.run(TestOrchestrator(item, env, RunOptions()).run())
 
-    # Simulate blocked vacuum causing dead-tuple ratio to exceed 20% threshold
-    async def bloat_alert_check(self):
-        return {
-            "dead_tuple_ratio": 0.28,
-            "unvacuumed_dead_tuples": 450,
-            "live_tuples": 1150,
-            "oldest_transaction_age_s": 75.0,
-            "bloat_alert_fired": True,
-            "bloat_ratio": 1.35,
-        }
 
-    monkeypatch.setattr(OutageAdapter, "check_idle_transaction", lingering_check)
-    monkeypatch.setattr(OutageAdapter, "evaluate_vacuum_bloat", bloat_alert_check)
+async def _lingering(self, pid: int | None = None):
+    return {"pid": pid or 8888, "terminated_by_timeout": False, "still_idle": True,
+            "backend_xmin": "5000", "age_s": 75.0}
 
-    item = RunPlanItem(
-        scenario=scenario("NL-M-05"),
-        env_class=env.env_class,
-        role="standalone",
-        node=env.nodes[0],
-    )
-    results = asyncio.run(TestOrchestrator(item, env, RunOptions()).run())
 
-    assert results["status"] == "passed", why(results)
+def test_nl_m_05_path_a_needs_evidence_of_why_the_session_ended(env, monkeypatch):
+    """Was: 'backend gone and connection closed' was read as the timeout firing. Anything can
+    end a session; without the server's own reason the cause is unknown."""
+    async def vanished(self, pid=None):
+        return {"pid": 8888, "terminated_by_timeout": True, "still_idle": False, "termination_sqlstate": None}
+
+    monkeypatch.setattr(OutageAdapter, "check_idle_transaction", vanished)
+    results = _run_nlm05(env)
+    assert results["status"] == "failed", why(results)
+    assert str(results["measured"]["idle_in_transaction_session_timeout_enforced"]) == "NOT_MEASURED"
+    assert "cause is unknown" in results["facts"]["not_measured"]["idle_in_transaction_session_timeout_enforced"]
+
+
+def test_nl_m_05_path_b_cannot_pass_without_an_alert_source(env, monkeypatch):
+    """Was: the harness's own dead_tuple_ratio >= 0.20 was reported as 'a bloat alert fired'.
+    Now vacuum blocking is proven, but an alert is not something the harness can see."""
+    monkeypatch.setattr(OutageAdapter, "check_idle_transaction", _lingering)
+    results = _run_nlm05(env)
     m = results["measured"]
-
-    # Path B criteria
     assert m["idle_in_transaction_session_timeout_enforced"] is False
-    assert m["bloat_alert_fired"] is True
-    assert m["dead_tuple_ratio"] == 0.28
-    assert m["unvacuumed_dead_tuples"] == 450
-    assert m["rpo_txn"] == 0
-    assert m["structural_integrity_errors"] == 0
-    assert m["corruption_count"] == 0
+    assert m["vacuum_blocked"] is True and m["dead_tuples_not_removable"] == 4200
+    assert str(m["bloat_alert_fired"]) == "NOT_MEASURED"
+    assert results["status"] == "failed", why(results)
+    (path,) = [r for r in results["verdict"]["results"] if "vacuum_blocked" in r["predicate"]]
+    assert path["outcome"] == "not_measured" and "alert source" in path["reason"]
+
+
+def test_nl_m_05_vacuum_that_removed_everything_was_not_blocked(env, monkeypatch):
+    async def clean_vacuum(self):
+        return {"supported": True, "dead_not_removable": 0, "removable_cutoff": 6000}
+
+    monkeypatch.setattr(OutageAdapter, "check_idle_transaction", _lingering)
+    monkeypatch.setattr(OutageAdapter, "probe_vacuum_horizon", clean_vacuum)
+    results = _run_nlm05(env)
+    assert results["measured"]["vacuum_blocked"] is False
+    (path,) = [r for r in results["verdict"]["results"] if "vacuum_blocked" in r["predicate"]]
+    assert path["outcome"] == "fail"
+
+
+def test_nl_m_05_a_horizon_held_by_something_else_is_not_this_fault(env, monkeypatch):
+    """Dead tuples kept at a cutoff NEWER than the idle session's xid are being held by some
+    other transaction -- the fault under test is not the cause."""
+    async def other_holder(self):
+        return {"supported": True, "dead_not_removable": 900, "removable_cutoff": 7000}
+
+    monkeypatch.setattr(OutageAdapter, "check_idle_transaction", _lingering)
+    monkeypatch.setattr(OutageAdapter, "probe_vacuum_horizon", other_holder)
+    results = _run_nlm05(env)
+    assert results["measured"]["vacuum_blocked"] is False
+    assert results["facts"]["vacuum_horizon_held_by_idle_session"] is False
 
 
 def test_nl_m_05_fails_closed_when_neither_defense_triggers(env, monkeypatch):
@@ -155,7 +164,7 @@ def test_nl_m_05_fails_closed_when_neither_defense_triggers(env, monkeypatch):
         return {"pid": pid or 8888, "terminated_by_timeout": False, "still_idle": True}
 
     async def no_bloat_alert(self):
-        return {"dead_tuple_ratio": 0.05, "unvacuumed_dead_tuples": 10, "bloat_alert_fired": False,
+        return {"dead_tuple_ratio": 0.05, "unvacuumed_dead_tuples": 10, "tuple_bloat_ratio": 1.05,
                 "oldest_transaction_age_s": 10.0}
 
     monkeypatch.setattr(OutageAdapter, "check_idle_transaction", no_timeout)
@@ -249,8 +258,8 @@ def test_nl_m_05_summary_report_rendering(env):
     assert "idle backend pid: 8888" in summary
     assert "backend_xmin: 5000" in summary
     assert "timeout enforced: True" in summary
-    assert "bloat alert fired: False" in summary
-    assert "note: baseline, TPS floor, and SLO recovery were measured under this tuning" not in summary
+    assert "bloat alert fired: NOT_MEASURED" in summary
+    assert "tuning" not in summary.lower()
 
 
 def test_nl_m_05_cleanup_closes_idle_transaction(env):
@@ -335,107 +344,81 @@ def test_check_idle_transaction_absent_backend_without_closed_session_is_not_tim
     asyncio.run(_test())
 
 
-def test_evaluate_vacuum_bloat_alert_is_ratio_driven_not_age_driven(monkeypatch):
-    """The NL-M-05 acceptance is `timeout enforced OR bloat alert fires`, and NL-M-04 keys the
-    alert to dead_tuple_ratio >= 0.20. An old idle session WITH ZERO dead tuples must not fire
-    the alert: that would pass the guard clause on the injected fault's age alone."""
+def test_evaluate_vacuum_bloat_reports_counters_and_never_an_alert():
+    """Planner statistics are context. The adapter must not turn a ratio into an 'alert'."""
 
     async def _test():
         adapter = PostgreSQLAdapter(_node())
         conn = AsyncMock()
-        conn.fetchrow = AsyncMock(return_value={"live_tup": 0, "dead_tup": 0})
-        conn.fetchval = AsyncMock(return_value=599.0)  # a very old idle-in-transaction session
+        conn.fetchrow = AsyncMock(return_value={"live_tup": 2000, "dead_tup": 6000})
+        conn.fetchval = AsyncMock(return_value=599.0)
         conn.close = AsyncMock()
         adapter._connect = AsyncMock(return_value=conn)
         result = await adapter.evaluate_vacuum_bloat()
-        assert result["dead_tuple_ratio"] == 0.0
-        assert result["oldest_transaction_age_s"] == 599.0
-        assert result["bloat_alert_fired"] is False
+        assert result["dead_tuple_ratio"] == 0.75 and result["tuple_bloat_ratio"] == 4.0
+        assert "bloat_alert_fired" not in result
 
     asyncio.run(_test())
 
 
-def test_nl_m_05_tuning_is_observed_not_applied(monkeypatch):
-    """NL-M-05 must SHOW the deployment's idle_in_transaction_session_timeout and STOP. It must
-    not be recorded in _scenario_config_applied (which would make cleanup `ALTER SYSTEM RESET` a
-    value the harness never wrote), and it is not 'tuning applied'."""
+def test_settings_are_observed_never_written():
+    """Was: every non-NL-C-05 run ALTER SYSTEM RESET autovacuum_naptime,
+    autovacuum_vacuum_cost_delay and idle_in_transaction_session_timeout -- silently changing
+    the very setting NL-M-05 is meant to observe."""
 
     async def _test():
         adapter = PostgreSQLAdapter(_node())
         conn = AsyncMock()
-        conn.fetchval = AsyncMock(return_value="0")
+        conn.fetchval = AsyncMock(return_value="30s")
         conn.close = AsyncMock()
         adapter._connect = AsyncMock(return_value=conn)
-
-        tuning = await adapter.configure_for_scenario("NL-M-05")
-        assert tuning == {"observed_idle_in_transaction_session_timeout": "0"}
-        assert adapter._scenario_config_applied == {}
-        assert adapter._scenario_observed == {"idle_in_transaction_session_timeout": "0"}
-        assert conn.execute.call_count == 0  # nothing written
-
-        # restore must be a no-op: nothing was applied
-        await adapter.restore_scenario_configuration()
+        assert await adapter.observe_fault_settings("idle_in_transaction") == {
+            "idle_in_transaction_session_timeout": "30s"}
+        assert await adapter.observe_fault_settings("process_kill") == {}
         assert conn.execute.call_count == 0
+        assert not hasattr(adapter, "cleanup_leftover_configuration")
+        assert not hasattr(adapter, "configure_for_scenario")
 
     asyncio.run(_test())
 
 
-def test_nl_m_05_is_a_single_injection_not_a_double(env, monkeypatch):
-    """The generic SSH injector and the adapter must both target the SAME session. When the
-    adapter injects a supported idle transaction, the orchestrator must NOT also fire the
-    os_ssh injector -- two concurrent idle transactions would be an unmeasured second fault
-    (Events showed pids 1866342 AND 1866395 in the field run)."""
+def test_nl_m_05_is_one_injection_through_the_injector(env, monkeypatch):
+    """The fault goes through the FaultInjector like every other fault (Arch §5), and the
+    injector applies it on the run's own adapter -- exactly one idle session, the one the run
+    observes. (Was: the orchestrator injected through the adapter and bypassed the injector,
+    with a fallback that could open a second, unmeasured session.)"""
+    injected: list[Any] = []
+    real = OutageAdapter.inject_idle_transaction
 
-    import resilience_tests.control.orchestrator as orch
-    calls = []
+    async def counting(self):
+        injected.append(self)
+        return await real(self)
 
-    class RecordingFault(FakeFault):
-        async def inject(self, node):
-            calls.append(self.fault_type)
-            return {"action": self.fault_type}
-
-    monkeypatch.setattr(orch, "resolve", lambda fault, prof: RecordingFault(prof, fault.type))
-
-    item = RunPlanItem(
-        scenario=scenario("NL-M-05"),
-        env_class=env.env_class,
-        role="standalone",
-        node=env.nodes[0],
-    )
-    results = asyncio.run(TestOrchestrator(item, env, RunOptions()).run())
-
+    monkeypatch.setattr(OutageAdapter, "inject_idle_transaction", counting)
+    item = RunPlanItem(scenario=scenario("NL-M-05"), env_class=env.env_class,
+                       role="standalone", node=env.nodes[0])
+    orch = TestOrchestrator(item, env, RunOptions())
+    results = asyncio.run(orch.run())
     assert results["status"] == "passed", why(results)
-    assert calls == [], f"generic SSH injector must not double-inject when the adapter session exists: {calls}"
+    assert injected == [orch.adapter]
+    # and cleanup reverted it with that same adapter, so the same session is the one ended
+    (revert,) = [r for r in FakeFault.reverts if r["fault_type"] == "idle_in_transaction"]
+    assert revert["adapter"] is orch.adapter
 
 
-def test_nl_m_05_fails_closed_when_injection_fails_even_if_bloat_alert_fires(env, monkeypatch):
-    """Path B must be gated on the fault actually existing. If injection fails (supported: False)
-    but the workload alone bloats a table past 0.20, the test MUST fail closed."""
+def test_nl_m_05_aborts_when_the_injection_did_not_land(env, monkeypatch):
+    """Nothing is scored against a fault that was never confirmed by the server."""
     async def failed_injection(self):
         return {"supported": False, "error": "simulated injection failure"}
 
-    async def firing_bloat_alert(self):
-        return {
-            "dead_tuple_ratio": 0.25,
-            "unvacuumed_dead_tuples": 500,
-            "bloat_alert_fired": True,
-            "oldest_transaction_age_s": 0.0,
-        }
-
     monkeypatch.setattr(OutageAdapter, "inject_idle_transaction", failed_injection)
-    monkeypatch.setattr(OutageAdapter, "evaluate_vacuum_bloat", firing_bloat_alert)
-
-    item = RunPlanItem(
-        scenario=scenario("NL-M-05"),
-        env_class=env.env_class,
-        role="standalone",
-        node=env.nodes[0],
-    )
-    results = asyncio.run(TestOrchestrator(item, env, RunOptions()).run())
-
-    assert results["status"] == "failed"
-    assert results["measured"]["bloat_alert_fired"] is False
-    assert results["measured"]["idle_in_transaction_session_timeout_enforced"] is False
+    results = _run_nlm05(env)
+    assert results["status"] == "aborted", why(results)
+    assert "idle_in_transaction fault did not land" in results["error"]
+    assert results["verdict"] is None
+    # the outstanding entry was still reverted by cleanup, not left for the next run
+    from resilience_tests.control.killswitch import ledger_for
+    assert not ledger_for(env).outstanding()
 
 
 def test_check_idle_transaction_does_not_mutate_session_when_backend_present():
@@ -465,38 +448,98 @@ def test_check_idle_transaction_does_not_mutate_session_when_backend_present():
     asyncio.run(_test())
 
 
-def test_inject_idle_transaction_rolls_back_partial_connection_before_fallback(monkeypatch):
-    """If an exception occurs after opening the connection, inject_idle_transaction must
-    roll back and close the connection before attempting the SSH fallback."""
-    from resilience_tests.execution.remote import RemoteHost
+def test_inject_idle_transaction_rolls_back_and_does_not_fall_back(monkeypatch):
+    """Was: on any error a `nohup ... sleep 7200 | psql` session was started over SSH, holding
+    the horizon for up to 2 h under a shell PID nothing could later find or end."""
 
     async def _test():
         adapter = PostgreSQLAdapter(_node())
         mock_conn = AsyncMock()
         mock_conn.fetchval = AsyncMock(return_value=1234)
-        mock_conn.execute = AsyncMock(return_value=None)
-        # Fail when querying pg_stat_activity after BEGIN
-        mock_conn.fetchrow = AsyncMock(side_effect=RuntimeError("pg_stat_activity connection dropped"))
+        mock_conn.execute = AsyncMock(side_effect=[None, RuntimeError("connection dropped"), None])
         mock_conn.is_closed = MagicMock(return_value=False)
         mock_conn.close = AsyncMock()
         adapter._connect = AsyncMock(return_value=mock_conn)
-
-        # Mock SSH fallback to succeed
-        fake_host = AsyncMock()
-        fake_host.run = AsyncMock(return_value=MagicMock(stdout="5678\n", exit_status=0))
-        fake_remote = MagicMock()
-        fake_remote.__aenter__ = AsyncMock(return_value=fake_host)
-        fake_remote.__aexit__ = AsyncMock(return_value=False)
-        monkeypatch.setattr("resilience_tests.adapters.postgresql.adapter.RemoteHost", lambda ssh: fake_remote)
+        monkeypatch.setattr("resilience_tests.adapters.postgresql.adapter.RemoteHost",
+                            MagicMock(side_effect=AssertionError("no SSH fallback")))
 
         result = await adapter.inject_idle_transaction()
-        assert result["supported"] is True
-        assert result["pid"] == 5678
-        assert result["method"] == "ssh_background"
-        # The partial connection must have had ROLLBACK called and been closed
+        assert result["supported"] is False and "connection dropped" in result["error"]
         mock_conn.execute.assert_any_call("ROLLBACK")
         mock_conn.close.assert_awaited_once()
         assert adapter._idle_conn is None
+
+    asyncio.run(_test())
+
+
+def test_inject_idle_transaction_is_confirmed_from_a_separate_connection():
+    """The session must be SEEN idle in transaction holding an xid, from another connection."""
+    from resilience_tests.adapters.postgresql.adapter import IDLE_SESSION_APPLICATION_NAME
+
+    async def _test():
+        adapter = PostgreSQLAdapter(_node())
+        idle = AsyncMock()
+        idle.fetchval = AsyncMock(return_value=8888)
+        stat = AsyncMock()
+        stat.fetchrow = AsyncMock(side_effect=[
+            {"state": "active", "backend_xid": 5000, "backend_xmin": None, "xact_age_s": 0.0},
+            {"state": "idle in transaction", "backend_xid": 5000, "backend_xmin": None, "xact_age_s": 0.1},
+        ])
+        adapter._connect = AsyncMock(side_effect=[idle, stat])
+        result = await adapter.inject_idle_transaction()
+        assert result["supported"] is True and result["backend_xid"] == 5000
+        assert stat.fetchrow.await_count == 2
+        assert idle.fetchrow.await_count == 0                 # never queried from itself
+        settings = adapter._connect.await_args_list[0].kwargs["server_settings"]
+        assert settings == {"application_name": IDLE_SESSION_APPLICATION_NAME}
+
+    asyncio.run(_test())
+
+
+def test_cleanup_ends_only_the_harness_session(monkeypatch):
+    """Was: `kill -9 <ledger pid>` as root (a PID that may since belong to anything) and
+    pg_terminate_backend on EVERY idle-in-transaction session in the cluster."""
+    from resilience_tests.adapters.postgresql.adapter import IDLE_SESSION_APPLICATION_NAME
+    import resilience_tests.execution.injectors.process as process_mod
+    from resilience_tests.execution.injectors.process import OsSshProcessDriver
+    from tests.test_measurement_and_safety import NODE, PROFILE, use_host
+
+    calls = use_host(monkeypatch, process_mod, {"pg_terminate_backend": "1"})
+    detail = asyncio.run(OsSshProcessDriver(PROFILE, "idle_in_transaction").revert(NODE, {"inject": {"pid": 8888}}))
+    assert detail["terminated"] == "1"
+    (cmd,) = calls
+    assert IDLE_SESSION_APPLICATION_NAME in cmd and "kill" not in cmd.replace("pg_terminate_backend", "")
+    assert "idle in transaction" not in cmd
+
+    async def _test():
+        adapter = PostgreSQLAdapter(_node())
+        stat = AsyncMock()
+        stat.fetchval = AsyncMock(return_value=1)
+        adapter._connect = AsyncMock(return_value=stat)
+        adapter._idle_pid = 8888
+        detail = await adapter.close_idle_transaction()
+        assert detail["terminated"] == 1
+        assert stat.fetchval.await_args.args[1] == IDLE_SESSION_APPLICATION_NAME
+
+    asyncio.run(_test())
+
+
+def test_probe_vacuum_horizon_reads_what_vacuum_could_not_remove():
+    async def _test():
+        adapter = PostgreSQLAdapter(_node())
+        conn = AsyncMock()
+        conn.add_log_listener = MagicMock()
+
+        async def execute(sql):
+            listener = conn.add_log_listener.call_args.args[0]
+            listener(conn, MagicMock(message='finished vacuuming "resilience.resilience.churn": index scans: 0\n'
+                                             "tuples: 12 removed, 2000 remain, 5310 are dead but not yet removable\n"
+                                             "removable cutoff: 74121, which was 6022 XIDs old when operation ended",
+                                     detail=None))
+        conn.execute = execute
+        adapter._connect = AsyncMock(return_value=conn)
+        result = await adapter.probe_vacuum_horizon()
+        assert result["dead_not_removable"] == 5310 and result["removable_cutoff"] == 74121
 
     asyncio.run(_test())
 
@@ -538,8 +581,8 @@ def test_nl_m_05_disclosures_and_timing_recorded(env, monkeypatch):
             "dead_tuple_ratio": 0.05,
             "unvacuumed_dead_tuples": 10,
             "live_tuples": 200,
+            "tuple_bloat_ratio": 1.05,
             "oldest_transaction_age_s": 0.0,
-            "bloat_alert_fired": False,
             "last_autovacuum": "2026-09-30 18:10:00+00",
             "last_analyze": None,
             "last_autoanalyze": None,
@@ -587,5 +630,49 @@ def test_integrity_file_writes_clean_sentinel_when_raw_output_empty(env, monkeyp
     assert integrity_path.exists()
     content = integrity_path.read_text()
     assert content == "pg_amcheck run clean (exit 0)\n"
+
+
+def test_parse_pg_interval_s():
+    from resilience_tests.adapters.postgresql.adapter import parse_pg_interval_s
+
+    assert parse_pg_interval_s(None) == 0.0
+    assert parse_pg_interval_s("0") == 0.0
+    assert parse_pg_interval_s("0s") == 0.0
+    assert parse_pg_interval_s("disabled") == 0.0
+    assert parse_pg_interval_s("30s") == 30.0
+    assert parse_pg_interval_s("30") == 30.0
+    assert parse_pg_interval_s("500ms") == 0.5
+    assert parse_pg_interval_s("2min") == 120.0
+    assert parse_pg_interval_s("1h") == 3600.0
+    assert parse_pg_interval_s("2h") == 7200.0
+
+
+def test_nl_m_05_calibrated_soak_hold_and_untestable_disclosure(env, monkeypatch):
+    """When configured timeout is large (e.g. 2h), recovery soak holds for MIN_SOAK_S,
+    records testable=False, and issues an explicit disclosure explaining Path B fallback."""
+    item = RunPlanItem(
+        scenario=scenario("NL-M-05"),
+        env_class=env.env_class,
+        role="standalone",
+        node=env.nodes[0],
+    )
+    orch_inst = TestOrchestrator(item, env, RunOptions())
+    orch_inst.facts["scenario_observed"] = {"idle_in_transaction_session_timeout": "2h"}
+
+    async def run_recovery():
+        orch_inst.facts["injection_id"] = "test-inj"
+        orch_inst.baseline = MagicMock(tps=200, p99_ms=10.0)
+        orch_inst.t0_ns = 1000
+        orch_inst.injector = MagicMock()
+        orch_inst.stream = MagicMock()
+        orch_inst.stream.events.return_value = []
+        return await orch_inst._p_recovery()
+
+    detail = asyncio.run(run_recovery())
+    assert orch_inst.facts["idle_timeout_parsed_s"] == 7200.0
+    assert orch_inst.facts["idle_timeout_testable"] is False
+    # Hold was clamped to available bound / min soak, not 7200s
+    assert orch_inst.facts["idle_hold_s"] <= 7.0
+
 
 

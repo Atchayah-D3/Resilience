@@ -133,9 +133,11 @@ class Workload(_Model):
     history: Literal["none", "list_append"] = "none"
 
 
-# Fault timing for faults that must land INSIDE a database operation, not merely under load.
-# The orchestrator starts the operation, confirms it is in progress, and only then injects.
-FaultDuring = Literal["large_transaction", "concurrent_index_build"]
+# A database state the fault must land inside (Framework §10.2 NL-C-02 "while the checkpointer
+# is active", NL-C-03 "during a 10M-row INSERT", NL-C-06 "mid-build"). The orchestrator
+# establishes the state, confirms it is in progress, then injects; which scenario asked is
+# never consulted -- only this field.
+FaultDuring = Literal["checkpoint", "large_transaction", "concurrent_index_build"]
 
 
 class Fault(_Model):

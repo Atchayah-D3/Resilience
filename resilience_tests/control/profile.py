@@ -130,6 +130,11 @@ class Safety(_Model):
 
     allowlist: Allowlist
     sentinel_table: str = Field(pattern=r"^[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*$")
+    # Standing abort (Arch §15 "abort conditions evaluated continuously"), for every scenario on
+    # this environment: stop the run once the filesystem holding the data directory is fuller
+    # than this. A crash loop or blocked vacuum can fill it, and where PGDATA shares the root
+    # filesystem a full disk takes the host down with it. Operator-owned; None = no such abort.
+    max_data_fs_used_pct: float | None = Field(default=None, gt=0, le=100)
 
 
 class EnvProfile(_Model):

@@ -12,6 +12,7 @@ capability fails rather than passing on a measurement nobody took.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar
@@ -198,13 +199,14 @@ class BaseDatabaseAdapter(ABC):
         (fail closed). Subclasses must override with engine-specific synchronization."""
         return {"checkpointer_active": False, "method": "default (not implemented)"}
 
-    async def verify_checkpoint_aborted(self) -> dict[str, Any]:
-        """Verify that the checkpoint interrupted by the crash was indeed aborted and not
-        completed before the crash, and that recovery resumed from the prior REDO point.
+    async def checkpoint_in_flight_at_kill(self, log_lines: Sequence[str]) -> dict[str, Any]:
+        """Whether the checkpoint started by `trigger_checkpoint_and_await_active` was still
+        unfinished when the process was killed, judged from what the REPLACEMENT process logged
+        as it recovered (`log_lines`: the engine's log lines received after T0).
 
-        Default: returns checkpoint_aborted=None (unknown). Subclasses must override with
-        engine-specific verification logic."""
-        return {"checkpoint_aborted": None, "method": "default (not implemented)"}
+        Returns `in_flight`: True (proven unfinished), False (proven finished before the kill --
+        the fault did not land) or None (no evidence either way). Default: None."""
+        return {"in_flight": None, "note": "this engine cannot show where crash recovery started"}
 
     async def inject_idle_transaction(self) -> dict[str, Any]:
         """Inject an open idle-in-transaction holding back the vacuum xmin horizon (NL-M-05).
@@ -212,9 +214,24 @@ class BaseDatabaseAdapter(ABC):
         return {"supported": False, "method": "default (not implemented)"}
 
     async def check_idle_transaction(self, pid: int | None = None) -> dict[str, Any]:
-        """Check status of the idle-in-transaction backend: whether it was terminated by
-        idle_in_transaction_session_timeout or remains open and holding xmin (NL-M-05)."""
+        """Check status of the idle-in-transaction backend: whether it is gone and the harness's
+        own session closed (`terminated_by_timeout`), or still open and holding xmin (NL-M-05).
+        When the closed session reported why, its error code is `termination_sqlstate`."""
         return {"terminated_by_timeout": False, "still_idle": False}
+
+    def idle_timeout_log_patterns(self) -> tuple[str, ...]:
+        """Regexes matching the line this engine logs when it ends a session because of its
+        idle-in-transaction timeout. Evidence of WHY a session ended (NL-M-05 path A)."""
+        return ()
+
+    idle_timeout_sqlstates: tuple[str, ...] = ()  # error codes with the same meaning
+
+    async def probe_vacuum_horizon(self) -> dict[str, Any]:
+        """Run the engine's vacuum on the churn table while the idle session is still open and
+        report whether it found dead tuples it was NOT ALLOWED to remove (`dead_not_removable`)
+        and the cutoff it used (`removable_cutoff`). This is direct evidence that the vacuum
+        horizon is pinned. Default: not supported."""
+        return {"supported": False}
 
     async def close_idle_transaction(self) -> dict[str, Any]:
         """Cleanly terminate or rollback any active idle-in-transaction connection injected
@@ -222,32 +239,18 @@ class BaseDatabaseAdapter(ABC):
         return {}
 
     async def evaluate_vacuum_bloat(self) -> dict[str, Any]:
-        """Evaluate relation dead-tuple accumulation and operational bloat alert telemetry
-        under blocked vacuum (NL-M-05). Default returns baseline counters."""
-        return {"dead_tuple_ratio": 0.0, "unvacuumed_dead_tuples": 0, "bloat_alert_fired": False,
-                "oldest_transaction_age_s": 0.0}
-
-    async def configure_for_scenario(self, scenario_id: str) -> dict[str, str]:
-        """Apply temporary engine configuration specific to a scenario before workload starts
-        (e.g. tuning autovacuum for rapid repeated-cycle bloat testing in NL-C-05).
-        Default: no-op, returns empty dict. Subclasses override for engine-specific tuning."""
+        """Dead-tuple counters on the churn table, as context for NL-M-05. Default: none."""
         return {}
 
-    async def restore_scenario_configuration(self) -> None:
-        """Revert any temporary configuration applied by configure_for_scenario, ensuring the
-        database is restored to its original configuration without stranding modified settings.
-        Default: no-op."""
-        pass
+    async def observe_fault_settings(self, fault_type: str) -> dict[str, str]:
+        """Read -- never write -- the engine settings that decide how `fault_type` plays out
+        (e.g. the idle-in-transaction timeout), so the run can say what it was measured
+        against. Default: nothing to observe."""
+        return {}
 
     async def config_deviations(self) -> dict[str, str]:
         """Detect any configuration deviations currently active on the database that diverge
         from standard baseline (e.g. settings in postgresql.auto.conf).
-        Default: returns empty dict."""
-        return {}
-
-    async def cleanup_leftover_configuration(self) -> dict[str, str]:
-        """Clean up any leftover configuration from previous failed runs (e.g. resetting
-        stranded postgresql.auto.conf parameters).
         Default: returns empty dict."""
         return {}
 
@@ -269,6 +272,11 @@ class BaseDatabaseAdapter(ABC):
         """Regexes matching the lines a replacement process writes when it begins recovering
         (e.g. crash recovery after an unclean stop). Reported as `recovery_started_s`."""
         return ()
+
+    def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
+        """The engine's idle-in-transaction timeout in seconds, from the settings
+        `observe_fault_settings` returned; 0.0 when it is disabled or unknown."""
+        return 0.0
 
     # --- operations a fault must land inside (fault.during) ---------------------------
     #
