@@ -12,6 +12,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+from resilience_tests.adapters.base import BaseDatabaseAdapter
 from resilience_tests.control.ledger import InjectionLedger, LedgerEntry
 from resilience_tests.control.profile import EnvProfile, load_profile
 from resilience_tests.execution.injectors.base import resolve_by_name
@@ -29,7 +30,11 @@ def ledger_for(profile: EnvProfile) -> InjectionLedger:
 
 
 async def revert_outstanding(profile: EnvProfile, ledger: InjectionLedger, *, run_id: str | None = None,
-                             timeout_s: float = REVERT_TIMEOUT_S) -> list[tuple[LedgerEntry, str]]:
+                             timeout_s: float = REVERT_TIMEOUT_S,
+                             adapter: BaseDatabaseAdapter | None = None) -> list[tuple[LedgerEntry, str]]:
+    """`adapter`: the live run's database adapter, handed to the drivers reverting that run's
+    node, so a fault held inside the database (an open session, a connection flood) is undone
+    on the very connections that hold it. The kill switch after a crash has none to give."""
     results: list[tuple[LedgerEntry, str]] = []
     for entry in ledger.outstanding():
         if run_id is not None and entry.run_id != run_id:
@@ -37,6 +42,8 @@ async def revert_outstanding(profile: EnvProfile, ledger: InjectionLedger, *, ru
         section = entry.detail.get("section", "")
         try:
             injector = resolve_by_name(section, entry.driver, profile, entry.fault_type)
+            if adapter is not None and adapter.node.name == entry.node:
+                injector.adapter = adapter
             async with asyncio.timeout(timeout_s):
                 detail = await injector.revert(profile.node(entry.node), entry.detail)
             ledger.transition(entry, "reverted", revert=detail, by="killswitch")

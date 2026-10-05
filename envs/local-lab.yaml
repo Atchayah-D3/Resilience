@@ -52,6 +52,7 @@ safety:
     hostname_pattern: '^shakti-target-01$'
     inventory_tag: local-nested-kvm
   sentinel_table: resilience.harness_target
+  max_data_fs_used_pct: 90        # standing abort: stop before the data filesystem fills (operator-owned margin)
 
 phase_timeouts_s:
   reset: 600

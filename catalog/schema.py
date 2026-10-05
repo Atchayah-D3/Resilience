@@ -121,11 +121,18 @@ class Workload(_Model):
     rate_tps: float | None = Field(default=None, gt=0)  # Framework §10.1 "at 1000 TPS"
 
 
+# A database state the fault must land inside (Framework §10.2 NL-C-02 "while the checkpointer
+# is active", NL-C-06 "mid-build"). The orchestrator establishes the state, then injects; which
+# scenario asked is never consulted -- only this field.
+FaultDuring = Literal["checkpoint", "concurrent_index_build"]
+
+
 class Fault(_Model):
     type: FaultType
     driver: str  # env-profile section name, resolved at run time -- never a driver name
     target: FaultTarget
     duration: Literal["permanent"] | Annotated[float, Field(gt=0)] = "permanent"
+    during: FaultDuring | None = None
 
     @model_validator(mode="after")
     def _driver_section(self) -> Fault:

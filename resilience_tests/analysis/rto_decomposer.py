@@ -127,6 +127,44 @@ def write_recovery(events: Sequence[Event], t0_ns: int) -> WriteRecovery:
     return WriteRecovery(True, None)
 
 
+def sample_meets_slo(e: Event, baseline: Baseline, max_sample_interval_s: float = MAX_SAMPLE_INTERVAL_S) -> bool:
+    """One 1 s workload sample against the Framework §6.2 SLO: committed TPS >= 80% of
+    baseline and p99 <= 1.5x baseline, over an interval short enough to show a dip."""
+    return (
+        e.data["interval_s"] <= max_sample_interval_s
+        and e.data["tps"] >= SLO_TPS_FRACTION * baseline.tps
+        and e.data.get("p99_ms") is not None
+        and e.data["p99_ms"] <= SLO_P99_MULTIPLIER * baseline.p99_ms
+    )
+
+
+@dataclass(frozen=True)
+class BaselineSloCheck:
+    """Can this baseline support an RTO-to-SLO measurement at all?
+
+    rto_to_slo_s asks when the service is back to SLO -- 60 s straight of 1 s samples within
+    80% TPS / 1.5x p99 of the baseline. If the UNDISTURBED service, during the baseline itself,
+    never holds that for 60 s, the measurement after a fault would time stalls the database
+    always has, not recovery. Derived entirely from the Framework's own SLO definition."""
+
+    samples: int
+    compliant: int
+    sustained_window_found: bool
+
+    @property
+    def compliant_fraction(self) -> float | None:
+        return self.compliant / self.samples if self.samples else None
+
+
+def baseline_slo_check(events: Sequence[Event], window_t0_ns: int, window_end_ns: int,
+                       baseline: Baseline) -> BaselineSloCheck:
+    samples = [e for e in sorted(events, key=lambda e: e.t_mono_ns)
+               if e.kind == "sample" and e.source == "workload"
+               and e.t_mono_ns - int(e.data["interval_s"] * 1e9) >= window_t0_ns and e.t_mono_ns <= window_end_ns]
+    start, _ = slo_recovery(samples, window_t0_ns, baseline)
+    return BaselineSloCheck(len(samples), sum(1 for e in samples if sample_meets_slo(e, baseline)), start is not None)
+
+
 def slo_recovery(events: Sequence[Event], t0_ns: int, baseline: Baseline,
                  max_sample_interval_s: float = MAX_SAMPLE_INTERVAL_S) -> tuple[float | None, float | None]:
     """Earliest run of consecutive 1 s workload samples after T0, spanning SLO_SUSTAIN_S, in
@@ -137,8 +175,6 @@ def slo_recovery(events: Sequence[Event], t0_ns: int, baseline: Baseline,
     missing from the record), and a sample whose own interval is far longer than the sampling
     period (a starved sampler averaging over the dip it should have exposed).
     """
-    tps_floor = SLO_TPS_FRACTION * baseline.tps
-    p99_ceiling = SLO_P99_MULTIPLIER * baseline.p99_ms
     run_start_ns: int | None = None
     prev_end_ns: int | None = None
     for e in events:
@@ -148,12 +184,7 @@ def slo_recovery(events: Sequence[Event], t0_ns: int, baseline: Baseline,
         start_ns = e.t_mono_ns - interval_ns
         if start_ns < t0_ns:
             continue
-        ok = (
-            e.data["interval_s"] <= max_sample_interval_s
-            and e.data["tps"] >= tps_floor
-            and e.data.get("p99_ms") is not None
-            and e.data["p99_ms"] <= p99_ceiling
-        )
+        ok = sample_meets_slo(e, baseline, max_sample_interval_s)
         contiguous = prev_end_ns is not None and start_ns - prev_end_ns <= interval_ns // 2
         if not ok:
             run_start_ns = None

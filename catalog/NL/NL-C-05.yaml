@@ -1,6 +1,6 @@
 # NL-C-05 -- Repeated crash cycles (Framework §10.2, Tier 1, P1).
 # Fault injection: 10 x (kill -9, restart) at 5 s intervals.
-# Acceptance: recovery_s at cycle 10 <= 1.5 x cycle 1; no cumulative bloat.
+# Acceptance: recovery_s at cycle 10 <= 1.5 x cycle 1; no cumulative bloat (reported, see below).
 #
 # One crash proves the database recovers. Ten prove it recovers REPEATABLY: that nothing is
 # carried from one crash into the next -- no growing replay, no space left behind. The driver
@@ -12,18 +12,20 @@
 # measurement rather than a judgement, sampled before the first crash and after every cycle:
 #
 #   bloat_ratio                 bytes per live row of the CHURN table at the last cycle over
-#                               the first. REPORTED, NOT GATED -- see the calibration below.
+#                               the first.
 #   wal_ratio_of_max_wal_size   write-ahead log bytes against the server's OWN max_wal_size,
-#                               read from pg_settings. Checkpoints should hold it near that
-#                               bound; 2.0 is the point past which recycling is not keeping up.
+#                               read from pg_settings.
+#   bytes_unexplained_by_rows   growth the inserted rows do not account for.
 #
-# OPTION A: DYNAMIC AUTOVACUUM TUNING & DEFENSIVE GATING.
-# In untuned environments with default autovacuum_naptime = 60s, a 50s run cannot distinguish
-# autovacuum phase timing from true storage leaks. Under Option A, the harness dynamically tunes
-# autovacuum_naptime = 5s and autovacuum_vacuum_cost_delay = 0 in postgresql.auto.conf before the run,
-# sets aggressive table-level storage parameters on resilience.churn, and reverts all settings
-# cleanly at cleanup (ALTER SYSTEM RESET). This keeps healthy bloat <= 1.05 and enables a strict,
-# defensible acceptance gate at bloat_ratio <= 1.15 without leaving modified settings on the database.
+# All three are REPORTED, NOT GATED. The Framework gives no number for "no cumulative bloat",
+# and Framework §13.7 requires any threshold to be re-baselined against measurement before it
+# gates. None has been measured on an untuned server: with the default autovacuum_naptime of
+# 60 s, a run of about a minute cannot tell autovacuum's timing apart from a real storage leak,
+# so any bound chosen today would fail healthy servers or pass leaking ones. The harness does
+# NOT retune the server to make a bound pass -- that would measure a configuration the customer
+# does not run. NEEDS SIGN-OFF: a measured threshold before "no cumulative bloat" can gate.
+#
+# Integrity IS gated: Framework §16.3 requires pg_amcheck clean after every Tier-1 scenario.
 #
 # Two dead ends worth not repeating. Comparing against a freshly seeded table measures the
 # warm-up curve: a churned table settles at ~1.12x its seeded density and then plateaus, so
@@ -86,7 +88,7 @@ abort_if:
 
 requires:
   - transactional_markers
-  - workload_churn               # without it there are no dead rows and bloat cannot fail
+  - workload_churn               # without it there are no dead rows to measure
   - structural_integrity_check
 
 measure:
@@ -98,8 +100,8 @@ measure:
   - recovery_s_max
   - recovery_ratio_last_over_first
   - recovery_slope_s_per_cycle    # reported, not gated: catches steady degradation
-  - bloat_ratio                   # reported, not gated: the window cannot separate the cases
-  - wal_ratio_of_max_wal_size
+  - bloat_ratio                   # reported, not gated: no measured threshold yet (see above)
+  - wal_ratio_of_max_wal_size     # reported, not gated: no measured threshold yet
   - bytes_unexplained_by_rows     # reported: growth the rows do not explain
   - wal_replayed_bytes_max        # reported: the replay work each crash actually left
   - wal_replayed_bytes_median
@@ -115,11 +117,8 @@ accept:
   - cycles_recovered == cycles_run          # every cycle must come back on its own;
                                             # the count is declared once, in `repeat`
   - recovery_ratio_last_over_first <= 1.5   # Framework §10.2
-  - wal_ratio_of_max_wal_size <= 2.0        # Harness-authored heuristic (not Framework verbatim).
-                                            # PostgreSQL §20.5.2 notes max_wal_size is a soft ceiling
-                                            # under load/recovery; 2.0 gates that WAL recycling is
-                                            # keeping up across repeated crashes rather than abandoning bounds.
-  - bloat_ratio <= 1.15                     # Framework §10.2: Option A bounds bloat via tuned autovacuum
+  - structural_integrity_errors == 0        # Framework §16.3: pg_amcheck clean after every Tier-1 scenario
+  - corruption_count == 0                   # Framework §16.3
 
 priority: P1
 
@@ -127,5 +126,6 @@ description: >
   The database is killed and left to restart itself ten times in succession, under
   marker-instrumented write load. Each cycle is measured on its own: the time from the kill
   to the first accepted write, and the on-disk footprint once service returns. Recovery must
-  not slow down across the ten, and nothing may accumulate on disk that the inserted rows do
-  not explain. Crash recovery of a single failure is covered by NL-C-01.
+  not slow down across the ten and the data must stay structurally intact. On-disk growth is
+  measured and reported against the server's untouched configuration; it does not gate until a
+  measured threshold is signed off. Crash recovery of a single failure is covered by NL-C-01.

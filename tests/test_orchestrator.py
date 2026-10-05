@@ -23,7 +23,7 @@ from resilience_tests.control.orchestrator import RunOptions, TestOrchestrator
 from resilience_tests.analysis import rto_decomposer
 from resilience_tests.control.profile import load_profile
 from resilience_tests.control.safety import SafetyViolation
-from resilience_tests.execution.injectors.base import FaultInjector
+from resilience_tests.execution.injectors.base import FaultInjector, FaultNotLanded
 from resilience_tests.execution.remote import RemoteResult
 from resilience_tests.execution.workload.markers import MarkerJournals
 from tests.test_adapter_seam import FakeAdapter
@@ -110,32 +110,31 @@ class OutageAdapter(FakeAdapter):
             "t_active_mono_ns": time.monotonic_ns(),
         }
 
-    async def verify_checkpoint_aborted(self) -> dict[str, Any]:
-        """Simulate verified checkpoint abort with LSN comparison."""
-        baseline = getattr(self, "_checkpoint_baseline", {"checkpoint_lsn": 1000000, "redo_lsn": 1000000})
-        return {
-            "checkpoint_aborted": True,
-            "current_checkpoint": {"checkpoint_lsn": 2000000, "redo_lsn": 1500000,
-                                   "checkpoint_time": "2026-01-01 00:00:05"},
-            "prior_checkpoint": baseline,
-            "redo_advanced": True,
-        }
+    async def checkpoint_in_flight_at_kill(self, log_lines) -> dict[str, Any]:
+        """Simulate recovery that started from the pre-CHECKPOINT redo point."""
+        return {"in_flight": True, "prior_redo_lsn": "0/F4240", "recovery_redo_start_lsn": "0/F4240",
+                "note": "recovery started from the redo point that preceded the CHECKPOINT"}
 
     async def inject_idle_transaction(self) -> dict[str, Any]:
-        """Simulate idle transaction injection for NL-M-05."""
+        """Simulate an idle transaction confirmed by the server for NL-M-05."""
         return {
             "supported": True,
             "pid": 8888,
-            "backend_xmin": "5000",
             "state": "idle in transaction",
+            "backend_xid": 5000,
+            "backend_xmin": "5000",
             "xact_age_s": 0.1,
         }
 
+    idle_timeout_sqlstates = ("25P03",)
+
     async def check_idle_transaction(self, pid: int | None = None) -> dict[str, Any]:
+        """Path A: the session was ended by the timeout, and said so."""
         return {
             "pid": pid or 8888,
             "terminated_by_timeout": True,
             "still_idle": False,
+            "termination_sqlstate": "25P03",
         }
 
     async def evaluate_vacuum_bloat(self) -> dict[str, Any]:
@@ -143,9 +142,23 @@ class OutageAdapter(FakeAdapter):
             "dead_tuple_ratio": 0.05,
             "unvacuumed_dead_tuples": 10,
             "live_tuples": 200,
+            "tuple_bloat_ratio": 1.05,
             "oldest_transaction_age_s": 0.0,
-            "bloat_alert_fired": False,
         }
+
+    async def probe_vacuum_horizon(self) -> dict[str, Any]:
+        return {"supported": True, "dead_not_removable": 4200, "removable_cutoff": 5000}
+
+    async def start_concurrent_index_build(self) -> None:
+        await asyncio.sleep(3600)   # "builds" until the fault cuts it short
+
+    async def concurrent_index_outcome(self) -> dict[str, Any]:
+        return {"post_recovery_status": {"name": "idx", "is_valid": False, "is_ready": False},
+                "cleanup_or_rebuild_succeeded": True}
+
+    def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
+        from resilience_tests.adapters.postgresql.adapter import parse_pg_interval_s
+        return parse_pg_interval_s(observed.get("idle_in_transaction_session_timeout"))
 
     async def exhaust_connections(self, hold_duration_s: float = 2.0) -> dict[str, Any]:
         return {
@@ -176,6 +189,12 @@ class FakeFault(FaultInjector):
         return {"auto_conf_prior": "1s"} if self.fault_type == "config_reload" else {"ok": True}
 
     async def inject(self, node):
+        if self.fault_type == "idle_in_transaction":
+            # as the real driver: applied through the run's adapter, confirmed or not landed
+            detail = dict(await self.adapter.inject_idle_transaction())
+            if not detail.get("supported"):
+                raise FaultNotLanded(f"idle session not established: {detail.get('error')}", detail)
+            return detail | {"action": "idle_in_transaction", "t0_mono_ns": time.monotonic_ns()}
         if self.fault_type == "process_kill" and self.lands:
             Engine.down = True
             asyncio.get_running_loop().call_later(OUTAGE_S, lambda: setattr(Engine, "down", False))
@@ -193,7 +212,10 @@ class FakeFault(FaultInjector):
         return {"action": self.fault_type}
 
     async def revert(self, node, detail=None):
-        FakeFault.reverts.append({"fault_type": self.fault_type, "detail": dict(detail or {})})
+        FakeFault.reverts.append({"fault_type": self.fault_type, "detail": dict(detail or {}),
+                                  "adapter": self.adapter})
+        if self.fault_type == "idle_in_transaction" and self.adapter is not None:
+            await self.adapter.close_idle_transaction()
         return {"action": "revert"}
 
 
@@ -232,6 +254,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "run_once", hostname)
     monkeypatch.setattr(orch, "measure_clock_offset", no_offset)
     monkeypatch.setattr(orch, "LogTailer", NoTail)
+    monkeypatch.setattr(orch, "DiskUsageProber", NoTail)
     monkeypatch.setattr(orch, "WORKLOAD_RAMP_S", 0.3)
     monkeypatch.setattr(orch, "resolve", lambda fault, prof: FakeFault(prof, fault.type))
     monkeypatch.setattr(killswitch, "resolve_by_name", lambda section, driver, prof, fault_type="": FakeFault(prof, fault_type))
@@ -454,6 +477,7 @@ def test_nl_m_05_execution(env):
     assert m["rpo_txn"] == 0
     assert m["structural_integrity_errors"] == 0
     assert m["corruption_count"] == 0
-    assert m["idle_in_transaction_session_timeout_enforced"] is True or m["bloat_alert_fired"] is True
+    assert m["idle_in_transaction_session_timeout_enforced"] is True
+    assert str(m["bloat_alert_fired"]) == "NOT_MEASURED"   # no alert source is connected
     assert "idle_transaction" in results["facts"]
 

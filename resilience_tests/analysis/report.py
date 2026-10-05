@@ -90,31 +90,46 @@ def render_summary(r: dict[str, Any]) -> str:
         else:
             event_desc = "none (checkpointer running, not waiting)"
 
+        verification = (r.get("facts") or {}).get("checkpoint_verification") or {}
         lines += [
             "",
             "checkpoint fault injection (NL-C-02):",
-            f"  checkpointer active at kill: {cp.get('checkpointer_active')}",
+            f"  checkpointer seen active before kill: {cp.get('checkpointer_active')}",
             f"  checkpointer pid: {cp.get('checkpointer_pid')}",
             f"  wait event: {event_desc}",
         ]
+        if verification:
+            lines += [
+                f"  checkpoint still in flight at kill: {verification.get('in_flight')}",
+                f"    redo point before CHECKPOINT: {verification.get('prior_redo_lsn')}  "
+                f"recovery redo started at: {verification.get('recovery_redo_start_lsn')}",
+                f"    {verification.get('note', '')}",
+            ]
         if cp.get("buffers_written_during_cp") is not None:
             lines.append(f"  stat counter delta (pg_stat_checkpointer.buffers_written): {cp['buffers_written_during_cp']}")
         if cp.get("io_writes_during_cp") is not None:
             lines.append(f"  io writes delta (pg_stat_io): {cp['io_writes_during_cp']}")
     idle = (r.get("facts") or {}).get("idle_transaction")
     if idle:
-        idle_chk = (r.get("facts") or {}).get("idle_transaction_check") or {}
-        bloat_chk = (r.get("facts") or {}).get("vacuum_bloat_check") or {}
-        thresh = bloat_chk.get("threshold", 0.20)
+        facts = r.get("facts") or {}
+        idle_chk = facts.get("idle_transaction_check") or {}
+        evidence = facts.get("idle_timeout_evidence") or {}
+        probe = facts.get("vacuum_horizon_probe") or {}
+        measured = r.get("measured") or {}
         lines += [
             "",
             "idle-in-transaction vacuum blocking (NL-M-05):",
-            f"  idle backend pid: {idle.get('pid')}",
+            f"  idle backend pid: {idle.get('pid')}  state at injection: {idle.get('state')}  "
+            f"backend_xid: {idle.get('backend_xid')}",
             f"  backend_xmin: {idle.get('backend_xmin')}",
-            f"  timeout enforced: {idle_chk.get('terminated_by_timeout')}",
-            f"  bloat alert fired: {bloat_chk.get('bloat_alert_fired')}",
-            f"  dead tuple ratio: {bloat_chk.get('dead_tuple_ratio')} (alert threshold >= {thresh})",
-            f"  unvacuumed dead tuples: {bloat_chk.get('unvacuumed_dead_tuples')}",
+            f"  path A  session ended: {idle_chk.get('terminated_by_timeout')}  "
+            f"timeout log line: {'seen' if evidence.get('log_line') else 'not seen'}  "
+            f"sqlstate: {evidence.get('sqlstate')}  -> timeout enforced: "
+            f"{measured.get('idle_in_transaction_session_timeout_enforced')}",
+            f"  path B  vacuum blocked: {measured.get('vacuum_blocked')}  "
+            f"dead but not removable: {probe.get('dead_not_removable')}  "
+            f"removable cutoff: {probe.get('removable_cutoff')}  "
+            f"bloat alert fired: {measured.get('bloat_alert_fired')}",
         ]
     if r.get("measured"):
         rendered = []
@@ -124,25 +139,8 @@ def render_summary(r: dict[str, Any]) -> str:
             else:
                 rendered.append(f"  {k} = {v}")
         lines += ["", "measured:"] + rendered
-    tuning = (r.get("facts") or {}).get("scenario_tuning")
-    tuning_err = (r.get("facts") or {}).get("scenario_tuning_error")
     deviations = (r.get("facts") or {}).get("config_deviations")
-    scenario_id = (r.get("scenario") or {}).get("id")
-    if tuning:
-        lines += [
-            "",
-            "scenario tuning (Option A):",
-            *[f"  {k} = {v}" for k, v in sorted(tuning.items())],
-        ]
-        if scenario_id == "NL-C-05":
-            lines.append("  note: baseline, TPS floor, and SLO recovery were measured under this tuning")
-    elif tuning_err:
-        lines += [
-            "",
-            "scenario tuning (Option A):",
-            f"  FAILED: {tuning_err}",
-        ]
-    elif deviations:
+    if deviations:
         lines += [
             "",
             "config deviations (postgresql.auto.conf):",

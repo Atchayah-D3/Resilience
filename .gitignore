@@ -7,3 +7,5 @@ reports/*.html
 evidence/*
 !*/README.md
 .venv-ansible/
+.specify/
+.claude/

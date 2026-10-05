@@ -35,7 +35,9 @@ from resilience_tests.analysis.elle_checker import ElleChecker
 from resilience_tests.analysis.predicates import NOT_APPLICABLE, NOT_MEASURED
 from resilience_tests.analysis.bloat import bloat_metrics
 from resilience_tests.analysis.rto_decomposer import (
+    SLO_SUSTAIN_S,
     Baseline,
+    baseline_slo_check,
     decompose,
     first_write_after,
     per_cycle_recovery,
@@ -49,8 +51,8 @@ from resilience_tests.control.profile import EnvProfile
 from resilience_tests.control.reset import resolve_reset
 from resilience_tests.control.safety import SafetyController, SafetyViolation
 from resilience_tests.execution import injectors  # noqa: F401  (registers drivers)
-from resilience_tests.execution.injectors.base import FaultInjector, resolve
-from resilience_tests.execution.probes.probers import LogTailer, WriteProber, measure_clock_offset
+from resilience_tests.execution.injectors.base import FaultInjector, FaultNotLanded, resolve
+from resilience_tests.execution.probes.probers import DiskUsageProber, LogTailer, WriteProber, measure_clock_offset
 from resilience_tests.execution.remote import run_once
 from resilience_tests.execution.workload.driver import MeasuredWindow, WorkloadDriver
 from resilience_tests.execution.workload.history_writer import HistoryWriter
@@ -59,37 +61,17 @@ from resilience_tests.observability.event_stream import EventStream
 
 EVENTS_FILE = "events.jsonl"
 INTEGRITY_FILE = "integrity.txt"
-WORKLOAD_RAMP_S = 2.0  # connections established before the baseline window opens
+WORKLOAD_RAMP_S = 1.0  # one sample period after every worker has connected (see _p_baseline)
 RECOVERY_POLL_S = 1.0
 ABORT_POLL_S = 1.0
 RECOVERY_EXIT_MARGIN_S = 5.0  # leave the recovery loop before its phase timeout fires
 IDLE_TRANSACTION_GRACE_S = 2.0
+INDEX_BUILD_HEADSTART_S = 0.05
+# Fault detail kept under its own name in facts, where analysis and the report look for it.
+FAULT_FACT_KEY = {"idle_in_transaction": "idle_transaction", "connection_exhaustion": "connection_exhaustion"}
 IDLE_TRANSACTION_MIN_SOAK_S = 30.0
 
 
-def parse_pg_interval_s(val: str | None) -> float:
-    """Parse PostgreSQL interval strings such as '30s', '1min', '2h', '500ms', '0' into seconds."""
-    if not val:
-        return 0.0
-    val = str(val).strip().lower()
-    if val in ("0", "disabled", "off", "none"):
-        return 0.0
-    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)?$", val)
-    if not m:
-        return 0.0
-    num = float(m.group(1))
-    unit = m.group(2) or "s"
-    if unit in ("ms", "millisecond", "milliseconds"):
-        return num / 1000.0
-    elif unit in ("s", "sec", "second", "seconds"):
-        return num
-    elif unit in ("min", "m", "minute", "minutes"):
-        return num * 60.0
-    elif unit in ("h", "hr", "hour", "hours"):
-        return num * 3600.0
-    elif unit in ("d", "day", "days"):
-        return num * 86400.0
-    return num
 # Faults that must interrupt writes. If the probes never see an outage for one of these, the
 # availability gap is not measured rather than reported as ~0 s.
 OUTAGE_FAULTS = frozenset({"process_kill", "service_restart", "host_power_loss"})
@@ -147,6 +129,7 @@ class TestOrchestrator:
         self.workload: WorkloadDriver | None = None
         self.write_prober: WriteProber | None = None
         self.log_tailer: LogTailer | None = None
+        self.disk_prober: DiskUsageProber | None = None
         self.injector: FaultInjector | None = None
         self.abort_task: asyncio.Task[None] | None = None
         self.phases: list[PhaseRecord] = []
@@ -350,6 +333,7 @@ class TestOrchestrator:
 
         section = FAULT_DRIVER_SECTION.get(self.scenario.fault.type, DEFAULT_DRIVER_SECTION)
         self.injector = resolve(self.scenario.fault, self.profile)
+        self.injector.adapter = self.adapter   # faults inside the database act on the run's own sessions
         if self.scenario.repeat is not None:
             self.injector.repeat_plan = (self.scenario.repeat.cycles, self.scenario.repeat.interval_s)
         self.facts["fault_driver"] = {"section": section, "driver": self.injector.driver_name}
@@ -357,44 +341,26 @@ class TestOrchestrator:
         # Integrity counters are cumulative in most engines; the run is judged on its own delta.
         self.facts["integrity_baseline"] = await self.adapter.mark_integrity_baseline()
         await self.adapter.prepare_harness_state()
-        if hasattr(self.adapter, "configure_for_scenario"):
-            tuning = await self.adapter.configure_for_scenario(self.scenario.id)
-            if tuning and isinstance(tuning, dict):
-                self.facts["scenario_tuning"] = tuning
-                if self.scenario.id == "NL-M-05":
-                    # SHOW-only: the value was observed, not written. Never word this as
-                    # "tuning applied", and cleanup must not restore (RESET) it.
-                    observed = {k.replace("observed_", ""): v for k, v in tuning.items()
-                                if k.startswith("observed_")}
-                    self.facts["scenario_observed"] = observed
-                    self.disclosures.append(
-                        f"Observed deployment configuration (not modified): "
-                        f"{', '.join(f'{k}={v}' for k, v in sorted(observed.items()))}"
-                    )
-                else:
-                    self.disclosures.append(
-                        f"Scenario tuning applied (Option A): {', '.join(f'{k}={v}' for k, v in sorted(tuning.items()))} "
-                        f"(baseline, TPS floor, and SLO recovery measured under this tuning)"
-                    )
-            elif self.scenario.id == "NL-C-05":
-                err = getattr(self.adapter, "_scenario_config_error", None) or "returned empty"
-                self.facts["scenario_tuning_error"] = err
-                self.disclosures.append(f"Scenario tuning failed for NL-C-05: {err}")
-        if hasattr(self.adapter, "config_deviations"):
-            deviations = await self.adapter.config_deviations()
-            self.facts["config_deviations"] = deviations
-            if deviations and not self.facts.get("scenario_tuning"):
-                self.disclosures.append(
-                    f"Configuration deviation in postgresql.auto.conf: "
-                    f"{', '.join(f'{k}={v}' for k, v in sorted(deviations.items()))}"
-                )
+        # Read-only: the settings that decide how this fault plays out are recorded, never
+        # changed -- a result measured against a configuration the harness chose describes a
+        # deployment nobody runs.
+        observed = await self.adapter.observe_fault_settings(self.scenario.fault.type)
+        if observed:
+            self.facts["scenario_observed"] = observed
+            self.disclosures.append(
+                f"Observed deployment configuration (not modified): "
+                f"{', '.join(f'{k}={v}' for k, v in sorted(observed.items()))}"
+            )
+        deviations = await self.adapter.config_deviations()
+        self.facts["config_deviations"] = deviations
+        if deviations:
+            self.disclosures.append(
+                f"Configuration deviation in postgresql.auto.conf: "
+                f"{', '.join(f'{k}={v}' for k, v in sorted(deviations.items()))}"
+            )
         self.journals = MarkerJournals(self.run_dir)
-        try:
-            self.history = HistoryWriter(self.run_dir / "history.edn")
-            self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream, history=self.history)
-        except TypeError:
-            self.history = None
-            self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream)
+        self.history = HistoryWriter(self.run_dir / "history.edn")
+        self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream, history=self.history)
         return {"hostname": hostname, "settings": settings}
 
     async def _p_baseline(self) -> dict[str, Any]:
@@ -403,13 +369,31 @@ class TestOrchestrator:
         self.write_prober.start()
         self.log_tailer = LogTailer(self.node, self.stream)
         self.log_tailer.start()
+        if self.safety.standing_aborts():
+            self.disk_prober = DiskUsageProber(self.node, self.stream)
+            self.disk_prober.start()
+        else:
+            self.disclosures.append("No standing abort condition is configured for this environment "
+                                    "(safety.max_data_fs_used_pct): nothing stops the run if the data filesystem fills.")
         await self.workload.start()
         self.abort_task = asyncio.create_task(self._abort_monitor(), name="abort-monitor")
+        # Warm-up ends on evidence -- every declared worker connected and offering load -- and
+        # then one full sample period settles, so the window opens on a running workload rather
+        # than after a guessed delay.
+        await self.workload.wait_until_ready()
         await asyncio.sleep(WORKLOAD_RAMP_S)
         self.workload.begin_window()
         await asyncio.sleep(self.scenario.steady_state.duration_s)
         self.baseline = self.workload.end_window()
         self.stream.emit("orchestrator", "baseline", **asdict(self.baseline))
+        check = baseline_slo_check(self.stream.events(), self.workload.window_t0_ns, time.monotonic_ns(),
+                                   Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0))
+        self.facts["baseline_slo_check"] = asdict(check) | {"compliant_fraction": check.compliant_fraction}
+        if not check.sustained_window_found:
+            self.disclosures.append(
+                f"The undisturbed baseline never held the SLO definition (>= 80% TPS, p99 <= 1.5x, "
+                f"{SLO_SUSTAIN_S:.0f} s straight) -- {check.compliant} of {check.samples} seconds compliant -- "
+                f"so time-to-SLO after the fault cannot be measured on this target and is reported as not measured.")
         return asdict(self.baseline)
 
     async def _p_pre_fault(self) -> dict[str, Any]:
@@ -453,10 +437,7 @@ class TestOrchestrator:
             one = await self._inject_once(cycle=cycle)
             recovered = await self._await_cycle_recovery(cycle, last=cycle == r.cycles)
             one.update(recovered)
-            if hasattr(self.adapter, "quick_integrity_check"):
-                quick_integrity = await self.adapter.quick_integrity_check()
-            else:
-                quick_integrity = {"checksum_failures": 0, "ok": True}
+            quick_integrity = await self.adapter.quick_integrity_check()
             if quick_integrity:
                 one["quick_integrity"] = quick_integrity
                 if quick_integrity.get("checksum_failures", 0) > 0:
@@ -482,78 +463,69 @@ class TestOrchestrator:
         redo_sample_mono_ns = time.monotonic_ns()
         redo = await self.adapter.redo_distance_bytes()
 
-        checkpoint_detail: dict[str, Any] = {}
-        if self.scenario.id == "NL-C-02":
-            # Deterministic synchronization (Framework §10.2, Arch §5):
-            # Industry-level harnesses eliminate timing guessing by synchronizing with the database
-            # internal state. Ensure checkpointer is actively flushing/syncing buffers before kill.
-            try:
-                checkpoint_detail = await self.adapter.trigger_checkpoint_and_await_active()
-            except Exception as exc:
-                self.facts["checkpoint_trigger_error"] = f"{type(exc).__name__}: {exc}"
-                checkpoint_detail = {"checkpointer_active": False, "error": str(exc)}
-            active = checkpoint_detail.get("checkpointer_active", False)
-            self.facts["checkpoint_active_at_kill"] = active
-            self.facts["checkpoint_injection"] = checkpoint_detail
-            if not active:
-                raise PhaseAbort(f"checkpointer was not active: {checkpoint_detail.get('error', 'wait event indicates idle checkpointer')}")
-
-        index_task = None
-        if self.scenario.id == "NL-C-06" or getattr(self.scenario.fault, "timing", "") == "during_concurrent_index_build":
-            index_task = asyncio.create_task(
-                self.adapter.create_index_concurrently("resilience.markers", "ts", "idx_nlc06_concurrent")
-            )
-            await asyncio.sleep(0.05)
-
-        idle_detail: dict[str, Any] = {}
-        idle_supports = False
-        if self.scenario.id == "NL-M-05" or self.scenario.fault.type == "idle_in_transaction":
-            try:
-                idle_detail = await self.adapter.inject_idle_transaction()
-            except Exception as exc:
-                self.facts["idle_injection_error"] = f"{type(exc).__name__}: {exc}"
-                idle_detail = {"supported": False, "error": str(exc)}
-            self.facts["idle_transaction"] = idle_detail
-            idle_supports = bool(idle_detail.get("supported"))
-
-        if idle_supports:
-            # The adapter session IS the injection for idle_in_transaction (it is the session
-            # the harness later observes in check_idle_transaction). Injecting the same fault
-            # again through the generic SSH injector would open a second lingering transaction
-            # that is never measured -- and, using pg_sleep, would never even be `idle in
-            # transaction` state. T0 is the moment that session became idle.
-            detail = dict(idle_detail)
-            detail.pop("t0_mono_ns", None)
-            detail["t0_mono_ns"] = time.monotonic_ns()
-            sampling_delay_ms = round((detail["t0_mono_ns"] - redo_sample_mono_ns) / 1e6, 2)
-        else:
-            if idle_detail:
-                # injection unsupported: never read a missing backend as a timeout enforcement
-                self.facts["idle_injection_unsupported"] = True
+        checkpoint_detail, index_task = await self._establish_fault_state()
+        try:
             detail = await self.injector.inject(self.node)
+        except FaultNotLanded as exc:
+            # the ledger entry stays outstanding: whatever the attempt half-opened is still
+            # undone by cleanup's revert (or the kill switch)
+            if self.scenario.fault.type in FAULT_FACT_KEY:
+                self.facts[FAULT_FACT_KEY[self.scenario.fault.type]] = exc.detail
+            raise PhaseAbort(f"{self.scenario.fault.type} fault did not land: {exc}") from None
+        finally:
             if index_task is not None and not index_task.done():
                 index_task.cancel()
-            sampling_delay_ms = round(((detail.get("t0_mono_ns") or time.monotonic_ns()) - redo_sample_mono_ns) / 1e6, 2)
+        sampling_delay_ms = round(((detail.get("t0_mono_ns") or time.monotonic_ns()) - redo_sample_mono_ns) / 1e6, 2)
         t0 = detail.pop("t0_mono_ns", None) or time.monotonic_ns()
         self.t0_ns = t0 if self.t0_ns is None else self.t0_ns   # T0 of the run is the first fault
         self.cycle_t0s.append(t0)
         if checkpoint_detail:
             detail["checkpoint"] = checkpoint_detail
-        if idle_detail:
-            detail["idle_transaction"] = idle_detail
         self.ledger.transition(entry, "applied", inject=detail, cycle=cycle)
         self.stream.emit("injector", "t0", fault=self.scenario.fault.type, node=self.node.name,
                          t0_mono_ns=t0, cycle=cycle, redo_sampling_delay_ms=sampling_delay_ms, **detail)
         self.stream.sync()
         self.facts["injection_id"] = entry.injection_id
-        if self.scenario.fault.type == "connection_exhaustion":
-            self.facts["connection_exhaustion"] = detail
+        if self.scenario.fault.type in FAULT_FACT_KEY:
+            self.facts[FAULT_FACT_KEY[self.scenario.fault.type]] = detail
         self._cycle_entries = getattr(self, "_cycle_entries", {})
         self._cycle_entries[cycle] = entry
         self.redo_at_t0.append(redo)
 
         return {"cycle": cycle, "t0_mono_ns": t0, "redo_distance_bytes": redo,
                 "redo_sampling_delay_ms": sampling_delay_ms, **detail}
+
+    async def _establish_fault_state(self) -> tuple[dict[str, Any], asyncio.Task[None] | None]:
+        """Bring the target into the state the catalog says the fault must land inside
+        (`fault.during`). Returns (checkpoint evidence, running index build) -- either empty."""
+        during = self.scenario.fault.during
+        if during == "checkpoint":
+            # The kill must land while the checkpoint is still running. Everything the kill
+            # needs (SSH session, postmaster identity) is prepared BEFORE the checkpoint
+            # starts, so once the checkpointer is seen working the kill is a single command.
+            # Whether it actually landed in time is proven after recovery (validate).
+            await self.injector.arm(self.node)
+            try:
+                checkpoint_detail = await self.adapter.trigger_checkpoint_and_await_active()
+            except Exception as exc:
+                self.facts["checkpoint_trigger_error"] = f"{type(exc).__name__}: {exc}"
+                checkpoint_detail = {"checkpointer_active": False, "error": str(exc)}
+            except BaseException:
+                await self.injector.disarm()
+                raise
+            active = checkpoint_detail.get("checkpointer_active", False)
+            self.facts["checkpointer_seen_active_before_kill"] = active
+            self.facts["checkpoint_injection"] = checkpoint_detail
+            if not active:
+                await self.injector.disarm()
+                raise PhaseAbort(f"checkpointer was not active: {checkpoint_detail.get('error', 'wait event indicates idle checkpointer')}")
+            return checkpoint_detail, None
+        if during == "concurrent_index_build":
+            task = asyncio.create_task(self.adapter.start_concurrent_index_build())
+            # Not verified to still be building at the kill -- an NL-C-06 finding of its own.
+            await asyncio.sleep(INDEX_BUILD_HEADSTART_S)
+            return {}, task
+        return {}, None
 
     async def _await_cycle_recovery(self, cycle: int, last: bool = False) -> dict[str, Any]:
         """Wait for this cycle's service to come back, on the evidence of the write probe --
@@ -622,9 +594,8 @@ class TestOrchestrator:
         self.facts["slo_t0_mono_ns"] = slo_t0
         deadline = time.monotonic() + self.profile.phase_timeouts_s["recovery"] - RECOVERY_EXIT_MARGIN_S
 
-        if fault_type == "idle_in_transaction" or self.scenario.id == "NL-M-05":
-            observed_raw = (self.facts.get("scenario_observed") or {}).get("idle_in_transaction_session_timeout")
-            t_s = parse_pg_interval_s(observed_raw)
+        if fault_type == "idle_in_transaction":
+            t_s = self.adapter.idle_session_timeout_s(self.facts.get("scenario_observed") or {})
             bound_s = float(self.profile.phase_timeouts_s.get("recovery", 900.0))
             available_bound = max(1.0, bound_s - RECOVERY_EXIT_MARGIN_S)
             testable = (0.0 < t_s) and ((t_s + IDLE_TRANSACTION_GRACE_S) < available_bound)
@@ -638,6 +609,11 @@ class TestOrchestrator:
             self.facts["idle_hold_s"] = hold_s
             self.facts["idle_timeout_testable"] = testable
             self.facts["idle_timeout_parsed_s"] = t_s
+            self.disclosures.append(
+                f"Idle transaction held for {hold_s:.0f} s; the Framework specifies 2 h "
+                f"(Framework §10.7). The hold is the configured timeout plus a "
+                f"{IDLE_TRANSACTION_GRACE_S:.0f} s grace when that fits the recovery bound, "
+                f"otherwise {IDLE_TRANSACTION_MIN_SOAK_S:.0f} s of evidence collection.")
 
             start_mono = time.monotonic()
             while (time.monotonic() - start_mono) < hold_s and time.monotonic() < deadline:
@@ -678,6 +654,9 @@ class TestOrchestrator:
             raise PhaseAbort(f"workload driver failed: {self._workload_failure}")
         events = self.stream.events()
         m: dict[str, Any] = {}
+        if self.safety.standing_aborts() and not any(e.kind == "disk_usage" for e in events):
+            self.disclosures.append("The standing disk abort never received a reading from the target, so it "
+                                    "could not have stopped this run (see disk_usage_unavailable events).")
 
         expect_outage = self.scenario.fault.type in OUTAGE_FAULTS
         slo_t0 = self.cycle_t0s[-1] if self.scenario.repeat else self.t0_ns
@@ -688,6 +667,12 @@ class TestOrchestrator:
                       expect_outage=expect_outage)
         m.update(d.as_measured())
         self.facts["outage_observed"] = d.outage_observed
+        if not (self.facts.get("baseline_slo_check") or {}).get("sustained_window_found", True):
+            why = ("the undisturbed baseline never held the SLO for the sustain period, so a return to SLO "
+                   "after the fault cannot be told apart from the stalls the target always has")
+            for name in ("rto_to_slo_s", "t_warm_s"):
+                m[name] = NOT_MEASURED
+                self.not_measured[name] = why
         if d.outage_observed and d.rto_first_write_s is None:
             # the probes saw the outage start and never saw it end
             why = ("service did not accept a write again before the recovery bound expired -- "
@@ -723,7 +708,7 @@ class TestOrchestrator:
             recovered = recovered and isinstance(d.rto_first_write_s, (int, float))
         m["starts_unattended"] = recovered
 
-        if self.scenario.id == "NL-R-04" or self.scenario.fault.type == "connection_exhaustion":
+        if self.scenario.fault.type == "connection_exhaustion":
             exhaust_facts = self.facts.get("connection_exhaustion", {})
             m["rejections_explicit"] = bool(exhaust_facts.get("rejections_explicit", False))
             m["superuser_slot_honoured"] = bool(exhaust_facts.get("superuser_slot_honoured", False))
@@ -864,83 +849,34 @@ class TestOrchestrator:
             if not elle_res.valid:
                 m["elle_anomalies_count"] = elle_res.anomalies_count
 
-        if self.scenario.id == "NL-C-06" or getattr(self.scenario.fault, "timing", "") == "during_concurrent_index_build":
-            idx_status = await self.adapter.get_index_status("idx_nlc06_concurrent")
-            rebuild_ok = await self.adapter.cleanup_index("idx_nlc06_concurrent")
-            self.facts["concurrent_index"] = {
-                "post_recovery_status": idx_status,
-                "cleanup_or_rebuild_succeeded": rebuild_ok,
-            }
+        if self.scenario.fault.during == "concurrent_index_build":
+            self.facts["concurrent_index"] = await self.adapter.concurrent_index_outcome()
 
-        if self.scenario.id == "NL-C-02":
+        fault_not_landed: str | None = None
+        if self.scenario.fault.during == "checkpoint":
+            # Proven from where crash recovery started, not from what was seen before the kill:
+            # a checkpoint observed running can still finish before an SSH command arrives.
+            log_lines = [str(e.data.get("line", "")) for e in events
+                         if e.kind == "log_line" and e.t_mono_ns > self.t0_ns]
             try:
-                aborted_detail = await self.adapter.verify_checkpoint_aborted()
-                self.facts["checkpoint_verification"] = aborted_detail
-                aborted = aborted_detail.get("checkpoint_aborted")
-                self.facts["checkpoint_aborted"] = aborted
-                if aborted is None:
-                    self.not_measured["checkpoint_aborted"] = (
-                        "could not verify whether the in-flight checkpoint was aborted: "
-                        + aborted_detail.get("note", "no LSN baseline available"))
-            except Exception as exc:
-                self.facts["checkpoint_verify_error"] = f"{type(exc).__name__}: {exc}"
-                self.facts["checkpoint_aborted"] = None
-            m["checkpoint_active_at_kill"] = self.facts.get("checkpoint_active_at_kill", False)
+                verification = await self.adapter.checkpoint_in_flight_at_kill(log_lines)
+            except Exception as exc:  # noqa: BLE001 -- recorded; the run is then aborted below
+                verification = {"in_flight": None, "note": f"{type(exc).__name__}: {exc}"}
+            self.facts["checkpoint_verification"] = verification
+            in_flight = verification.get("in_flight")
+            if in_flight is None:
+                m["checkpoint_in_flight_at_kill"] = NOT_MEASURED
+                self.not_measured["checkpoint_in_flight_at_kill"] = verification.get("note", "no evidence")
+                fault_not_landed = ("could not show the checkpoint was still running when the kill landed: "
+                                    + verification.get("note", "no evidence"))
+            else:
+                m["checkpoint_in_flight_at_kill"] = in_flight
+                if not in_flight:
+                    fault_not_landed = ("the checkpoint completed before the kill landed, so this run tested an "
+                                        "ordinary crash, not a crash during a checkpoint: " + verification.get("note", ""))
 
-        if self.scenario.id == "NL-M-05" or self.scenario.fault.type == "idle_in_transaction":
-            idle_fact = self.facts.get("idle_transaction") or {}
-            idle_pid = idle_fact.get("pid")
-            idle_injected = bool(idle_fact.get("supported"))
-            if not idle_injected:
-                self.facts["idle_injection_unsupported"] = True
-            try:
-                idle_check = await self.adapter.check_idle_transaction(idle_pid)
-            except Exception as exc:
-                self.facts["idle_check_error"] = f"{type(exc).__name__}: {exc}"
-                idle_check = {"terminated_by_timeout": False, "still_idle": False, "error": str(exc)}
-            try:
-                bloat_check = await self.adapter.evaluate_vacuum_bloat()
-            except Exception as exc:
-                self.facts["vacuum_bloat_error"] = f"{type(exc).__name__}: {exc}"
-                bloat_check = {"dead_tuple_ratio": 0.0, "unvacuumed_dead_tuples": 0, "bloat_alert_fired": False}
-
-            self.facts["idle_transaction_check"] = idle_check
-            self.facts["vacuum_bloat_check"] = bloat_check
-
-            self.disclosures.append(
-                "dead-tuple metrics are from pg_stat_user_tables planner statistics, "
-                "updated at analyze/vacuum and potentially stale while vacuum is blocked; "
-                "treated as an operational alert basis, not an exact count"
-            )
-            timing = {k: bloat_check.get(k) for k in ("last_vacuum", "last_autovacuum", "last_analyze", "last_autoanalyze") if bloat_check.get(k)}
-            if timing:
-                self.facts["vacuum_bloat_timing"] = timing
-            if not bloat_check.get("last_analyze") and not bloat_check.get("last_autoanalyze"):
-                self.disclosures.append(
-                    "No analyze ran during the hold; planner statistics may reflect pre-hold dead tuple estimates."
-                )
-            t_s = float(self.facts.get("idle_timeout_parsed_s") or 0.0)
-            testable = bool(self.facts.get("idle_timeout_testable", False))
-            if t_s > 0 and not testable:
-                self.disclosures.append(
-                    f"Configured idle_in_transaction_session_timeout ({t_s:.1f}s) exceeds the recovery soak bound; "
-                    "timeout enforcement was untestable within this run and must be validated via Path B (bloat alerting)."
-                )
-
-            # Fail-closed on the injection itself: if no idle session was ever established, a
-            # missing backend CANNOT be read as "the engine enforced the timeout" -- that would
-            # report a passed path A for a fault that never existed. Similarly, Path B (bloat alert)
-            # must require that an idle session was actually injected and holding vacuum.
-            timeout_enforced = bool(idle_check.get("terminated_by_timeout", False)) and idle_injected and idle_pid is not None
-            bloat_alert = bool(bloat_check.get("bloat_alert_fired", False)) and idle_injected and idle_pid is not None
-
-            m["idle_in_transaction_session_timeout_enforced"] = timeout_enforced
-            m["bloat_alert_fired"] = bloat_alert
-            m["dead_tuple_ratio"] = float(bloat_check.get("dead_tuple_ratio", 0.0))
-            m["unvacuumed_dead_tuples"] = int(bloat_check.get("unvacuumed_dead_tuples", 0))
-            m["oldest_transaction_age_s"] = float(bloat_check.get("oldest_transaction_age_s", 0.0))
-            if "bloat_ratio" in bloat_check and bloat_check.get("bloat_ratio") is not None:
-                m["bloat_ratio"] = float(bloat_check["bloat_ratio"])
+        if self.scenario.fault.type == "idle_in_transaction":
+            m.update(await self._measure_idle_transaction(events))
 
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).
@@ -949,9 +885,110 @@ class TestOrchestrator:
         if journal_problem:
             # integrity output was still collected above, as evidence; no verdict is issued
             raise PhaseAbort(journal_problem)
+        if fault_not_landed:
+            # a statement about the run, not the database: no verdict is issued
+            raise PhaseAbort(fault_not_landed)
         self.facts["not_measured"] = dict(self.not_measured)
         self.verdict = threshold_eval.evaluate(self.scenario.accept, m, self.not_measured)
         return {"verdict": "pass" if self.verdict.passed else "fail"}
+
+    async def _measure_idle_transaction(self, events: list[Any]) -> dict[str, Any]:
+        """NL-M-05: each acceptance path is accepted only on evidence the harness observed.
+
+        Path A (timeout enforced): the session is gone, the harness's connection is closed,
+        AND the server said why -- its idle-in-transaction timeout log line, or that error
+        code on the closed connection. A session that merely disappeared proves nothing.
+
+        Path B (vacuum blocked, and an alert fired): vacuum is run while the session is still
+        open and must report dead tuples it was not allowed to remove, at a cutoff no newer
+        than the session's transaction id. Whether MONITORING alerted is not something the
+        harness can see -- no alert source is wired in -- so bloat_alert_fired is NOT_MEASURED;
+        the harness's own dead-tuple ratio shows bloat exists, not that anyone was told."""
+        m: dict[str, Any] = {}
+        idle_fact = self.facts.get("idle_transaction") or {}
+        idle_pid = idle_fact.get("pid")
+        try:
+            idle_check = await self.adapter.check_idle_transaction(idle_pid)
+        except Exception as exc:
+            self.facts["idle_check_error"] = f"{type(exc).__name__}: {exc}"
+            idle_check = {"terminated_by_timeout": False, "still_idle": False, "error": str(exc)}
+        self.facts["idle_transaction_check"] = idle_check
+
+        # --- path A
+        log_patterns = [re.compile(p, re.IGNORECASE) for p in self.adapter.idle_timeout_log_patterns()]
+        log_evidence = next((str(e.data.get("line", "")) for e in events
+                             if e.kind == "log_line" and e.t_mono_ns > (self.t0_ns or 0)
+                             and any(p.search(str(e.data.get("line", ""))) for p in log_patterns)), None)
+        sqlstate = idle_check.get("termination_sqlstate")
+        sqlstate_evidence = sqlstate if sqlstate in self.adapter.idle_timeout_sqlstates else None
+        self.facts["idle_timeout_evidence"] = {"log_line": log_evidence, "sqlstate": sqlstate_evidence}
+        if not idle_check.get("terminated_by_timeout"):
+            m["idle_in_transaction_session_timeout_enforced"] = False
+        elif log_evidence or sqlstate_evidence:
+            m["idle_in_transaction_session_timeout_enforced"] = True
+        else:
+            m["idle_in_transaction_session_timeout_enforced"] = NOT_MEASURED
+            self.not_measured["idle_in_transaction_session_timeout_enforced"] = (
+                "the idle session ended, but neither the server's idle-in-transaction timeout log line nor "
+                f"SQLSTATE {'/'.join(self.adapter.idle_timeout_sqlstates) or '(none)'} was seen, so the cause "
+                "is unknown")
+
+        # --- context: planner statistics (reported, never the basis of a path)
+        try:
+            stats = await self.adapter.evaluate_vacuum_bloat()
+        except Exception as exc:  # noqa: BLE001
+            stats = {"error": f"{type(exc).__name__}: {exc}"}
+        self.facts["vacuum_bloat_check"] = stats
+        for name in ("dead_tuple_ratio", "unvacuumed_dead_tuples", "tuple_bloat_ratio", "oldest_transaction_age_s"):
+            if stats.get(name) is not None:
+                m[name] = stats[name]
+            else:
+                m[name] = NOT_MEASURED
+                self.not_measured[name] = stats.get("error", "the engine reported no value")
+        timing = {k: stats.get(k) for k in ("last_vacuum", "last_autovacuum", "last_analyze", "last_autoanalyze") if stats.get(k)}
+        if timing:
+            self.facts["vacuum_bloat_timing"] = timing
+        self.disclosures.append(
+            "dead-tuple metrics are from pg_stat_user_tables planner statistics, "
+            "updated at analyze/vacuum and potentially stale while vacuum is blocked; "
+            "reported as context only")
+        if not stats.get("last_analyze") and not stats.get("last_autoanalyze"):
+            self.disclosures.append(
+                "No analyze ran during the hold; planner statistics may reflect pre-hold dead tuple estimates.")
+
+        # --- path B: is vacuum actually blocked? Only meaningful while the session is open.
+        if idle_check.get("still_idle"):
+            try:
+                probe = await self.adapter.probe_vacuum_horizon()
+            except Exception as exc:  # noqa: BLE001
+                probe = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
+            self.facts["vacuum_horizon_probe"] = probe
+            dead = probe.get("dead_not_removable")
+            cutoff, xid = probe.get("removable_cutoff"), idle_fact.get("backend_xid")
+            if not probe.get("supported") or dead is None:
+                m["vacuum_blocked"] = NOT_MEASURED
+                self.not_measured["vacuum_blocked"] = probe.get("error") or "vacuum did not report dead-but-not-removable tuples"
+            else:
+                m["dead_tuples_not_removable"] = dead
+                # the cutoff must be held at (or behind) the idle session's own xid -- otherwise
+                # something else is pinning the horizon and the fault is not the cause
+                held_by_session = cutoff is None or xid is None or cutoff <= xid
+                self.facts["vacuum_horizon_held_by_idle_session"] = held_by_session
+                m["vacuum_blocked"] = dead > 0 and held_by_session
+        else:
+            m["vacuum_blocked"] = NOT_MEASURED
+            self.not_measured["vacuum_blocked"] = "the idle session had already ended, so vacuum was no longer blocked by it"
+        m["bloat_alert_fired"] = NOT_MEASURED
+        self.not_measured["bloat_alert_fired"] = (
+            "no monitoring alert source is connected to the harness; its own dead-tuple ratio is evidence of "
+            "bloat, not of an alert")
+
+        t_s = float(self.facts.get("idle_timeout_parsed_s") or 0.0)
+        if t_s > 0 and not self.facts.get("idle_timeout_testable", False):
+            self.disclosures.append(
+                f"Configured idle_in_transaction_session_timeout ({t_s:.1f}s) exceeds the recovery soak bound; "
+                "timeout enforcement was untestable within this run.")
+        return m
 
     async def _p_report(self, results: dict[str, Any]) -> dict[str, Any]:
         path = report_mod.write_results(self.run_dir, results)
@@ -961,17 +998,11 @@ class TestOrchestrator:
         await self._stop_load()
         if self.log_tailer:
             await self.log_tailer.stop()
-        if hasattr(self.adapter, "close_idle_transaction"):
-            try:
-                await self.adapter.close_idle_transaction()
-            except Exception as exc:
-                self.facts["close_idle_error"] = f"{type(exc).__name__}: {exc}"
-        reverted = await revert_outstanding(self.profile, self.ledger, run_id=self.run_id)
-        try:
-            if hasattr(self.adapter, "restore_scenario_configuration"):
-                await self.adapter.restore_scenario_configuration()
-        except Exception as exc:
-            self.facts["restore_config_error"] = f"{type(exc).__name__}: {exc}"
+        if self.injector is not None:
+            await self.injector.disarm()
+        # the run's adapter goes with the revert: faults held inside the database are undone on
+        # the connections that hold them, not on a fresh adapter that holds nothing
+        reverted = await revert_outstanding(self.profile, self.ledger, run_id=self.run_id, adapter=self.adapter)
         return {"reverted": [(e.injection_id, outcome) for e, outcome in reverted]}
 
     def _after_cleanup(self, status: str, error: str | None, *,
@@ -999,8 +1030,6 @@ class TestOrchestrator:
         if outstanding:
             problems.append("injections not reverted: "
                             + ", ".join(f"{e.fault_type} on {e.node} ({e.state})" for e in outstanding))
-        if self.facts.get("restore_config_error"):
-            problems.append(f"scenario configuration not restored: {self.facts['restore_config_error']}")
         self.facts["cleanup_outstanding"] = [
             {"injection_id": e.injection_id, "fault_type": e.fault_type, "node": e.node, "state": e.state}
             for e in outstanding
@@ -1070,6 +1099,9 @@ class TestOrchestrator:
         if self.write_prober:
             await self.write_prober.stop()
             self.write_prober = None
+        if self.disk_prober:
+            await self.disk_prober.stop()
+            self.disk_prober = None
         if self.journals:
             self.journals.close()
             self.journals = None
@@ -1078,11 +1110,16 @@ class TestOrchestrator:
             self.history = None
 
     def _signals(self) -> dict[str, Any]:
-        """Probe-stream signals for abort_if. The replication/HA signals come from the Tier-2
-        probers; on a standalone target they do not exist and are marked not applicable."""
-        if self.node.role == "standalone":
-            return {"replication_lag_s": NOT_APPLICABLE, "secondary_node_unhealthy": NOT_APPLICABLE}
-        raise NotImplementedError("abort signals for clustered targets arrive with the Tier-2 probes")
+        """Probe-stream signals for abort conditions. The replication/HA signals come from the
+        Tier-2 probers; on a standalone target they do not exist and are marked not applicable.
+        The data filesystem's fill level applies to every target: the latest disk reading, or
+        NOT_MEASURED until one has arrived (never assumed to be empty)."""
+        if self.node.role != "standalone":
+            raise NotImplementedError("abort signals for clustered targets arrive with the Tier-2 probes")
+        assert self.stream is not None
+        disk = next((e for e in reversed(self.stream.events()) if e.kind == "disk_usage"), None)
+        return {"replication_lag_s": NOT_APPLICABLE, "secondary_node_unhealthy": NOT_APPLICABLE,
+                "data_fs_used_pct": disk.data["used_pct"] if disk is not None else NOT_MEASURED}
 
     async def _abort_monitor(self) -> None:
         first = True
@@ -1097,6 +1134,13 @@ class TestOrchestrator:
             if first:
                 self.abort_checks = [asdict(c) | {"t": time.time()} for c in checks]
                 first = False
+                inert = [c.predicate for c in checks
+                         if c.predicate in self.scenario.abort_if and c.outcome == "not_applicable"]
+                if inert and len(inert) == len(self.scenario.abort_if):
+                    self.disclosures.append(
+                        f"None of this scenario's abort conditions apply to a {self.node.role} target "
+                        f"({', '.join(inert)}); the run was guarded only by the environment's standing "
+                        f"aborts ({', '.join(self.safety.standing_aborts()) or 'none configured'}).")
             fired = [c for c in checks if c.triggered]
             if fired:
                 self._abort_reason = f"abort_if triggered: {[c.predicate for c in fired]}"
