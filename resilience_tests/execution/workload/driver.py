@@ -9,7 +9,8 @@ marker transaction of Arch §6.2 (BEGIN; INSERT marker; COMMIT). The driver keep
 through the fault -- reconnecting as the target returns -- so post-recovery throughput
 (T_warm / RTO-to-SLO) is measured by the same load.
 
-Every second it emits a `sample` event (committed TPS, p99 commit latency, errors,
+Every second it emits a `sample` event (committed TPS, p50/p95/p99 latency over EVERY attempt,
+committed or not, errors,
 connection drops, reconnects, failed connection attempts) on the harness clock.
 Per-transaction evidence lives in the marker journals, not the event stream.
 
@@ -83,13 +84,24 @@ class MeasuredWindow:
     duration_s: float
     commits: int
     tps: float
-    p99_ms: float | None          # database transaction latency
+    p99_ms: float | None          # database transaction latency, over every attempt
     journal_p99_ms: float | None  # driver-side marker flush latency (Arch §6.2)
     errors: int
     indeterminate: int
     drops: int = 0
     reconnects: int = 0
     connect_failures: int = 0
+    p50_ms: float | None = None   # reported context; the SLO is defined on p99 (Framework §6.2)
+    p95_ms: float | None = None
+
+
+def percentile(values: list[float], q: float) -> float | None:
+    """Nearest-rank percentile: the smallest value at or above fraction `q` of the sample."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = math.ceil(q * len(ordered))  # 1-based
+    return ordered[max(0, rank - 1)]
 
 
 def p99(values: list[float]) -> float | None:
@@ -149,11 +161,20 @@ class WorkloadDriver:
         self._measure: _Window | None = None
         self._measure_t0 = 0.0
         self.failure: str | None = None
+        self.connected_workers = 0   # workers that have opened their first session
+
+    async def wait_until_ready(self, poll_s: float = 0.1) -> None:
+        """Return once every worker has opened its session -- the load the scenario declares
+        is actually being offered. Bounded by the caller's phase timeout; a driver that has
+        already failed returns at once so the abort monitor can report why."""
+        while self.connected_workers < self.workload.concurrency and self.failure is None:
+            await asyncio.sleep(poll_s)
 
     def begin_window(self) -> None:
         """Start an exact measurement window (baseline / steady-state check)."""
         self._measure = _Window()
         self._measure_t0 = time.monotonic()
+        self.window_t0_ns = time.monotonic_ns()
 
     def end_window(self) -> MeasuredWindow:
         if self._measure is None:
@@ -165,6 +186,7 @@ class WorkloadDriver:
             p99_ms=p99(w.latencies_ms or []), journal_p99_ms=p99(w.journal_ms or []),
             errors=w.errors, indeterminate=w.indeterminate, drops=w.drops,
             reconnects=w.reconnects, connect_failures=w.connect_failures,
+            p50_ms=percentile(w.latencies_ms or [], 0.50), p95_ms=percentile(w.latencies_ms or [], 0.95),
         )
 
     async def start(self) -> None:
@@ -197,6 +219,7 @@ class WorkloadDriver:
                 "workload", "sample", interval_s=elapsed, commits=w.commits,
                 tps=w.commits / elapsed if elapsed > 0 else 0.0,
                 p99_ms=p99(w.latencies_ms or []), journal_p99_ms=p99(w.journal_ms or []),
+                p50_ms=percentile(w.latencies_ms or [], 0.50), p95_ms=percentile(w.latencies_ms or [], 0.95),
                 errors=w.errors, indeterminate=w.indeterminate, drops=w.drops,
                 reconnects=w.reconnects, connect_failures=w.connect_failures,
             )
@@ -235,6 +258,8 @@ class WorkloadDriver:
                         continue
                     if ever_connected:
                         self._count(reconnects=1)
+                    else:
+                        self.connected_workers += 1
                     ever_connected = True
                 session = await self._one_transaction(session, worker_id)
         finally:
@@ -272,21 +297,24 @@ class WorkloadDriver:
             outcome = TransactionOutcome.UNKNOWN
 
         t_end_ns = time.monotonic_ns()
+        # Latency is recorded for EVERY attempt, not only the ones that committed: a client
+        # waited for the failures too. Percentiles over survivors alone would read a stall that
+        # ended in a timeout as no latency at all -- and a lower baseline p99 than the client saw.
+        latency_ms = (time.monotonic() - t0) * 1000
         if outcome is TransactionOutcome.DEFINITELY_ABORTED:
             if self.history is not None:
                 self.history.record_fail(worker_id, key, seq, error="aborted", t_mono_ns=t_end_ns)
-            self._count(errors=1)
+            self._count(errors=1, latency_ms=latency_ms)
             return session
         if outcome is TransactionOutcome.UNKNOWN:
             # stays in written - acked (indeterminate); the connection was lost or is no
             # longer trustworthy, so it is discarded -- a dropped connection for the client
             if self.history is not None:
                 self.history.record_info(worker_id, key, seq, error="indeterminate", t_mono_ns=t_end_ns)
-            self._count(indeterminate=1, drops=1)
+            self._count(indeterminate=1, drops=1, latency_ms=latency_ms)
             await _discard(session)
             return None
 
-        latency_ms = (time.monotonic() - t0) * 1000
         # 3. only on acknowledgement
         t2 = time.monotonic()
         await self.journals.acknowledged(marker_id, time.time())
@@ -308,11 +336,11 @@ class WorkloadDriver:
             w.drops += drops
             w.reconnects += reconnects
             w.connect_failures += connect_failures
+            assert w.latencies_ms is not None and w.journal_ms is not None
             if latency_ms is not None:
-                assert w.latencies_ms is not None and w.journal_ms is not None
                 w.latencies_ms.append(latency_ms)
-                if journal_ms is not None:
-                    w.journal_ms.append(journal_ms)
+            if journal_ms is not None:
+                w.journal_ms.append(journal_ms)
 
 
 async def _discard(session: DatabaseSession | None) -> None:

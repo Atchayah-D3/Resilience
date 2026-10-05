@@ -113,11 +113,18 @@ class SafetyController:
         return {"hostname": observed_hostname, "inventory_tag": sentinel["inventory_tag"],
                 "disposable": sentinel.get("disposable"), "created_by": sentinel.get("created_by")}
 
+    def standing_aborts(self) -> list[str]:
+        """Abort conditions the ENVIRONMENT imposes on every scenario run on it, beside the
+        scenario's own abort_if. A scenario's conditions may not apply to every target (a
+        standalone node has no replica to lag); these always do."""
+        limit = self.profile.safety.max_data_fs_used_pct
+        return [] if limit is None else [f"data_fs_used_pct > {limit:g}"]
+
     def check_abort(self, signals: Mapping[str, Any]) -> list[AbortCheck]:
         """An abort predicate whose inputs do not apply to this target (e.g. replication lag on a
         standalone node) is recorded as not_applicable -- visible in the report, never silent."""
         out = []
-        for text in self.scenario.abort_if:
+        for text in [*self.scenario.abort_if, *self.standing_aborts()]:
             r = threshold_eval.evaluate_one(text, signals)
             out.append(AbortCheck(text, r.outcome, r.values))
         return out

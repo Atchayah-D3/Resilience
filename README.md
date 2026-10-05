@@ -190,10 +190,12 @@ exists purely to earn the right to continue.
    the test asks for. → `workload/driver.py`
 4. The abort monitor starts, checking once a second whether the run must stop early.
    → `control/orchestrator.py`
-5. Two seconds of warm-up, deliberately unmeasured: connections are still opening and caches are
-   cold. A low baseline would *lower the bar* for recovery.
-6. The measuring window opens for 120 seconds, then closes. Throughput and latency are frozen as
-   the baseline. → `workload/driver.py`
+5. Warm-up, deliberately unmeasured, ends on evidence: every declared worker has connected, then
+   one more 1 s sample settles. A low baseline would *lower the bar* for recovery.
+6. The measuring window opens for 120 seconds, then closes. Throughput and latency (p50/p95/p99
+   over every attempt, failed ones included) are frozen as the baseline. → `workload/driver.py`
+7. The baseline is checked against the SLO definition it anchors: if the undisturbed service never
+   holds ≥ 80 % TPS and p99 ≤ 1.5× for 60 s straight, time-to-SLO is reported as not measured.
 
 ### Phase 4 — pre_fault
 
@@ -364,6 +366,7 @@ as failed, with the reason attached. The verdict is `passed` only when every rul
 | One machine at a time | Fixed at one, enforced by the test file’s own validation. |
 | Record book before the act | Forced to disk before every fault, so a crashed harness can still be cleaned up. |
 | Repair tool | `python -m resilience_tests.control.killswitch --env <profile>`. |
+| Standing abort | `safety.max_data_fs_used_pct` in the machine file: every run stops if the data filesystem fills past it, whatever the scenario's own `abort_if` (which may not apply to a standalone target). |
 | Time limit on every phase | No step can hang forever. |
 | One run per machine | A lock, released by the operating system if the harness dies. |
 | No credentials in the repository | Database passwords come from the harness machine’s `~/.pgpass`; SSH uses keys with host keys verified. |

@@ -85,11 +85,72 @@ def test_nl_c_02_deterministic_execution_and_verdict(env):
 
     # Checkpoint synchronization facts
     facts = results["facts"]
-    assert facts.get("checkpoint_active_at_kill") is True
+    assert facts.get("checkpointer_seen_active_before_kill") is True
     assert "checkpoint_injection" in facts
     assert facts["checkpoint_injection"].get("checkpointer_active") is True
-    assert "checkpoint_verification" in facts
-    assert facts["checkpoint_verification"].get("checkpoint_aborted") is True
+    # the fault is proven from where recovery started, not from what was seen before the kill
+    assert facts["checkpoint_verification"].get("in_flight") is True
+    assert m["checkpoint_in_flight_at_kill"] is True
+
+
+def _run_nlc02(env):
+    item = RunPlanItem(scenario=scenario("NL-C-02"), env_class=env.env_class,
+                       role="standalone", node=env.nodes[0])
+    return asyncio.run(TestOrchestrator(item, env, RunOptions()).run())
+
+
+def test_nl_c_02_aborts_when_the_checkpoint_finished_before_the_kill(env, monkeypatch):
+    """Was: the checkpointer was seen busy, the kill arrived after the checkpoint completed,
+    and the run passed as a 'crash during checkpoint' that was an ordinary crash."""
+    async def completed(self, log_lines):
+        return {"in_flight": False, "prior_redo_lsn": "0/F4240", "recovery_redo_start_lsn": "0/1E8480",
+                "note": "recovery started from a newer redo point"}
+
+    monkeypatch.setattr(OutageAdapter, "checkpoint_in_flight_at_kill", completed)
+    results = _run_nlc02(env)
+    assert results["status"] == "aborted", why(results)
+    assert "checkpoint completed before the kill landed" in results["error"]
+    assert results["verdict"] is None
+    assert results["measured"]["checkpoint_in_flight_at_kill"] is False
+
+
+def test_nl_c_02_aborts_when_recovery_start_cannot_be_seen(env, monkeypatch):
+    """No 'redo starts at' line (log not tailed, wrong log_file) is no evidence -- never a pass."""
+    async def unknown(self, log_lines):
+        return {"in_flight": None, "note": "no 'redo starts at' line reached the harness"}
+
+    monkeypatch.setattr(OutageAdapter, "checkpoint_in_flight_at_kill", unknown)
+    results = _run_nlc02(env)
+    assert results["status"] == "aborted", why(results)
+    assert "could not show the checkpoint was still running" in results["error"]
+    assert str(results["measured"]["checkpoint_in_flight_at_kill"]) == "NOT_MEASURED"
+
+
+def test_nl_c_02_arms_the_kill_before_the_checkpoint_starts(env, monkeypatch):
+    """Everything but the kill itself must be done before the CHECKPOINT is issued."""
+    from tests.test_orchestrator import FakeFault
+    order: list[str] = []
+
+    async def arm(self, node):
+        order.append("arm")
+
+    async def trigger(self, timeout_s: float = 10.0):
+        order.append("checkpoint")
+        self._checkpoint_baseline = {"redo_lsn": 1000000}
+        return {"checkpointer_active": True, "checkpointer_pid": 9999}
+
+    real_inject = FakeFault.inject
+
+    async def inject(self, node):
+        order.append("kill")
+        return await real_inject(self, node)
+
+    monkeypatch.setattr(FakeFault, "arm", arm, raising=False)
+    monkeypatch.setattr(FakeFault, "inject", inject)
+    monkeypatch.setattr(OutageAdapter, "trigger_checkpoint_and_await_active", trigger)
+    results = _run_nlc02(env)
+    assert results["status"] == "passed", why(results)
+    assert order == ["arm", "checkpoint", "kill"]
 
 
 def test_nl_c_02_fails_if_checkpoint_not_active(env, monkeypatch):
@@ -152,11 +213,11 @@ def test_nl_c_02_summary_report_formatting():
                 "io_writes_during_cp": 15,
             }
         },
-        "measured": {"checkpoint_active_at_kill": True, "corruption_count": 0},
+        "measured": {"checkpoint_in_flight_at_kill": True, "corruption_count": 0},
     }
     summary = render_summary(sample_results)
     assert "checkpoint fault injection (NL-C-02):" in summary
-    assert "checkpointer active at kill: True" in summary
+    assert "checkpointer seen active before kill: True" in summary
     assert "checkpointer pid: 48102" in summary
     assert "wait event: CheckpointWriteDelay (Timeout)" in summary
     assert "stat counter delta (pg_stat_checkpointer.buffers_written): 42" in summary
@@ -247,23 +308,80 @@ def test_postgres_adapter_checkpoint_methods_unit():
         # Verify the poll actually polled 3 times (skipped 2 idle states)
         assert mock_conn_poll.fetchrow.call_count == 3
 
-        # --- verify_checkpoint_aborted ---
-        # After crash recovery, pg_control_checkpoint shows the end-of-recovery checkpoint
-        # with a HIGHER checkpoint_lsn than the pre-kill baseline.
-        mock_conn_verify = AsyncMock()
-        mock_conn_verify.fetchrow.return_value = {
-            "checkpoint_lsn": 23134208,   # higher than baseline 23068672
-            "redo_lsn": 23100000,         # also advanced past baseline
-            "checkpoint_time": "2026-09-28 12:00:05",
-        }
-        adapter._connect = AsyncMock(return_value=mock_conn_verify)
-        verify = await adapter.verify_checkpoint_aborted()
-        assert verify["checkpoint_aborted"] is True
-        assert "current_checkpoint" in verify
-        assert "prior_checkpoint" in verify
-        assert verify.get("redo_advanced") is True
-
     asyncio.run(_test())
+
+
+def _pg_adapter():
+    from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
+    from resilience_tests.control.profile import Node
+
+    return PostgreSQLAdapter(Node(
+        name="test-node", role="standalone", topology_role="primary",
+        ssh={"host": "127.0.0.1", "port": 22, "user": "test"},
+        db={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
+        client={"host": "127.0.0.1", "port": 5432, "dbname": "test", "user": "test"},
+        pgdata="/data", pg_bin="/bin", os_user="postgres", service="postgresql.service",
+        log_file="/data/logfile",
+    ))
+
+
+@pytest.mark.parametrize("lines,in_flight", [
+    # recovery replayed from the redo point read before the CHECKPOINT: it never completed
+    (["LOG:  database system was interrupted; last known up at ...", "LOG:  redo starts at 0/1600000"], True),
+    # recovery started later: a checkpoint completed before the kill
+    (["LOG:  redo starts at 0/1A00000"], False),
+    # nothing to judge by
+    (["LOG:  database system is ready to accept connections"], None),
+])
+def test_checkpoint_in_flight_is_judged_from_the_recovery_start(lines, in_flight):
+    """Was: post-recovery checkpoint_lsn > pre-kill checkpoint_lsn, which is ALWAYS true --
+    recovery writes its own end-of-recovery checkpoint whether or not ours had finished."""
+    adapter = _pg_adapter()
+    adapter._checkpoint_baseline = {"redo_lsn": 0x1600000}
+    detail = asyncio.run(adapter.checkpoint_in_flight_at_kill(lines))
+    assert detail["in_flight"] is in_flight
+    assert detail["prior_redo_lsn"] == "0/1600000"
+
+
+def test_checkpoint_in_flight_is_unknown_without_a_pre_checkpoint_redo_point():
+    adapter = _pg_adapter()
+    detail = asyncio.run(adapter.checkpoint_in_flight_at_kill(["LOG:  redo starts at 0/1600000"]))
+    assert detail["in_flight"] is None
+
+
+def test_recovery_redo_start_lsn_parses_high_and_low_words():
+    from resilience_tests.adapters.postgresql.adapter import recovery_redo_start_lsn
+    assert recovery_redo_start_lsn(["2026-10-05 LOG:  redo starts at 1/2A"]) == (1 << 32) | 0x2A
+    assert recovery_redo_start_lsn(["redo done at 0/5"]) is None
+
+
+def test_an_armed_kill_sends_only_the_kill(monkeypatch):
+    """After arm(), inject() must not reconnect or look anything up before the SIGKILL."""
+    import resilience_tests.execution.injectors.process as process_mod
+    from resilience_tests.execution.injectors.process import OsSshProcessDriver
+    from tests.test_measurement_and_safety import NODE, PROFILE, STAT, use_host
+
+    state = {"killed": False}
+
+    def kill():
+        state["killed"] = True
+        return ""
+
+    calls = use_host(monkeypatch, process_mod, {
+        "postmaster.pid": "4242", "systemctl kill": kill,
+        "/proc/4242/stat": lambda: "" if state["killed"] else STAT,
+    })
+    driver = OsSshProcessDriver(PROFILE, "process_kill")
+
+    async def go():
+        await driver.arm(NODE)
+        armed_calls = len(calls)
+        detail = await driver.inject(NODE)
+        return armed_calls, detail
+
+    armed_calls, detail = asyncio.run(go())
+    assert "systemctl kill" in calls[armed_calls]          # the very next command is the kill
+    assert detail["pre_armed"] is True and calls[-1] == "<close>"
 
 
 def test_postgres_adapter_rejects_null_wait_event_without_buffers():

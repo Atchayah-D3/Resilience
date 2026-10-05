@@ -12,12 +12,22 @@ from collections.abc import Mapping
 from typing import Any, ClassVar
 
 from catalog.schema import DEFAULT_DRIVER_SECTION, FAULT_DRIVER_SECTION, Fault
+from resilience_tests.adapters.base import BaseDatabaseAdapter
 from resilience_tests.control.profile import EnvProfile, Node
 
 
 class DriverNotAvailable(RuntimeError):
     """The profile resolves the fault to a driver that is not configured or not built.
     Always fails closed -- a scenario never silently runs without its fault."""
+
+
+class FaultNotLanded(RuntimeError):
+    """The fault was attempted and the target did not end up in the faulted state. The run
+    is aborted -- a statement about the run, not the database. `detail` is what was observed."""
+
+    def __init__(self, message: str, detail: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.detail = dict(detail or {})
 
 
 class FaultInjector(ABC):
@@ -33,6 +43,11 @@ class FaultInjector(ABC):
     def __init__(self, profile: EnvProfile, fault_type: str) -> None:
         self.profile = profile
         self.fault_type = fault_type
+        # The run's database adapter. Faults that live inside the database (a held session,
+        # a connection flood) are applied and reverted through it, so the session the fault
+        # opened is the same one the run observes and cleanup ends. Set by the orchestrator
+        # and by the kill switch; None when no adapter was handed over.
+        self.adapter: BaseDatabaseAdapter | None = None
         # (cycles, interval_s) when the scenario repeats its fault, so preflight can check the
         # target can actually take that cadence (Framework NL-C-05)
         self.repeat_plan: tuple[int, float] | None = None
@@ -44,6 +59,15 @@ class FaultInjector(ABC):
     @abstractmethod
     async def inject(self, node: Node) -> dict[str, Any]:
         """Apply the fault. Returns driver detail recorded in the ledger and event stream."""
+
+    async def arm(self, node: Node) -> None:
+        """Do everything `inject` needs EXCEPT the fault itself, so that a later `inject` is a
+        single action. Used when the fault must land inside a short window the harness has
+        just observed (NL-C-02: while a checkpoint is running). Default: nothing to prepare."""
+
+    async def disarm(self) -> None:
+        """Release what `arm` prepared, when the fault will not be injected after all.
+        Idempotent. Default: nothing to release."""
 
     @abstractmethod
     async def revert(self, node: Node, detail: Mapping[str, Any] | None = None) -> dict[str, Any]:

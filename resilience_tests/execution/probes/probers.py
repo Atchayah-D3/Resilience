@@ -27,6 +27,7 @@ WRITE_PROBE_INTERVAL_S = 0.2  # Fig. 6
 READ_PROBE_INTERVAL_S = 0.2  # Fig. 6
 PROBE_ATTEMPT_TIMEOUT_S = 1.0  # a probe attempt is bounded (Arch §15); it may span several ticks
 LOG_RECONNECT_PAUSE_S = 1.0
+DISK_PROBE_INTERVAL_S = 5.0  # disk fills over minutes; a 5 s reading is ample for an abort
 
 
 class _Periodic:
@@ -160,6 +161,54 @@ class LogTailer:
             except (OSError, asyncssh.Error, TimeoutError) as exc:
                 self.stream.emit("log_tailer", "disconnected", node=self.node.name, error=type(exc).__name__)
             await asyncio.sleep(LOG_RECONNECT_PAUSE_S)
+
+
+class DiskUsageProber:
+    """How full the filesystem holding the data directory is, every DISK_PROBE_INTERVAL_S, over
+    one persistent SSH session (reconnecting across restarts and reboots). Feeds the standing
+    abort condition; a failed reading is recorded as unavailable, never as a number."""
+
+    def __init__(self, node: Node, stream: EventStream) -> None:
+        self.node = node
+        self.stream = stream
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop(), name="DiskUsageProber")
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+
+    async def _loop(self) -> None:
+        command = as_root(f"df -P {shlex.quote(self.node.pgdata)}")
+        while True:
+            try:
+                async with RemoteHost(self.node.ssh, connect_timeout_s=PROBE_ATTEMPT_TIMEOUT_S * 3) as host:
+                    while True:
+                        result = await host.run(command, timeout_s=DISK_PROBE_INTERVAL_S, check=False)
+                        used = parse_df_used_pct(result.stdout)
+                        if used is None:
+                            self.stream.emit("disk_prober", "disk_usage_unavailable", node=self.node.name,
+                                             error=(result.stderr or result.stdout).strip()[:200])
+                        else:
+                            self.stream.emit("disk_prober", "disk_usage", node=self.node.name, used_pct=used)
+                        await asyncio.sleep(DISK_PROBE_INTERVAL_S)
+            except (OSError, asyncssh.Error, TimeoutError) as exc:
+                self.stream.emit("disk_prober", "disk_usage_unavailable", node=self.node.name, error=type(exc).__name__)
+            await asyncio.sleep(DISK_PROBE_INTERVAL_S)
+
+
+def parse_df_used_pct(text: str) -> float | None:
+    """The Use% column of `df -P <path>` (header line, then one line for the filesystem)."""
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    fields = lines[-1].split()
+    if len(fields) < 5 or not fields[4].endswith("%") or not fields[4][:-1].isdigit():
+        return None
+    return float(fields[4][:-1])
 
 
 async def measure_clock_offset(node: Node, stream: EventStream, samples: int = 5) -> float:

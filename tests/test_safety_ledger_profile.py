@@ -87,11 +87,27 @@ def test_destructive_scenario_needs_a_disposable_sentinel():
 
 
 def test_abort_predicates_on_standalone_are_not_applicable_not_triggered():
-    checks = ctl().check_abort({"replication_lag_s": NOT_APPLICABLE, "secondary_node_unhealthy": NOT_APPLICABLE})
-    assert [c.outcome for c in checks] == ["not_applicable", "not_applicable"]
+    signals = {"replication_lag_s": NOT_APPLICABLE, "secondary_node_unhealthy": NOT_APPLICABLE,
+               "data_fs_used_pct": 40.0}
+    checks = ctl().check_abort(signals)
+    assert [c.outcome for c in checks] == ["not_applicable", "not_applicable", "fail"]
     assert not any(c.triggered for c in checks)
-    fired = ctl().check_abort({"replication_lag_s": 400, "secondary_node_unhealthy": False})
+    fired = ctl().check_abort({"replication_lag_s": 400, "secondary_node_unhealthy": False, "data_fs_used_pct": 40.0})
     assert fired[0].triggered and not fired[1].triggered
+
+
+def test_the_standing_disk_abort_applies_to_a_standalone_target():
+    """Was: every abort_if in the catalog is a cluster signal, so on a standalone node nothing
+    could ever stop a run. The environment's own condition applies to every target."""
+    assert ctl().standing_aborts() == ["data_fs_used_pct > 90"]
+    checks = ctl().check_abort({"replication_lag_s": NOT_APPLICABLE, "secondary_node_unhealthy": NOT_APPLICABLE,
+                                "data_fs_used_pct": 95.0})
+    assert [c.predicate for c in checks if c.triggered] == ["data_fs_used_pct > 90"]
+    # no reading yet is NOT_MEASURED -- never read as an empty disk, and never a trigger
+    from resilience_tests.analysis.predicates import NOT_MEASURED
+    unknown = ctl().check_abort({"replication_lag_s": NOT_APPLICABLE, "secondary_node_unhealthy": NOT_APPLICABLE,
+                                 "data_fs_used_pct": NOT_MEASURED})
+    assert unknown[-1].outcome == "not_measured" and not unknown[-1].triggered
 
 
 def test_ledger_outstanding_until_reverted(tmp_path):
@@ -206,8 +222,14 @@ def test_every_fault_type_can_be_injected_and_reverted(monkeypatch):
     for fault_type in sorted(process_mod.OsSshProcessDriver.fault_types):
         injector = process_mod.OsSshProcessDriver(PROFILE, fault_type)
         assert asyncio.run(injector.preflight(NODE))
-        detail = asyncio.run(injector.inject(NODE))
-        assert detail["t0_mono_ns"] > 0, fault_type
+        if fault_type == "idle_in_transaction":
+            # injected and confirmed by the database adapter; a shell-held second session
+            # could not be confirmed or found again, so the SSH driver refuses
+            with pytest.raises(DriverNotAvailable, match="through the database adapter"):
+                asyncio.run(injector.inject(NODE))
+        else:
+            detail = asyncio.run(injector.inject(NODE))
+            assert detail["t0_mono_ns"] > 0, fault_type
         asyncio.run(injector.revert(NODE))
     assert any("systemctl kill -s SIGKILL" in c for c in calls)   # Arch §5: the unit's cgroup
     assert any("systemctl restart" in c for c in calls)

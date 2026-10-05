@@ -19,8 +19,10 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from resilience_tests.adapters.base import BaseDatabaseAdapter, adapter_for
+from resilience_tests.adapters.postgresql.adapter import IDLE_SESSION_APPLICATION_NAME
 from resilience_tests.control.profile import Node
-from resilience_tests.execution.injectors.base import DriverNotAvailable, FaultInjector, register
+from resilience_tests.execution.injectors.base import DriverNotAvailable, FaultInjector, FaultNotLanded, register
 from resilience_tests.execution.remote import RemoteHost, as_root, as_user
 
 q = shlex.quote  # profile fields reach root shell commands as literals, never as syntax
@@ -235,28 +237,31 @@ class OsSshProcessDriver(FaultInjector):
             return await self._exhaust_connections(node)
         return await self._kill(node)
 
+    def _database_adapter(self, node: Node) -> BaseDatabaseAdapter:
+        """The run's adapter when it was handed over; otherwise one built from the profile
+        (the kill switch after a crash, where the run's adapter no longer exists)."""
+        if self.adapter is None:
+            self.adapter = adapter_for(self.profile.database.engine, node)
+        return self.adapter
+
     async def _inject_idle(self, node: Node) -> dict[str, Any]:
-        """Inject an idle-in-transaction holding back vacuum xmin (NL-M-05)."""
-        async with RemoteHost(node.ssh) as host:
-            sql = "BEGIN; SELECT txid_current();"
-            cmd = (
-                f"cd /tmp && nohup bash -c '("
-                f"echo {shlex.quote(sql)}; sleep 7200"
-                f") | {q(node.pg_bin + '/psql')} -X -p {node.db.port} "
-                f"-d {q(node.db.dbname)}' >/dev/null 2>&1 & echo $!"
-            )
-            r = await host.run(as_user(node.os_user, cmd), timeout_s=SSH_TIMEOUT_S, check=False)
-            bg_pid = int(r.stdout.strip()) if r.stdout.strip().isdigit() else None
-            t0_mono_ns = time.monotonic_ns()
-        return {"action": "idle_in_transaction", "pid": bg_pid, "t0_mono_ns": t0_mono_ns}
+        """Idle-in-transaction (NL-M-05), applied through the run's database adapter so the
+        session it opens is the one the run later observes and cleanup ends. The adapter
+        confirms it from the server; an unconfirmed session is a fault that did not land.
+        Never a shell-held psql session: it could neither be confirmed nor found again."""
+        if self.adapter is None:
+            raise DriverNotAvailable("idle_in_transaction is injected through the database adapter, "
+                                     "and none was handed to this driver")
+        detail = dict(await self.adapter.inject_idle_transaction())
+        if not detail.get("supported"):
+            raise FaultNotLanded(f"idle session not established: {detail.get('error')}", detail)
+        detail.update(action="idle_in_transaction", t0_mono_ns=time.monotonic_ns())
+        return detail
 
     async def _exhaust_connections(self, node: Node) -> dict[str, Any]:
-        """Connection exhaustion under load (NL-R-04)."""
-        from resilience_tests.adapters.base import adapter_for
-        engine = getattr(self.profile.database, "engine", "postgresql") if hasattr(self, "profile") and self.profile and hasattr(self.profile, "database") else "postgresql"
-        adapter = adapter_for(engine, node)
-        self._adapter = adapter
-        return await adapter.exhaust_connections(hold_duration_s=5.0)
+        """Connection exhaustion under load (NL-R-04), held on the run's adapter so the revert
+        that follows can release the same connections."""
+        return await self._database_adapter(node).exhaust_connections(hold_duration_s=5.0)
 
     async def _reload(self, node: Node) -> dict[str, Any]:
         """Change a parameter, then SIGHUP. A reload-only parameter is used deliberately: the
@@ -283,6 +288,37 @@ class OsSshProcessDriver(FaultInjector):
             t0_mono_ns = time.monotonic_ns()
         return {"action": f"systemctl restart {node.service}", "t0_mono_ns": t0_mono_ns}
 
+    async def arm(self, node: Node) -> None:
+        """For process_kill: open the SSH session and identify the postmaster now, so that
+        `inject` sends exactly one command. NL-C-02 must land its kill while a checkpoint it
+        has just seen running is still running; an SSH handshake and two lookups between the
+        two would give the checkpoint time to finish."""
+        if self.fault_type != "process_kill":
+            return
+        await self.disarm()
+        host = RemoteHost(node.ssh)
+        await host.connect()
+        try:
+            pid, before = await self._identify_postmaster(host, node)
+        except BaseException:
+            await host.close()
+            raise
+        self._armed = (host, pid, before)
+
+    async def disarm(self) -> None:
+        armed, self._armed = getattr(self, "_armed", None), None
+        if armed is not None:
+            await armed[0].close()
+
+    async def _identify_postmaster(self, host: RemoteHost, node: Node) -> tuple[int, tuple[str, str]]:
+        pid = await self._postmaster_pid(host, node)
+        if pid is None:
+            raise DriverNotAvailable(f"{node.name}: no postmaster.pid in {node.pgdata}")
+        before = parse_proc_stat(await self._proc_stat(host, pid))
+        if before is None:
+            raise DriverNotAvailable(f"{node.name}: postmaster.pid names {pid}, which is not running")
+        return pid, before
+
     async def _kill(self, node: Node) -> dict[str, Any]:
         """SIGKILL every process in the unit's cgroup -- postmaster and backends together
         (Arch §5: `systemctl kill -s SIGKILL`). T0 is when the kill call returns; the
@@ -292,24 +328,32 @@ class OsSshProcessDriver(FaultInjector):
         Killing the postmaster alone leaves its backends running in the cgroup. The service
         manager then holds the restart until they exit or its stop timeout expires, and that
         wait lands inside the measured RTO -- a recovery-time budget spent on the harness's
-        own untidiness rather than on the database."""
-        async with RemoteHost(node.ssh) as host:
-            pid = await self._postmaster_pid(host, node)
-            if pid is None:
-                raise DriverNotAvailable(f"{node.name}: no postmaster.pid in {node.pgdata}")
-            before = parse_proc_stat(await self._proc_stat(host, pid))
-            if before is None:
-                raise DriverNotAvailable(f"{node.name}: postmaster.pid names {pid}, which is not running")
-            await host.run(as_root(f"systemctl kill -s SIGKILL {q(node.service)}"), timeout_s=SSH_TIMEOUT_S)
-            t0_mono_ns = time.monotonic_ns()
-            deadline = time.monotonic() + KILL_CONFIRM_TIMEOUT_S
-            while not process_gone(before, await self._proc_stat(host, pid)):
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(f"{node.name}: postmaster {pid} still alive {KILL_CONFIRM_TIMEOUT_S} s after SIGKILL")
-                await asyncio.sleep(KILL_CONFIRM_POLL_S)
-            confirmed_s = (time.monotonic_ns() - t0_mono_ns) / 1e9
+        own untidiness rather than on the database.
+
+        If `arm` prepared the session, it is used as is: the kill is the next command sent."""
+        armed, self._armed = getattr(self, "_armed", None), None
+        if armed is None:
+            async with RemoteHost(node.ssh) as host:
+                pid, before = await self._identify_postmaster(host, node)
+                return await self._kill_on(host, node, pid, before, pre_armed=False)
+        host, pid, before = armed
+        try:
+            return await self._kill_on(host, node, pid, before, pre_armed=True)
+        finally:
+            await host.close()
+
+    async def _kill_on(self, host: RemoteHost, node: Node, pid: int, before: tuple[str, str], *,
+                       pre_armed: bool) -> dict[str, Any]:
+        await host.run(as_root(f"systemctl kill -s SIGKILL {q(node.service)}"), timeout_s=SSH_TIMEOUT_S)
+        t0_mono_ns = time.monotonic_ns()
+        deadline = time.monotonic() + KILL_CONFIRM_TIMEOUT_S
+        while not process_gone(before, await self._proc_stat(host, pid)):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"{node.name}: postmaster {pid} still alive {KILL_CONFIRM_TIMEOUT_S} s after SIGKILL")
+            await asyncio.sleep(KILL_CONFIRM_POLL_S)
+        confirmed_s = (time.monotonic_ns() - t0_mono_ns) / 1e9
         return {"action": f"systemctl kill -s SIGKILL {node.service} (whole unit cgroup)", "pid": pid,
-                "t0_mono_ns": t0_mono_ns, "death_confirmed_s": confirmed_s}
+                "t0_mono_ns": t0_mono_ns, "death_confirmed_s": confirmed_s, "pre_armed": pre_armed}
 
     async def revert(self, node: Node, detail: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Idempotent. For a reload, put the changed parameter back to its pre-fault value;
@@ -319,12 +363,7 @@ class OsSshProcessDriver(FaultInjector):
         if self.fault_type == "idle_in_transaction":
             return await self._revert_idle(node, detail or {})
         if self.fault_type == "connection_exhaustion":
-            if hasattr(self, "_adapter") and self._adapter:
-                return await self._adapter.revert_exhaust_connections()
-            from resilience_tests.adapters.base import adapter_for
-            engine = getattr(self.profile.database, "engine", "postgresql") if hasattr(self, "profile") and self.profile and hasattr(self.profile, "database") else "postgresql"
-            adapter = adapter_for(engine, node)
-            return await adapter.revert_exhaust_connections()
+            return await self._database_adapter(node).revert_exhaust_connections()
         deadline = time.monotonic() + REVERT_TOTAL_BUDGET_S
         async with RemoteHost(node.ssh) as host:
             state = await self._settled_state(host, node, deadline)
@@ -384,18 +423,25 @@ class OsSshProcessDriver(FaultInjector):
         return {"action": statement, "restored": target, "prior_known": prior_known}
 
     async def _revert_idle(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
-        """Terminate any background psql session holding an idle transaction."""
+        """End the harness's own idle session, found by its application_name -- the only safe
+        handle after a harness crash. Never a signal to the PID in the ledger (that backend is
+        usually long gone and its PID may now belong to anything), and never every idle
+        session on the cluster (other clients' sessions are not ours to end).
+
+        With the run's adapter, it rolls back its own connection first; the server-side
+        termination over SSH runs regardless, so a failed rollback cannot leave it open."""
         inject = detail.get("inject") or {}
-        pid = inject.get("pid")
+        out: dict[str, Any] = {"pid": inject.get("pid")}
+        if self.adapter is not None:
+            out["adapter"] = await self.adapter.close_idle_transaction()
+        term_sql = ("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+                    f"WHERE application_name = {_sql_literal(IDLE_SESSION_APPLICATION_NAME)} "
+                    "AND pid <> pg_backend_pid()")
         async with RemoteHost(node.ssh) as host:
-            if pid:
-                await host.run(as_root(f"kill -9 {pid} 2>/dev/null || true"), timeout_s=SSH_TIMEOUT_S, check=False)
-            term_sql = (
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE state LIKE 'idle in transaction%' AND pid <> pg_backend_pid()"
-            )
-            await host.run(self._psql(node, term_sql), timeout_s=SSH_TIMEOUT_S, check=False)
-        return {"action": "terminated idle transactions", "pid": pid}
+            result = await host.run(self._psql(node, term_sql), timeout_s=SSH_TIMEOUT_S)
+        out.update(action=f"terminated sessions named {IDLE_SESSION_APPLICATION_NAME}",
+                   terminated=result.stdout.strip())
+        return out
 
 
 register("os_ssh", OsSshProcessDriver)

@@ -2,23 +2,34 @@
 # Fault injection: An idle transaction held for 2 h under write load.
 # Acceptance: idle_in_transaction_session_timeout enforced, or a bloat alert fires.
 #
-# An open transaction holding an active snapshot pins the global vacuum horizon (backend_xmin
-# in pg_stat_activity), preventing autovacuum from removing dead row versions created by
-# concurrent write/churn activity. Under sustained write load, unvacuumed dead tuples accumulate,
-# resulting in relation and index bloat, storage growth, and buffer degradation.
+# An open transaction holding an assigned transaction id pins the vacuum horizon, so vacuum
+# cannot remove dead row versions that concurrent churn traffic creates. The Framework accepts
+# either of two defences, and the harness accepts a path only on evidence it can observe:
 #
-# Production systems defend against this failure through two standard mechanisms:
-# 1. idle_in_transaction_session_timeout: The engine automatically terminates lingering idle
-#    sessions with FATAL (SQLSTATE 25P03/57P01), rolls back the transaction, and advances the
-#    xmin horizon so autovacuum can resume pruning dead tuples.
-# 2. Bloat alerting: In environments where timeout is unconfigured (0) or long, telemetry probes
-#    detect dead-tuple accumulation (dead_tuple_ratio >= 0.20 per Framework §10.7 NL-M-04) and
-#    raise an operational bloat alert before storage exhaustion occurs.
+# Path A -- idle_in_transaction_session_timeout_enforced. The server must have ended THIS
+#   session BECAUSE of the timeout: the backend is gone, the harness's own connection is
+#   closed, AND the cause is evidenced -- the server's log line "terminating connection due to
+#   idle-in-transaction timeout", or SQLSTATE 25P03 on the closed connection. A session that
+#   merely vanished is NOT_MEASURED, not a pass.
 #
-# In a test harness, holding for the full 2 h production duration is accelerated via calibrated
-# timeout evaluation or dead-tuple bloat accumulation measurement under active churn load.
-# All acknowledged writes must be preserved with rpo_txn == 0, and the database relations must
-# remain structurally intact with structural_integrity_errors == 0.
+# Path B -- vacuum_blocked AND bloat_alert_fired. vacuum_blocked is proven directly: with the
+#   idle session still open, VACUUM (VERBOSE) on the churn table must report dead tuples it
+#   could not remove, at a removable cutoff no newer than the idle session's transaction id.
+#   bloat_alert_fired means an alert from the deployment's MONITORING. The harness has no
+#   alert source wired in yet, so it reports this as NOT_MEASURED -- its own dead-tuple ratio
+#   is evidence that bloat exists, not that anything alerted on it. Until an alert source is
+#   connected, path B cannot pass and only a configured timeout can satisfy this scenario.
+#
+# The fault itself is verified at injection: the session must be seen in pg_stat_activity as
+# `idle in transaction` holding a transaction id, or the run aborts -- nothing is scored
+# against a fault that did not land.
+#
+# Hold time: the Framework specifies 2 h. The harness holds for the configured timeout plus a
+# 2 s grace (when that fits the recovery bound), otherwise for 30 s -- enough to produce dead
+# tuples for the vacuum probe under 200 TPS of churn. The shortfall against 2 h is stated as a
+# disclosure on every run.
+#
+# All acknowledged writes must survive (rpo_txn == 0) and the relations must stay intact.
 id: NL-M-05
 name: Idle-in-transaction blocking vacuum
 tier: node_local
@@ -60,19 +71,21 @@ requires:                        # engine capabilities this scenario needs (Arch
   - structural_integrity_check
 
 measure:
-  - idle_in_transaction_session_timeout_enforced  # Framework §10.7
-  - bloat_alert_fired                             # Framework §10.7
+  - idle_in_transaction_session_timeout_enforced  # Framework §10.7, path A
+  - vacuum_blocked                                # path B: VACUUM could not remove dead tuples
+  - bloat_alert_fired                             # Framework §10.7, path B: from monitoring
+  - dead_tuples_not_removable                     # reported: from the VACUUM (VERBOSE) probe
   - oldest_transaction_age_s
-  - dead_tuple_ratio
+  - dead_tuple_ratio                              # reported: planner statistics, may be stale
   - unvacuumed_dead_tuples
-  - bloat_ratio
+  - tuple_bloat_ratio                             # reported: (live + dead) / live tuples
   - rpo_txn
   - indeterminate_txn
   - structural_integrity_errors
   - corruption_count
 
 accept:
-  - idle_in_transaction_session_timeout_enforced == true or bloat_alert_fired == true
+  - idle_in_transaction_session_timeout_enforced == true or (vacuum_blocked == true and bloat_alert_fired == true)
   - rpo_txn == 0
   - structural_integrity_errors == 0
   - corruption_count == 0

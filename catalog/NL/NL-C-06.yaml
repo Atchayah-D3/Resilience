@@ -33,6 +33,7 @@ fault:
   driver: os_ssh                 # env-profile section; the profile picks the driver
   target: primary
   duration: permanent
+  during: concurrent_index_build  # the state the kill must land inside
 
 
 blast_radius:
