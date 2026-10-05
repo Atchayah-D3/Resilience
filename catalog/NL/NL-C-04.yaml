@@ -1,0 +1,72 @@
+# NL-C-04 -- Recovery time versus WAL volume (Framework §10.2, Tier 1, P0).
+# Fault injection: kill -9 with substantial uncheckpointed WAL volume under write load.
+# Acceptance: rpo_txn == 0; rto_first_write_s <= 120; structural_integrity_errors == 0; starts_unattended == true.
+#
+# Crash recovery is tested against significant write-ahead log replay distance. Replay
+# mechanics must be robust, bounded by configuration, and complete without error (Arch §5).
+#
+# Durability of the underlying storage stack is covered by category NL-D (Framework §13.1).
+id: NL-C-04
+name: Recovery time versus WAL volume
+tier: node_local
+category: NL-C
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-C is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 150                   # floor, not a throughput target
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: oltp_write_heavy
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 500                  # heavy write load to generate WAL distance
+
+fault:
+  type: process_kill
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:                        # engine capabilities this scenario needs (Arch §8)
+  - transactional_markers
+  - structural_integrity_check
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - rto_to_slo_s
+  - corruption_count
+  - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
+  - starts_unattended
+
+accept:
+  - rpo_txn == 0
+  - rto_first_write_s <= 120
+  - corruption_count == 0
+  - structural_integrity_errors == 0
+  - starts_unattended == true
+
+priority: P0
+
+description: >
+  The primary database process is killed under sustained write volume with substantial
+  uncheckpointed WAL accumulation. Recovery time must scale predictably with WAL replay
+  volume and complete within the configured RTO budget without data loss or corruption.
+  Durability of the storage stack is covered by category NL-D (Framework §13.1).
+
+see_also: [NL-C-01, NL-C-05]
