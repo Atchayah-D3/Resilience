@@ -7,3 +7,4 @@ reports/*.html
 evidence/*
 !*/README.md
 .venv-ansible/
+vendor/elle/elle-cli.jar

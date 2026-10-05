@@ -28,6 +28,7 @@ class Capability(str, Enum):
     STRUCTURAL_INTEGRITY_CHECK = "structural_integrity_check"
     PAGE_CHECKSUMS = "page_checksums"
     DURABILITY_SETTINGS = "durability_settings"
+    LIST_APPEND_HISTORY = "list_append_history"
 
 
 class TransactionOutcome(str, Enum):
@@ -42,6 +43,11 @@ class TransactionOutcome(str, Enum):
     COMMITTED = "committed"
     DEFINITELY_ABORTED = "definitely_aborted"
     UNKNOWN = "unknown"
+
+
+# One micro-operation of a list-append transaction: ("r", key, list-or-None) or
+# ("append", key, value). The vocabulary is Elle's, not an engine's.
+MicroOp = tuple[str, int, Any]
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,21 @@ class DatabaseSession(ABC):
 
         Engines without Capability.WORKLOAD_CHURN inherit this refusal."""
         raise NotImplementedError(f"{type(self).__name__} does not implement the churn workload")
+
+    async def commit_marker_list_append(self, seq: int, marker_id: str, read_key: int,
+                                        append_key: int) -> tuple[TransactionOutcome, list[MicroOp]]:
+        """The marker transaction of `commit_marker`, plus Elle's list-append micro-operations
+        in the SAME transaction, at the isolation level Elle is told to check (Arch §10.3):
+
+            read list `read_key`; append `seq` to list `append_key`; read list `append_key`
+
+        Returns the outcome and the micro-operations as executed -- each read carries the
+        list the database actually returned (None for a list that does not exist yet). The
+        history is evidence only if the reads are real; nothing here may be filled in from
+        what the client expected.
+
+        Engines without Capability.LIST_APPEND_HISTORY inherit this refusal."""
+        raise NotImplementedError(f"{type(self).__name__} does not implement the list-append workload")
 
     @abstractmethod
     async def try_write(self) -> bool:
@@ -249,31 +270,61 @@ class BaseDatabaseAdapter(ABC):
         (e.g. crash recovery after an unclean stop). Reported as `recovery_started_s`."""
         return ()
 
-    async def create_index_concurrently(self, table: str, column: str, index_name: str) -> None:
-        """Launch a concurrent index build. Used by NL-C-06."""
-        pass
+    # --- operations a fault must land inside (fault.during) ---------------------------
+    #
+    # `start_*` launches the operation on its own session and returns only once the engine
+    # itself reports it in progress: {"in_progress": True, ...}. Anything else -- including
+    # an engine that does not implement it -- aborts the run before the fault: a kill that
+    # missed the operation would test nothing and must never be reported as a pass.
 
-    async def get_index_status(self, index_name: str) -> dict[str, Any] | None:
-        """Check index existence and validity in catalog. Returns {'is_valid': bool, 'is_ready': bool} or None."""
-        return None
+    async def prepare_scenario_objects(self, during: str | None) -> dict[str, Any]:
+        """Create what a `during` operation needs (e.g. a table to index), in init, before
+        the baseline is measured. Default: nothing."""
+        return {}
 
-    async def cleanup_index(self, index_name: str) -> bool:
-        """Drop or rebuild an index. Returns True if cleanup succeeded."""
-        return True
+    async def start_large_transaction(self) -> dict[str, Any]:
+        """Begin the large uncommitted transaction of NL-C-03 (Framework §10.2: a 10M-row
+        INSERT) and return once it has demonstrably written part of its rows."""
+        return {"in_progress": False, "note": "not implemented by this engine"}
+
+    async def verify_large_transaction(self) -> dict[str, Any]:
+        """After recovery: {"rows_visible", "parent_rows_visible", "fk_violations"} -- every
+        one must be 0 for a transaction that never committed."""
+        return {}
+
+    async def start_concurrent_index_build(self) -> dict[str, Any]:
+        """Begin the online index build of NL-C-06 and return once the engine reports the
+        build phase in progress."""
+        return {"in_progress": False, "note": "not implemented by this engine"}
+
+    async def verify_concurrent_index(self) -> dict[str, Any]:
+        """After recovery: {"index_left_invalid", "table_readable", "rebuild_succeeds"}."""
+        return {}
+
+    async def abandon_background_operation(self) -> dict[str, Any]:
+        """Close whatever session `start_*` left open (it was killed with the server).
+        Idempotent; never raises."""
+        return {}
+
+    async def cleanup_scenario_objects(self) -> dict[str, Any]:
+        """Remove objects a `during` operation created (an invalid index, aborted bulk rows),
+        so the next run starts clean. Idempotent."""
+        return {}
 
     async def quick_integrity_check(self) -> dict[str, Any]:
         """A fast inter-cycle checksum check to localize corruptions to the cycle that caused them.
         Default: returns empty dict."""
         return {}
 
-    async def exhaust_connections(self, hold_duration_s: float = 2.0) -> dict[str, Any]:
-        """Exhaust the connection pool to test connection saturation handling (NL-R-04).
-        Default: returns empty dict."""
+    async def exhaust_connections(self, hold_s: float) -> dict[str, Any]:
+        """NL-R-04: open max_connections + 50% sessions, hold them for `hold_s`, release them,
+        and confirm a new session is accepted afterwards. Default: returns empty dict."""
         return {}
 
     async def revert_exhaust_connections(self) -> dict[str, Any]:
-        """Drain and release any connections held during connection exhaustion.
-        Default: returns empty dict."""
+        """Terminate any flood session still open on the server, wherever it came from --
+        including a harness process that died mid-hold. Must work from a fresh adapter (the
+        kill switch has no other). Default: returns empty dict."""
         return {}
 
 

@@ -15,7 +15,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from catalog.schema import EnvClass, Role
+from catalog.schema import EnvClass, InfraFeature, Role
 
 ENVS_ROOT = Path(__file__).resolve().parents[2] / "envs"
 
@@ -142,6 +142,9 @@ class EnvProfile(_Model):
     noisy_neighbour: NoisyNeighbour
     os_ssh: OsSsh | None = None
     storage_fault: StorageFault
+    # Infrastructure this environment provides (docs/infra-requirements.md). A scenario that
+    # needs something not listed is skipped with the reason -- never run on a substitute.
+    infra: list[InfraFeature] = Field(default_factory=list)
     reset: Reset
     sla_tier_target: Literal["platinum", "gold", "silver"]
     driver_host: DriverHost

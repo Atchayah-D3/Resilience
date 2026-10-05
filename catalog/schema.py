@@ -39,6 +39,15 @@ Capability = Literal[
     "structural_integrity_check",   # a checker for table/index structure (e.g. pg_amcheck)
     "page_checksums",               # corruption detected on read
     "durability_settings",          # flush/commit settings are inspectable
+    "list_append_history",          # list-append reads and appends in the marker transaction,
+                                    # so Elle can check the recorded history (Arch §10.3)
+]
+
+# Infrastructure a scenario cannot be run to specification without (docs/infra-requirements.md).
+# An environment profile lists what it provides; a scenario needing anything else is skipped
+# with the reason, never run against a weaker substitute.
+InfraFeature = Literal[
+    "dedicated_wal_volume",         # pg_wal on its own volume, large enough for 16 GB of WAL
 ]
 
 # Framework §9 -- the 20 categories.
@@ -119,6 +128,14 @@ class Workload(_Model):
     concurrency: int = Field(gt=0)
     transaction_markers: bool
     rate_tps: float | None = Field(default=None, gt=0)  # Framework §10.1 "at 1000 TPS"
+    # `list_append`: every marker transaction also appends to and reads back Elle's lists, and
+    # the operation history records what was actually read (Arch §10.3). `none`: no history.
+    history: Literal["none", "list_append"] = "none"
+
+
+# Fault timing for faults that must land INSIDE a database operation, not merely under load.
+# The orchestrator starts the operation, confirms it is in progress, and only then injects.
+FaultDuring = Literal["large_transaction", "concurrent_index_build"]
 
 
 class Fault(_Model):
@@ -126,6 +143,7 @@ class Fault(_Model):
     driver: str  # env-profile section name, resolved at run time -- never a driver name
     target: FaultTarget
     duration: Literal["permanent"] | Annotated[float, Field(gt=0)] = "permanent"
+    during: FaultDuring | None = None
 
     @model_validator(mode="after")
     def _driver_section(self) -> Fault:
@@ -184,6 +202,7 @@ class Scenario(_Model):
     compound: Compound | None = None
     repeat: Repeat | None = None
     requires: list[Capability] = Field(default_factory=list)
+    needs_infra: list[InfraFeature] = Field(default_factory=list)
     measure: list[str] = Field(min_length=1)
     accept: list[str] = Field(min_length=1)
     priority: Priority
@@ -234,6 +253,12 @@ class Scenario(_Model):
             raise ValueError("transaction_markers needs requires: [transactional_markers]")
         if "structural_integrity_errors" in self.measure and "structural_integrity_check" not in self.requires:
             raise ValueError("structural_integrity_errors needs requires: [structural_integrity_check]")
+        if self.workload.history == "list_append" and "list_append_history" not in self.requires:
+            raise ValueError("workload.history list_append needs requires: [list_append_history]")
+        if "elle_anomalies_count" in self.measure and self.workload.history != "list_append":
+            raise ValueError("elle_anomalies_count is measured, so workload.history must be list_append")
+        if self.fault.during is not None and self.fault.type != "process_kill":
+            raise ValueError("fault.during is only defined for process_kill")
 
         # Every accept predicate must be computed from declared measures.
         declared = set(self.measure)

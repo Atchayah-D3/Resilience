@@ -193,7 +193,38 @@ class OsSshProcessDriver(FaultInjector):
                 res = await host.run(self._psql(node, "SHOW idle_in_transaction_session_timeout"),
                                      timeout_s=SSH_TIMEOUT_S, check=False)
                 detail["idle_timeout"] = res.stdout.strip()
+            if self.fault_type == "connection_exhaustion":
+                if self.duration_s is None:
+                    raise DriverNotAvailable("connection_exhaustion is held and then released: "
+                                             "the scenario must give fault.duration in seconds")
+                detail["hold_s"] = self.duration_s
         return detail
+
+    async def confirm(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
+        """process_kill: death was confirmed from /proc at injection. service_restart: the
+        postmaster after recovery is a different process from the one preflight saw.
+        config_reload: a fresh session reports the value the injection wrote."""
+        inject = detail.get("inject") or {}
+        if self.fault_type == "process_kill":
+            return {"fault_confirmed": inject.get("death_confirmed_s") is not None,
+                    "death_confirmed_s": inject.get("death_confirmed_s")}
+        if self.fault_type == "service_restart":
+            before = (detail.get("preflight") or {}).get("postmaster_pid")
+            async with RemoteHost(node.ssh) as host:
+                after = await self._postmaster_pid(host, node)
+            if before is None or after is None:
+                return {"fault_confirmed": None, "postmaster_pid_before": before, "postmaster_pid_after": after,
+                        "note": "postmaster pid not readable before and after the restart"}
+            return {"fault_confirmed": after != before, "postmaster_pid_before": before, "postmaster_pid_after": after}
+        if self.fault_type == "config_reload":
+            injected = inject.get("value")
+            async with RemoteHost(node.ssh) as host:
+                r = await host.run(self._psql(node, f"SHOW {RELOAD_PROBE_PARAM}"), timeout_s=SSH_TIMEOUT_S, check=False)
+            live = r.stdout.strip()
+            if r.exit_status != 0 or injected is None:
+                return {"fault_confirmed": None, "injected": injected, "note": f"SHOW failed: {r.stderr.strip()[:200]}"}
+            return {"fault_confirmed": live == injected, "injected": injected, "live_value": live}
+        return await super().confirm(node, detail)
 
     async def _check_restart_cadence(self, host: RemoteHost, node: Node) -> dict[str, Any]:
         """A repeated-crash scenario must not trip the service manager's own restart limit.
@@ -250,13 +281,15 @@ class OsSshProcessDriver(FaultInjector):
             t0_mono_ns = time.monotonic_ns()
         return {"action": "idle_in_transaction", "pid": bg_pid, "t0_mono_ns": t0_mono_ns}
 
-    async def _exhaust_connections(self, node: Node) -> dict[str, Any]:
-        """Connection exhaustion under load (NL-R-04)."""
+    def _adapter_for(self, node: Node) -> Any:
         from resilience_tests.adapters.base import adapter_for
-        engine = getattr(self.profile.database, "engine", "postgresql") if hasattr(self, "profile") and self.profile and hasattr(self.profile, "database") else "postgresql"
-        adapter = adapter_for(engine, node)
-        self._adapter = adapter
-        return await adapter.exhaust_connections(hold_duration_s=5.0)
+        return adapter_for(self.profile.database.engine, node)
+
+    async def _exhaust_connections(self, node: Node) -> dict[str, Any]:
+        """Connection exhaustion under load (NL-R-04): the flood is held for the scenario's
+        fault.duration and released before this returns."""
+        assert self.duration_s is not None   # preflight refuses without it
+        return await self._adapter_for(node).exhaust_connections(hold_s=self.duration_s)
 
     async def _reload(self, node: Node) -> dict[str, Any]:
         """Change a parameter, then SIGHUP. A reload-only parameter is used deliberately: the
@@ -319,12 +352,9 @@ class OsSshProcessDriver(FaultInjector):
         if self.fault_type == "idle_in_transaction":
             return await self._revert_idle(node, detail or {})
         if self.fault_type == "connection_exhaustion":
-            if hasattr(self, "_adapter") and self._adapter:
-                return await self._adapter.revert_exhaust_connections()
-            from resilience_tests.adapters.base import adapter_for
-            engine = getattr(self.profile.database, "engine", "postgresql") if hasattr(self, "profile") and self.profile and hasattr(self.profile, "database") else "postgresql"
-            adapter = adapter_for(engine, node)
-            return await adapter.revert_exhaust_connections()
+            # server-side: terminates every flood session by application_name, so it works
+            # from a fresh injector -- cleanup and the kill switch have no other
+            return await self._adapter_for(node).revert_exhaust_connections()
         deadline = time.monotonic() + REVERT_TOTAL_BUDGET_S
         async with RemoteHost(node.ssh) as host:
             state = await self._settled_state(host, node, deadline)

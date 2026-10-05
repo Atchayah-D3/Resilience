@@ -1,10 +1,26 @@
 # NL-C-03 -- Crash during a large transaction (Framework §10.2, Tier 1, P0).
-# Fault injection: kill -9 during a large multi-row bulk INSERT under load.
-# Acceptance: rpo_txn == 0; corruption_count == 0; structural_integrity_errors == 0; starts_unattended == true.
+# Fault injection: kill -9 during a 10M-row INSERT. Acceptance: transaction fully absent; no
+# partial rows; FK invariants hold; Elle reports no G0/G1a/G1b/G1c/G-single/G2 anomalies in
+# the recorded history at the declared isolation level.
 #
-# A massive transaction is interrupted mid-flight by SIGKILL. The uncommitted transaction must
-# be completely rolled back by crash recovery: zero partial rows, foreign key invariants hold,
-# and no structural integrity anomalies remain (Arch §5).
+# The large transaction runs on its own session beside the marker load: one parent row and
+# 10M child rows referencing it, in ONE uncommitted transaction. The kill is sent only once
+# the engine shows the transaction active and the child table has already grown on disk
+# (fault.during), so partial rows really exist when the server dies. After recovery none of
+# them, and not the parent, may be visible, and no child may reference a missing parent. A
+# transaction that had committed before the kill would leave rows visible -- so a kill that
+# missed fails the scenario rather than passing it.
+#
+# Elle: every marker transaction also runs Elle's list-append micro-operations (read one list,
+# append to another, read it back) at SERIALIZABLE, and the history records what the database
+# actually returned. Elle (vendor/elle, elle-cli) checks it against the serializable model,
+# which forbids exactly the anomalies listed above. Without Java and the pinned jar on the
+# driver host the count is NOT_MEASURED and the scenario fails -- it is never assumed clean.
+#
+# The Framework gives no steady-state or workload numbers for this row; the values match
+# NL-C-01. Serializable list-append transactions abort under contention by design (each
+# abort is recorded as :fail), so the steady state must be re-qualified on the target before
+# sign-off. NEEDS SIGN-OFF.
 #
 # Durability of the underlying storage stack is covered by category NL-D (Framework §13.1).
 id: NL-C-03
@@ -27,12 +43,14 @@ workload:
   concurrency: 64
   transaction_markers: true
   rate_tps: 200
+  history: list_append           # Elle-checkable history (Arch §10.3)
 
 fault:
   type: process_kill
   driver: os_ssh                 # env-profile section; the profile picks the driver
   target: primary
   duration: permanent
+  during: large_transaction      # Framework §10.2: "kill -9 during a 10M-row INSERT"
 
 blast_radius:
   max_nodes_affected: 1
@@ -45,6 +63,7 @@ abort_if:
 requires:                        # engine capabilities this scenario needs (Arch §8)
   - transactional_markers
   - structural_integrity_check
+  - list_append_history
 
 measure:
   - rpo_txn
@@ -54,17 +73,30 @@ measure:
   - corruption_count
   - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
   - starts_unattended
+  - operation_in_progress_at_fault   # the large INSERT was confirmed running at the kill
+  - large_txn_rows_visible           # child rows of the killed transaction after recovery
+  - large_txn_parent_rows_visible    # its parent row after recovery
+  - fk_violations                    # children whose parent does not exist
+  - elle_anomalies_count             # anomaly types Elle found in the recorded history
 
 accept:
+  - operation_in_progress_at_fault == true
+  - large_txn_rows_visible == 0      # Framework §10.2: transaction fully absent, no partial rows
+  - large_txn_parent_rows_visible == 0
+  - fk_violations == 0               # Framework §10.2: FK invariants hold
+  - elle_anomalies_count == 0        # Framework §10.2: Elle reports no anomalies
   - rpo_txn == 0
   - corruption_count == 0
-  - structural_integrity_errors == 0
+  - structural_integrity_errors == 0 # Framework §16.3: pg_amcheck clean after every scenario
   - starts_unattended == true
 
 priority: P0
 
 description: >
-  The primary database process is killed with SIGKILL during execution of a large multi-row
-  transaction. Upon crash recovery, the interrupted transaction must be cleanly and fully
-  rolled back, with zero partial rows, no orphaned tuple versions, and no structural
-  integrity violations. Durability of the storage stack is covered by category NL-D (Framework §13.1).
+  The primary is killed with SIGKILL while a 10M-row INSERT is part-way through, under
+  marker-instrumented list-append load. After crash recovery the interrupted transaction
+  must be entirely absent -- no partial rows, no parent row, no foreign key violations -- and
+  Elle must find no isolation anomaly in the recorded history. Durability of the storage
+  stack is covered by category NL-D (Framework §13.1).
+
+see_also: [NL-C-01]

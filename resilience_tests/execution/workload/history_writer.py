@@ -17,10 +17,27 @@ import os
 import queue
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from resilience_tests.adapters.base import MicroOp
+
 _STOP = object()
+
+
+def edn_ops(ops: Sequence[MicroOp]) -> str:
+    """[[:r 3 nil] [:append 4 17] [:r 4 [9 17]]] -- Elle's list-append transaction value."""
+    parts = []
+    for f, key, val in ops:
+        if f == "append":
+            parts.append(f"[:append {int(key)} {int(val)}]")
+        elif f == "r":
+            shown = "nil" if val is None else "[" + " ".join(str(int(v)) for v in val) + "]"
+            parts.append(f"[:r {int(key)} {shown}]")
+        else:
+            raise ValueError(f"unknown micro-op {f!r}")
+    return "[" + " ".join(parts) + "]"
 
 
 class HistoryWriter:
@@ -42,47 +59,18 @@ class HistoryWriter:
             self._index += 1
             return idx
 
-    def record_invoke(self, process_id: int, key: int, value: int, t_mono_ns: int | None = None) -> int:
+    def record(self, type_: str, process_id: int, ops: Sequence[MicroOp],
+               t_mono_ns: int | None = None, error: str | None = None) -> int:
+        """One history operation. `ops` are the micro-operations: for :invoke, reads carry
+        None (nothing has been read yet); for :ok, exactly what the database returned. For
+        :fail and :info the invoke's ops are repeated -- Elle reads nothing into them."""
+        if type_ not in ("invoke", "ok", "fail", "info"):
+            raise ValueError(f"unknown history op type {type_!r}")
         idx = self.next_index()
         t = t_mono_ns if t_mono_ns is not None else time.monotonic_ns()
-        edn = (
-            f"{{:index {idx}, :type :invoke, :f :txn, :process {process_id}, "
-            f":time {t}, :value [[:append {key} {value}] [:r {key} nil]]}}\n"
-        )
-        self._q.put(edn.encode("utf-8"))
-        return idx
-
-    def record_ok(self, process_id: int, key: int, value: int, observed_values: list[int] | None = None,
-                  t_mono_ns: int | None = None) -> int:
-        idx = self.next_index()
-        t = t_mono_ns if t_mono_ns is not None else time.monotonic_ns()
-        read_val = "[" + " ".join(str(v) for v in (observed_values or [value])) + "]"
-        edn = (
-            f"{{:index {idx}, :type :ok, :f :txn, :process {process_id}, "
-            f":time {t}, :value [[:append {key} {value}] [:r {key} {read_val}]]}}\n"
-        )
-        self._q.put(edn.encode("utf-8"))
-        return idx
-
-    def record_info(self, process_id: int, key: int, value: int, error: str = "indeterminate",
-                    t_mono_ns: int | None = None) -> int:
-        idx = self.next_index()
-        t = t_mono_ns if t_mono_ns is not None else time.monotonic_ns()
-        edn = (
-            f"{{:index {idx}, :type :info, :f :txn, :process {process_id}, "
-            f":time {t}, :error :{error}, :value [[:append {key} {value}]]}}\n"
-        )
-        self._q.put(edn.encode("utf-8"))
-        return idx
-
-    def record_fail(self, process_id: int, key: int, value: int, error: str = "aborted",
-                    t_mono_ns: int | None = None) -> int:
-        idx = self.next_index()
-        t = t_mono_ns if t_mono_ns is not None else time.monotonic_ns()
-        edn = (
-            f"{{:index {idx}, :type :fail, :f :txn, :process {process_id}, "
-            f":time {t}, :error :{error}, :value [[:append {key} {value}]]}}\n"
-        )
+        err = f", :error :{error}" if error else ""
+        edn = (f"{{:index {idx}, :type :{type_}, :f :txn, :process {process_id}, "
+               f":time {t}{err}, :value {edn_ops(ops)}}}\n")
         self._q.put(edn.encode("utf-8"))
         return idx
 

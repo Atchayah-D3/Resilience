@@ -1,26 +1,18 @@
 #!/usr/bin/env bash
-# run_elle.sh -- Execute Elle consistency check on history.edn
+# run_elle.sh -- re-check a run's history.edn by hand with the pinned Elle checker.
+#   vendor/elle/run_elle.sh <run-dir>/history.edn [consistency-model]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HISTORY_FILE="${1:-history.edn}"
+HISTORY_FILE="${1:?usage: $0 <path/to/history.edn> [consistency-model]}"
+MODEL="${2:-serializable}"
 
-if [[ ! -f "${HISTORY_FILE}" ]]; then
-    echo "Usage: $0 <path/to/history.edn>"
+if [[ ! -f "${SCRIPT_DIR}/elle-cli.jar" ]]; then
+    echo "${SCRIPT_DIR}/elle-cli.jar is missing: run ${SCRIPT_DIR}/setup_elle.sh" >&2
     exit 1
 fi
-
-if [[ -f "${SCRIPT_DIR}/elle-cli.jar" ]] && command -v java >/dev/null 2>&1; then
-    java -jar "${SCRIPT_DIR}/elle-cli.jar" list-append "${HISTORY_FILE}"
-else
-    echo "Running in-process fallback checker..."
-    python3 -c "
-from pathlib import Path
-from resilience_tests.analysis.elle_checker import ElleChecker
-res = ElleChecker.check(Path('${HISTORY_FILE}'))
-print(f'Valid: {res.valid}, Anomalies: {res.anomalies_count}, Checker: {res.checker}')
-if res.anomalies:
-    print('Anomalies detail:', res.anomalies)
-"
-fi
+OUT="$(dirname "${HISTORY_FILE}")/elle"
+mkdir -p "${OUT}"
+java -jar "${SCRIPT_DIR}/elle-cli.jar" --model list-append --consistency-models "${MODEL}" \
+    --directory "${OUT}" "${HISTORY_FILE}"

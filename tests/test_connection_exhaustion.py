@@ -18,62 +18,133 @@ from resilience_tests.execution.remote import RemoteResult
 from tests.test_orchestrator import OutageAdapter, Engine
 
 
-def test_os_ssh_connection_exhaustion_driver():
-    """Verify OsSshProcessDriver can inject and revert connection_exhaustion with realistic mock."""
-    import asyncpg
+ADAPTER_MODULE = "resilience_tests.adapters.postgresql.adapter"
+TOO_MANY = "FATAL: 53300: remaining connection slots are reserved for roles with the SUPERUSER attribute"
+
+
+def flood_driver(hold_s: float = 0.01) -> tuple[OsSshProcessDriver, object]:
     profile = load_profile("e2-dedicated-vm")
     driver = OsSshProcessDriver(profile, "connection_exhaustion")
-    node = profile.nodes[0]
-
-    call_count = 0
-
-    async def fake_connect(**kwargs):
-        nonlocal call_count
-        call_count += 1
-        # GUC query connection (first call)
-        if call_count == 1:
-            mock_conn = AsyncMock()
-            mock_conn.fetchrow.side_effect = [("100",), ("3",)]
-            return mock_conn
-        # First 97 flood connections succeed
-        if call_count <= 98:
-            return AsyncMock(spec=asyncpg.Connection)
-        # Superuser probe after flood succeeds
-        if call_count > 151:
-            return AsyncMock(spec=asyncpg.Connection)
-        # Excess 50+ flood connections fail with 53300
-        raise asyncpg.TooManyConnectionsError("FATAL: 53300: remaining connection slots are reserved for non-replication superuser connections")
-
-    with patch("asyncpg.connect", side_effect=fake_connect):
-        detail = asyncio.run(driver.inject(node))
-        assert detail["t0_mono_ns"] > 0
-        assert detail["max_connections"] == 100
-        assert detail["superuser_reserved"] == 3
-        assert detail["attempted_connections"] == 150
-        assert detail["held_connections"] == 97
-        assert detail["rejected_connections"] > 0
-        assert detail["rejections_explicit"] is True
-        assert detail["superuser_slot_honoured"] is True
-
-        rev = asyncio.run(driver.revert(node, detail))
-        assert rev["action"] == "connection_exhaustion_drained"
+    driver.duration_s = hold_s
+    return driver, profile.nodes[0]
 
 
-def test_connection_exhaustion_fails_if_no_explicit_rejections():
-    """Negative test: if flood fails to hold or excess connections don't get 53300, rejections_explicit is False."""
+def fake_server(free_slots: int = 97, other_failures: int = 0):
+    """asyncpg.connect stand-in: the settings connection, then `free_slots` flood sessions,
+    then refusals (a few unexplained ones first, if asked), then the post-release probe."""
     import asyncpg
-    profile = load_profile("e2-dedicated-vm")
-    driver = OsSshProcessDriver(profile, "connection_exhaustion")
-    node = profile.nodes[0]
+    state = {"calls": 0, "flood_done": False}
 
-    async def fake_connect_all_fail(**kwargs):
-        raise ConnectionRefusedError("Connection refused")
+    async def connect(**kwargs):
+        state["calls"] += 1
+        n = state["calls"]
+        if n == 1:
+            conn = AsyncMock()
+            conn.fetchval.side_effect = ["100", "3"]
+            return conn
+        flood_index = n - 2           # 150 flood attempts follow
+        if flood_index < 150:
+            assert kwargs.get("server_settings") == {"application_name": "resilience-flood"}
+            if flood_index < free_slots:
+                return AsyncMock(spec=asyncpg.Connection)
+            if flood_index < free_slots + other_failures:
+                raise TimeoutError("connect timed out")
+            raise asyncpg.TooManyConnectionsError(TOO_MANY)
+        return AsyncMock(spec=asyncpg.Connection)    # accepted again after release
+    return connect
 
-    with patch("asyncpg.connect", side_effect=fake_connect_all_fail):
+
+def fake_ssh(rolsuper: str = "t", remaining: str = "0", fail: bool = False):
+    host = AsyncMock()
+
+    async def run(command, *a, **k):
+        if fail:
+            raise OSError("ssh unreachable")
+        if "rolsuper" in command:
+            return RemoteResult(0, f"{rolsuper}\n", "")
+        if "pg_terminate_backend" in command:
+            return RemoteResult(0, "53\n", "")
+        if "count(*)" in command:
+            return RemoteResult(0, f"{remaining}\n", "")
+        return RemoteResult(0, "", "")
+    host.run.side_effect = run
+    remote = MagicMock()
+    remote.return_value.__aenter__.return_value = host
+    return remote
+
+
+def test_flood_is_held_released_and_judged():
+    driver, node = flood_driver()
+    with patch("asyncpg.connect", side_effect=fake_server()), patch(f"{ADAPTER_MODULE}.RemoteHost", fake_ssh()):
         detail = asyncio.run(driver.inject(node))
-        assert detail["held_connections"] == 0
-        assert detail["rejections_explicit"] is False
-        assert detail["superuser_slot_honoured"] is False
+    assert detail["attempted_connections"] == 150
+    assert detail["held_connections"] == 97
+    assert detail["rejected_explicit"] == 53 and detail["rejected_other"] == 0
+    assert detail["rejections_explicit"] is True
+    assert detail["superuser_slot_honoured"] is True
+    assert detail["released_connections"] == 97          # released inside the fault
+    assert detail["connections_recover_after_release"] is True
+    assert detail["hold_s"] == 0.01
+
+
+def test_one_explicit_rejection_among_unexplained_ones_is_not_explicit():
+    """Was: rejections_explicit passed if any single refusal carried 53300."""
+    driver, node = flood_driver()
+    with patch("asyncpg.connect", side_effect=fake_server(other_failures=5)), \
+            patch(f"{ADAPTER_MODULE}.RemoteHost", fake_ssh()):
+        detail = asyncio.run(driver.inject(node))
+    assert detail["rejected_other"] == 5 and detail["rejected_explicit"] == 48
+    assert detail["rejections_explicit"] is False
+
+
+def test_superuser_slot_is_not_measured_without_a_superuser_probe():
+    """Was: fell back to connecting as the harness role -- a non-superuser -- and passed."""
+    driver, node = flood_driver()
+    with patch("asyncpg.connect", side_effect=fake_server()), \
+            patch(f"{ADAPTER_MODULE}.RemoteHost", fake_ssh(fail=True)):
+        detail = asyncio.run(driver.inject(node))
+    assert detail["superuser_slot_honoured"] is None
+    with patch("asyncpg.connect", side_effect=fake_server()), \
+            patch(f"{ADAPTER_MODULE}.RemoteHost", fake_ssh(rolsuper="f")):
+        detail = asyncio.run(driver.inject(node))
+    assert detail["superuser_slot_honoured"] is None
+
+
+def test_preflight_refuses_a_flood_without_a_duration():
+    from resilience_tests.execution.injectors.base import DriverNotAvailable
+    driver, node = flood_driver()
+    driver.duration_s = None
+    host = fake_ssh()
+
+    async def healthy_unit(command, *a, **k):
+        if "is-active" in command:
+            return RemoteResult(0, "active\n", "")
+        if "postmaster.pid" in command:
+            return RemoteResult(0, "4242\n", "")
+        if "-p Restart" in command:
+            return RemoteResult(0, "on-failure\n", "")
+        return RemoteResult(0, "", "")
+    host.return_value.__aenter__.return_value.run.side_effect = healthy_unit
+    with patch("resilience_tests.execution.injectors.process.RemoteHost", host):
+        with pytest.raises(DriverNotAvailable, match="fault.duration"):
+            asyncio.run(driver.preflight(node))
+
+
+def test_revert_terminates_flood_sessions_from_a_fresh_injector():
+    """Was: the kill switch built a new adapter holding no connections, drained 0, and the
+    ledger said reverted while the flood stayed open."""
+    driver, node = flood_driver()
+    with patch(f"{ADAPTER_MODULE}.RemoteHost", fake_ssh()):
+        rev = asyncio.run(driver.revert(node, {}))
+    assert rev["terminated_on_server"] == 53 and rev["remaining"] == 0
+
+
+def test_revert_fails_loudly_if_flood_sessions_remain():
+    driver, node = flood_driver()
+    with patch(f"{ADAPTER_MODULE}.RemoteHost", fake_ssh(remaining="4")), \
+            patch(f"{ADAPTER_MODULE}.asyncio.sleep", AsyncMock()):
+        with pytest.raises(RuntimeError, match="still open"):
+            asyncio.run(driver.revert(node, {}))
 
 
 def test_nl_r_04_orchestrator_evaluation(tmp_path, monkeypatch):
@@ -144,4 +215,5 @@ def test_nl_r_04_orchestrator_evaluation(tmp_path, monkeypatch):
         assert measured["rejections_explicit"] is True
         assert measured["superuser_slot_honoured"] is True
         assert measured["existing_sessions_unaffected"] is True
+        assert measured["connections_recover_after_release"] is True
         assert measured["rpo_txn"] == 0

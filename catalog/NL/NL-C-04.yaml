@@ -1,9 +1,20 @@
 # NL-C-04 -- Recovery time versus WAL volume (Framework §10.2, Tier 1, P0).
-# Fault injection: kill -9 with substantial uncheckpointed WAL volume under write load.
-# Acceptance: rpo_txn == 0; rto_first_write_s <= 120; structural_integrity_errors == 0; starts_unattended == true.
+# Fault injection: crash at 1 / 4 / 16 GB of un-checkpointed WAL. Acceptance: recovery_s <= the
+# RTO budget at the maximum WAL volume permitted by max_wal_size; the relationship is linear
+# and predictable, so the worst case is computable from configuration.
 #
-# Crash recovery is tested against significant write-ahead log replay distance. Replay
-# mechanics must be robust, bounded by configuration, and complete without error (Arch §5).
+# BLOCKED BY INFRASTRUCTURE (needs_infra). Holding 16 GB of un-checkpointed WAL needs pg_wal on
+# its own volume of at least 30 GB (docs/infra-requirements.md, Request 1); on the current
+# target pg_wal shares the root filesystem, and filling it would take the host down. The run
+# plan skips this scenario with that reason, and the orchestrator refuses it, until a profile
+# declares `infra: [dedicated_wal_volume]`.
+#
+# NOT YET BUILT, and required before the block is lifted: the WAL-volume control (raise
+# max_wal_size and checkpoint_timeout, then kill once the redo distance reaches each of 1, 4
+# and 16 GB), the per-point recovery measurement, the linear fit, and the RTO budget derived
+# from max_wal_size. The accept list below is a placeholder that stays honest meanwhile: the
+# Platinum RTO of NL-C-01, which the profile's sla_tier_target names -- the earlier 120 s had
+# no source. A single kill at an uncontrolled WAL volume is NL-C-01, not this scenario.
 #
 # Durability of the underlying storage stack is covered by category NL-D (Framework §13.1).
 id: NL-C-04
@@ -25,7 +36,7 @@ workload:
   profile: oltp_write_heavy
   concurrency: 64
   transaction_markers: true
-  rate_tps: 500                  # heavy write load to generate WAL distance
+  rate_tps: 500
 
 fault:
   type: process_kill
@@ -45,6 +56,9 @@ requires:                        # engine capabilities this scenario needs (Arch
   - transactional_markers
   - structural_integrity_check
 
+needs_infra:                     # docs/infra-requirements.md, Request 1
+  - dedicated_wal_volume
+
 measure:
   - rpo_txn
   - indeterminate_txn
@@ -56,7 +70,7 @@ measure:
 
 accept:
   - rpo_txn == 0
-  - rto_first_write_s <= 120
+  - rto_first_write_s <= 60       # placeholder: Platinum RTO, as NL-C-01 (see header)
   - corruption_count == 0
   - structural_integrity_errors == 0
   - starts_unattended == true
@@ -64,9 +78,9 @@ accept:
 priority: P0
 
 description: >
-  The primary database process is killed under sustained write volume with substantial
-  uncheckpointed WAL accumulation. Recovery time must scale predictably with WAL replay
-  volume and complete within the configured RTO budget without data loss or corruption.
-  Durability of the storage stack is covered by category NL-D (Framework §13.1).
+  The primary is killed at 1, 4 and 16 GB of un-checkpointed WAL. Recovery time must scale
+  linearly with the WAL replayed and stay within the RTO budget at the largest volume
+  max_wal_size permits. Blocked until a dedicated pg_wal volume is provisioned. Durability of
+  the storage stack is covered by category NL-D (Framework §13.1).
 
 see_also: [NL-C-01, NL-C-05]

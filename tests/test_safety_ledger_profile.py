@@ -6,6 +6,7 @@ them has a test that proves it refuses.
 
 import asyncio
 import copy
+import time
 
 import pytest
 import yaml
@@ -203,8 +204,21 @@ def test_every_fault_type_can_be_injected_and_reverted(monkeypatch):
             return RemoteResult(0, "", "")
 
     monkeypatch.setattr(process_mod, "RemoteHost", FakeHost)
+    # the flood itself talks to the database; it is exercised in test_connection_exhaustion.py
+    from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
+
+    async def flood(self, hold_s):
+        calls.append(f"flood held {hold_s}s")
+        return {"t0_mono_ns": time.monotonic_ns()}
+
+    async def unflood(self):
+        calls.append("flood terminated")
+        return {"remaining": 0}
+    monkeypatch.setattr(PostgreSQLAdapter, "exhaust_connections", flood)
+    monkeypatch.setattr(PostgreSQLAdapter, "revert_exhaust_connections", unflood)
     for fault_type in sorted(process_mod.OsSshProcessDriver.fault_types):
         injector = process_mod.OsSshProcessDriver(PROFILE, fault_type)
+        injector.duration_s = 0.01   # as the orchestrator sets it from fault.duration
         assert asyncio.run(injector.preflight(NODE))
         detail = asyncio.run(injector.inject(NODE))
         assert detail["t0_mono_ns"] > 0, fault_type
@@ -212,13 +226,15 @@ def test_every_fault_type_can_be_injected_and_reverted(monkeypatch):
     assert any("systemctl kill -s SIGKILL" in c for c in calls)   # Arch §5: the unit's cgroup
     assert any("systemctl restart" in c for c in calls)
     assert any("pg_reload_conf" in c for c in calls)
+    assert "flood held 0.01s" in calls and "flood terminated" in calls
 
 
 def test_matrix_expands_every_scenario_once_on_the_reference_class():
     catalog = load_catalog()
     plan, skipped = expand(catalog, PROFILE, reference_env_class="E2")
-    assert not skipped
-    assert sorted(p.scenario.id for p in plan) == sorted(catalog.scenarios)
+    blocked = sorted(sid for sid, sc in catalog.scenarios.items() if sc.needs_infra)
+    assert sorted(s.scenario_id for s in skipped) == blocked     # infrastructure only (NL-C-04)
+    assert sorted(p.scenario.id for p in plan) == sorted(set(catalog.scenarios) - set(blocked))
     assert all(p.node.name == "shaktidb-standalone" for p in plan)
 
 

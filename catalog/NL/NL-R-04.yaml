@@ -9,6 +9,15 @@
 # superuser reserved connection slots must remain accessible, and already-connected
 # workload sessions must continue processing without drops or aborts (Arch §5).
 #
+# The flood is held for fault.duration (harness-chosen; the Framework gives no hold time),
+# then released inside the fault, and a new ordinary session must be accepted again --
+# so validate never competes with the flood for connections. Flood sessions are tagged by
+# application_name, so cleanup and the kill switch terminate them on the server even after
+# a harness crash. rejections_explicit needs at least one refusal and EVERY refusal to carry
+# SQLSTATE 53300. superuser_slot_honoured is probed as a superuser over the local socket; if
+# no superuser probe is possible it is NOT_MEASURED -- a non-superuser getting in proves
+# nothing about reserved slots.
+#
 # Durability of the underlying storage stack is covered by category NL-D (Framework §13.1).
 id: NL-R-04
 name: Connection exhaustion
@@ -35,7 +44,7 @@ fault:
   type: connection_exhaustion
   driver: os_ssh
   target: primary
-  duration: 10.0
+  duration: 10.0                 # seconds the flood is held before release
 
 blast_radius:
   max_nodes_affected: 1
@@ -60,11 +69,13 @@ measure:
   - rejections_explicit
   - superuser_slot_honoured
   - existing_sessions_unaffected
+  - connections_recover_after_release
 
 accept:
   - rejections_explicit == true
   - superuser_slot_honoured == true
   - existing_sessions_unaffected == true
+  - connections_recover_after_release == true
   - rpo_txn == 0
   - corruption_count == 0
   - structural_integrity_errors == 0

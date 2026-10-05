@@ -1,10 +1,17 @@
 # NL-C-06 -- Crash during CREATE INDEX CONCURRENTLY (Framework §10.2, Tier 1, P1).
-# Fault injection: kill -9 mid-build during concurrent index creation.
-# Acceptance: rpo_txn == 0; structural_integrity_errors == 0; starts_unattended == true.
+# Fault injection: kill -9 mid-build. Acceptance: index left INVALID, table readable,
+# rebuild succeeds.
 #
-# A background concurrent index build is interrupted by SIGKILL. The interrupted index must
-# be left marked INVALID without corrupting existing relations, and crash recovery must restore
-# normal write operation unattended (Arch §5).
+# The index is built on its own seeded table (created in init, before the baseline), never on
+# a table other scenarios write to. The kill is sent only once the engine's own progress view
+# reports the build past initialisation (fault.during). After recovery the index must exist
+# and be INVALID -- an index found VALID means the build finished before the kill, and the
+# scenario fails rather than passing on a kill that missed. Then the table must be readable,
+# and PostgreSQL's documented recovery (drop the invalid index, build it again concurrently)
+# must succeed. Cleanup drops the index, so the next run starts from no index at all.
+#
+# The Framework gives no steady-state or workload numbers for this row; the values match
+# NL-C-01. NEEDS SIGN-OFF.
 #
 # Durability of the underlying storage stack is covered by category NL-D (Framework §13.1).
 id: NL-C-06
@@ -33,7 +40,7 @@ fault:
   driver: os_ssh                 # env-profile section; the profile picks the driver
   target: primary
   duration: permanent
-
+  during: concurrent_index_build # Framework §10.2: "kill -9 mid-build"
 
 blast_radius:
   max_nodes_affected: 1
@@ -55,17 +62,27 @@ measure:
   - corruption_count
   - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
   - starts_unattended
+  - operation_in_progress_at_fault  # the build was confirmed running at the kill
+  - index_left_invalid              # the interrupted index exists and is marked INVALID
+  - table_readable                  # the indexed table can still be read in full
+  - rebuild_succeeds                # drop + CREATE INDEX CONCURRENTLY yields a VALID index
 
 accept:
+  - operation_in_progress_at_fault == true
+  - index_left_invalid == true      # Framework §10.2: index left INVALID
+  - table_readable == true          # Framework §10.2: table readable
+  - rebuild_succeeds == true        # Framework §10.2: rebuild succeeds
   - starts_unattended == true
   - rpo_txn == 0
   - corruption_count == 0
-  - structural_integrity_errors == 0
+  - structural_integrity_errors == 0 # Framework §16.3: pg_amcheck clean after every scenario
 
 priority: P1
 
 description: >
-  The primary database is killed via SIGKILL in the middle of a CREATE INDEX CONCURRENTLY
-  build operation under active transaction load. Crash recovery must complete cleanly,
-  leaving the table accessible and structurally intact. Durability of the storage stack is
-  covered by category NL-D (Framework §13.1).
+  The primary is killed with SIGKILL while a CREATE INDEX CONCURRENTLY is confirmed in
+  progress under marker-instrumented load. After crash recovery the interrupted index must be
+  left INVALID, the table must remain readable, and dropping and rebuilding the index must
+  succeed. Durability of the storage stack is covered by category NL-D (Framework §13.1).
+
+see_also: [NL-C-01]

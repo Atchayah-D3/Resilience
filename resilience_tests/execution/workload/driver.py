@@ -39,6 +39,12 @@ CHURN_REPLACE_EVERY = 10
 CONNECT_TIMEOUT_S = 2.0
 RECONNECT_PAUSE_S = 0.2
 TXN_TIMEOUT_S = 10.0
+# Elle list-append keys (Arch §10.3). Transactions draw from a window of ELLE_KEYS keys that
+# moves on every ELLE_TXNS_PER_WINDOW transactions: few enough keys that concurrent
+# transactions genuinely contend (no contention, no dependency edges, nothing to check), and
+# short enough lists that the checker's cost stays bounded over a long run.
+ELLE_KEYS = 32
+ELLE_TXNS_PER_WINDOW = 4_000
 
 
 class UnsupportedWorkload(ValueError):
@@ -130,6 +136,17 @@ class WorkloadDriver:
                 f"engine {adapter.engine!r} cannot run the churn workload, so cumulative bloat "
                 "cannot be measured -- an insert-only load leaves no dead rows to find"
             )
+        # `list_append`: the marker transaction also carries Elle's micro-operations, and the
+        # history records what the database actually returned (Arch §10.3)
+        self.list_append = workload.history == "list_append"
+        if self.list_append and not adapter.has(Capability.LIST_APPEND_HISTORY):
+            raise UnsupportedWorkload(
+                f"engine {adapter.engine!r} cannot run list-append transactions, so no history "
+                "can be checked")
+        if self.list_append and self.churn:
+            raise UnsupportedWorkload("list-append history and the churn workload are not combined")
+        if self.list_append and history is None:
+            raise UnsupportedWorkload("list-append workload needs a history writer")
         # the engine's own seeded key space, never a second copy of the number
         self.churn_keys = adapter.churn_key_space if self.churn else 0
         if self.churn and self.churn_keys < 1:
@@ -143,6 +160,10 @@ class WorkloadDriver:
         self.stream = stream
         self.limiter = RateLimiter(workload.rate_tps)
         self._churn_rng = random.Random(0xC0FFEE)   # seeded: the same key sequence every run
+        self._elle_rng = random.Random(0xE11E)
+        # Elle: a process whose operation ended :info may still be running it, so it never
+        # issues another -- the worker continues under a fresh process id (Jepsen convention)
+        self._process: dict[int, int] = {}
         self._stop = asyncio.Event()
         self._window = _Window()
         self._tasks: list[asyncio.Task[None]] = []
@@ -250,16 +271,15 @@ class WorkloadDriver:
         tj = time.monotonic()
         await self.journals.written(seq, marker_id, time.time())
         t0 = time.monotonic()
-        t0_mono_ns = time.monotonic_ns()
         journal_ms = (t0 - tj) * 1000
 
-        key = self._churn_rng.randrange(1, self.churn_keys + 1) if self.churn else (seq % 100 + 1)
-        if self.history is not None:
-            self.history.record_invoke(worker_id, key, seq, t0_mono_ns)
+        if self.list_append:
+            return await self._list_append_transaction(session, worker_id, seq, marker_id, t0, journal_ms)
 
         try:
             async with asyncio.timeout(TXN_TIMEOUT_S):
                 if self.churn:
+                    key = self._churn_rng.randrange(1, self.churn_keys + 1)
                     # one in CHURN_REPLACE_EVERY replaces the row instead of updating it,
                     # so line pointers churn as well as tuples
                     replace = self._churn_rng.randrange(CHURN_REPLACE_EVERY) == 0
@@ -270,31 +290,64 @@ class WorkloadDriver:
             outcome = TransactionOutcome.UNKNOWN
         except Exception:  # noqa: BLE001 -- anything the adapter did not classify is unknown
             outcome = TransactionOutcome.UNKNOWN
+        return await self._settle(session, outcome, marker_id, t0, journal_ms)
 
-        t_end_ns = time.monotonic_ns()
+    async def _settle(self, session: DatabaseSession, outcome: TransactionOutcome, marker_id: str,
+                      t0: float, journal_ms: float) -> DatabaseSession | None:
+        """Count the outcome and journal the acknowledgement. Returns the session to reuse."""
         if outcome is TransactionOutcome.DEFINITELY_ABORTED:
-            if self.history is not None:
-                self.history.record_fail(worker_id, key, seq, error="aborted", t_mono_ns=t_end_ns)
             self._count(errors=1)
             return session
         if outcome is TransactionOutcome.UNKNOWN:
             # stays in written - acked (indeterminate); the connection was lost or is no
             # longer trustworthy, so it is discarded -- a dropped connection for the client
-            if self.history is not None:
-                self.history.record_info(worker_id, key, seq, error="indeterminate", t_mono_ns=t_end_ns)
             self._count(indeterminate=1, drops=1)
             await _discard(session)
             return None
-
         latency_ms = (time.monotonic() - t0) * 1000
         # 3. only on acknowledgement
         t2 = time.monotonic()
         await self.journals.acknowledged(marker_id, time.time())
-        if self.history is not None:
-            self.history.record_ok(worker_id, key, seq, observed_values=[seq], t_mono_ns=t_end_ns)
         journal_ms += (time.monotonic() - t2) * 1000
         self._count(commits=1, latency_ms=latency_ms, journal_ms=journal_ms)
         return session
+
+    async def _list_append_transaction(self, session: DatabaseSession, worker_id: int, seq: int,
+                                       marker_id: str, t0: float, journal_ms: float) -> DatabaseSession | None:
+        """The marker transaction plus Elle's micro-operations. The :invoke is recorded before
+        anything is sent; the completion records exactly what the database returned."""
+        assert self.history is not None
+        base = (seq // ELLE_TXNS_PER_WINDOW) * ELLE_KEYS
+        read_key = base + self._elle_rng.randrange(ELLE_KEYS)
+        append_key = base + self._elle_rng.randrange(ELLE_KEYS)
+        invoked = [("r", read_key, None), ("append", append_key, seq), ("r", append_key, None)]
+        process = self._process.setdefault(worker_id, worker_id)
+        self.history.record("invoke", process, invoked)
+        try:
+            try:
+                async with asyncio.timeout(TXN_TIMEOUT_S):
+                    outcome, executed = await session.commit_marker_list_append(seq, marker_id, read_key, append_key)
+            except TimeoutError:
+                outcome, executed = TransactionOutcome.UNKNOWN, []
+            except Exception:  # noqa: BLE001 -- anything the adapter did not classify is unknown
+                outcome, executed = TransactionOutcome.UNKNOWN, []
+        except asyncio.CancelledError:
+            # the load is stopping mid-transaction: its outcome is unknown, and the history
+            # must say so rather than end on a dangling invoke
+            self._crash_process(worker_id, process, invoked, "interrupted")
+            raise
+        if outcome is TransactionOutcome.COMMITTED:
+            self.history.record("ok", process, executed)
+        elif outcome is TransactionOutcome.DEFINITELY_ABORTED:
+            self.history.record("fail", process, invoked, error="aborted")
+        else:
+            self._crash_process(worker_id, process, invoked, "indeterminate")
+        return await self._settle(session, outcome, marker_id, t0, journal_ms)
+
+    def _crash_process(self, worker_id: int, process: int, invoked: list, error: str) -> None:
+        assert self.history is not None
+        self.history.record("info", process, invoked, error=error)
+        self._process[worker_id] = process + self.workload.concurrency
 
     def _count(self, *, commits: int = 0, errors: int = 0, indeterminate: int = 0, drops: int = 0,
                reconnects: int = 0, connect_failures: int = 0,

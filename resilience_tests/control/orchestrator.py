@@ -43,7 +43,7 @@ from resilience_tests.analysis.rto_decomposer import (
 )
 from resilience_tests.control.killswitch import ledger_for, revert_outstanding
 from resilience_tests.control.ledger import InjectionLedger
-from resilience_tests.control.matrix import RunPlanItem
+from resilience_tests.control.matrix import RunPlanItem, missing_infra
 from resilience_tests.control.profile import EnvProfile
 from resilience_tests.control.reset import resolve_reset
 from resilience_tests.control.safety import SafetyController, SafetyViolation
@@ -58,6 +58,8 @@ from resilience_tests.observability.event_stream import EventStream
 
 EVENTS_FILE = "events.jsonl"
 INTEGRITY_FILE = "integrity.txt"
+HISTORY_FILE = "history.edn"
+ELLE_DIR = "elle"
 WORKLOAD_RAMP_S = 2.0  # connections established before the baseline window opens
 RECOVERY_POLL_S = 1.0
 ABORT_POLL_S = 1.0
@@ -304,6 +306,12 @@ class TestOrchestrator:
 
     async def _p_init(self) -> dict[str, Any]:
         assert self.stream is not None
+        lacking = missing_infra(self.scenario, self.profile)
+        if lacking:
+            # the run plan skips these; refused here too, so a direct run cannot measure a
+            # scenario on infrastructure it cannot be run to specification on
+            raise PhaseAbort(f"blocked by infrastructure: profile {self.profile.name!r} does not provide "
+                             f"{', '.join(lacking)} (docs/infra-requirements.md)")
         self.safety.check_static([self.node])
         hostname = (await run_once(self.node.ssh, "hostname", timeout_s=15)).stdout.strip()
         sentinel = await self.adapter.sentinel(self.profile.safety.sentinel_table, hostname)
@@ -324,11 +332,24 @@ class TestOrchestrator:
         self.injector = resolve(self.scenario.fault, self.profile)
         if self.scenario.repeat is not None:
             self.injector.repeat_plan = (self.scenario.repeat.cycles, self.scenario.repeat.interval_s)
+        if self.scenario.fault.duration != "permanent":
+            self.injector.duration_s = float(self.scenario.fault.duration)
         self.facts["fault_driver"] = {"section": section, "driver": self.injector.driver_name}
 
         # Integrity counters are cumulative in most engines; the run is judged on its own delta.
         self.facts["integrity_baseline"] = await self.adapter.mark_integrity_baseline()
         await self.adapter.prepare_harness_state()
+        grants = getattr(self.adapter, "harness_grants", None)
+        if grants:
+            self.disclosures.append(
+                f"Harness role {self.node.db.user!r} was granted {', '.join(grants)} on the target; "
+                "the grant persists after the run (it is not revoked at cleanup)")
+        if self.scenario.fault.during:
+            self.facts["during_objects"] = await self.adapter.prepare_scenario_objects(self.scenario.fault.during)
+        # Read BEFORE configure_for_scenario, which may reset leaked harness tuning: the
+        # evidence records the configuration as the run found it.
+        deviations = await self.adapter.config_deviations()
+        self.facts["config_deviations"] = deviations
         if hasattr(self.adapter, "configure_for_scenario"):
             tuning = await self.adapter.configure_for_scenario(self.scenario.id)
             if tuning and isinstance(tuning, dict):
@@ -352,21 +373,23 @@ class TestOrchestrator:
                 err = getattr(self.adapter, "_scenario_config_error", None) or "returned empty"
                 self.facts["scenario_tuning_error"] = err
                 self.disclosures.append(f"Scenario tuning failed for NL-C-05: {err}")
-        if hasattr(self.adapter, "config_deviations"):
-            deviations = await self.adapter.config_deviations()
-            self.facts["config_deviations"] = deviations
-            if deviations and not self.facts.get("scenario_tuning"):
-                self.disclosures.append(
-                    f"Configuration deviation in postgresql.auto.conf: "
-                    f"{', '.join(f'{k}={v}' for k, v in sorted(deviations.items()))}"
-                )
+        reset = getattr(self.adapter, "leftover_reset", None)
+        if reset:
+            self.facts["leftover_configuration_reset"] = reset
+            self.disclosures.append(
+                "Leaked harness tuning from an earlier run was reset in postgresql.auto.conf before "
+                f"this run: {', '.join(f'{k}={v}' for k, v in sorted(reset.items()))}")
+        remaining = {k: v for k, v in deviations.items() if k not in (reset or {})}
+        if remaining and not self.facts.get("scenario_tuning"):
+            self.disclosures.append(
+                f"Configuration deviation in postgresql.auto.conf: "
+                f"{', '.join(f'{k}={v}' for k, v in sorted(remaining.items()))}"
+            )
         self.journals = MarkerJournals(self.run_dir)
-        try:
-            self.history = HistoryWriter(self.run_dir / "history.edn")
-            self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream, history=self.history)
-        except TypeError:
-            self.history = None
-            self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream)
+        if self.scenario.workload.history == "list_append":
+            self.history = HistoryWriter(self.run_dir / HISTORY_FILE)
+        self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream,
+                                       history=self.history)
         return {"hostname": hostname, "settings": settings}
 
     async def _p_baseline(self) -> dict[str, Any]:
@@ -399,9 +422,11 @@ class TestOrchestrator:
         if failed:
             # name the likely limiter: driver-side flush latency vs database latency
             jp99 = self.baseline.journal_p99_ms
-            where = "driver journal flush" if jp99 is not None and self.baseline.p99_ms is not None and jp99 > self.baseline.p99_ms else "target database"
+            dp99 = self.baseline.p99_ms   # None when the window committed nothing
+            where = "driver journal flush" if jp99 is not None and dp99 is not None and jp99 > dp99 else "target database"
             raise PhaseAbort(
-                f"steady state did not hold (tps={self.baseline.tps:.1f}, db p99={self.baseline.p99_ms:.1f} ms, "
+                f"steady state did not hold (tps={self.baseline.tps:.1f}, "
+                f"db p99={dp99 if dp99 is None else round(dp99, 1)} ms, "
                 f"journal p99={jp99 if jp99 is None else round(jp99, 1)} ms; slower side: {where}): {failed}"
             )
         detail: dict[str, Any] = {"steady_state": checks}
@@ -470,12 +495,20 @@ class TestOrchestrator:
             if not active:
                 raise PhaseAbort(f"checkpointer was not active: {checkpoint_detail.get('error', 'wait event indicates idle checkpointer')}")
 
-        index_task = None
-        if self.scenario.id == "NL-C-06" or getattr(self.scenario.fault, "timing", "") == "during_concurrent_index_build":
-            index_task = asyncio.create_task(
-                self.adapter.create_index_concurrently("resilience.markers", "ts", "idx_nlc06_concurrent")
-            )
-            await asyncio.sleep(0.05)
+        during = self.scenario.fault.during
+        during_detail: dict[str, Any] = {}
+        if during is not None:
+            # Start the operation the fault must land inside, and inject only once the engine
+            # itself reports it in progress. Whether the kill really caught it is judged again
+            # after recovery (an index left INVALID, no bulk rows visible).
+            start = {"large_transaction": self.adapter.start_large_transaction,
+                     "concurrent_index_build": self.adapter.start_concurrent_index_build}[during]
+            during_detail = await start()
+            self.facts["during"] = {"operation": during, **during_detail}
+            if not during_detail.get("in_progress"):
+                await self.adapter.abandon_background_operation()
+                raise PhaseAbort(f"{during} was not in progress at the fault: "
+                                 f"{during_detail.get('note', 'not confirmed')}")
 
         idle_detail: dict[str, Any] = {}
         idle_supports = False
@@ -503,8 +536,6 @@ class TestOrchestrator:
                 # injection unsupported: never read a missing backend as a timeout enforcement
                 self.facts["idle_injection_unsupported"] = True
             detail = await self.injector.inject(self.node)
-            if index_task is not None and not index_task.done():
-                index_task.cancel()
             sampling_delay_ms = round(((detail.get("t0_mono_ns") or time.monotonic_ns()) - redo_sample_mono_ns) / 1e6, 2)
         t0 = detail.pop("t0_mono_ns", None) or time.monotonic_ns()
         self.t0_ns = t0 if self.t0_ns is None else self.t0_ns   # T0 of the run is the first fault
@@ -513,7 +544,10 @@ class TestOrchestrator:
             detail["checkpoint"] = checkpoint_detail
         if idle_detail:
             detail["idle_transaction"] = idle_detail
+        if during_detail:
+            detail["during"] = during_detail
         self.ledger.transition(entry, "applied", inject=detail, cycle=cycle)
+        self._inject_detail = detail
         self.stream.emit("injector", "t0", fault=self.scenario.fault.type, node=self.node.name,
                          t0_mono_ns=t0, cycle=cycle, redo_sampling_delay_ms=sampling_delay_ms, **detail)
         self.stream.sync()
@@ -661,11 +695,33 @@ class TestOrchestrator:
             recovered = recovered and isinstance(d.rto_first_write_s, (int, float))
         m["starts_unattended"] = recovered
 
-        if self.scenario.id == "NL-R-04" or self.scenario.fault.type == "connection_exhaustion":
-            exhaust_facts = self.facts.get("connection_exhaustion", {})
-            m["rejections_explicit"] = bool(exhaust_facts.get("rejections_explicit", False))
-            m["superuser_slot_honoured"] = bool(exhaust_facts.get("superuser_slot_honoured", False))
+        if self.scenario.fault.type == "connection_exhaustion":
+            exhaust = self.facts.get("connection_exhaustion", {})
+            for name in ("rejections_explicit", "superuser_slot_honoured", "connections_recover_after_release"):
+                value = exhaust.get(name)
+                if isinstance(value, bool):
+                    m[name] = value
+                else:
+                    m[name] = NOT_MEASURED
+                    note = (exhaust.get("superuser_probe") or {}) if name == "superuser_slot_honoured" else {}
+                    self.not_measured[name] = (note.get("note") or note.get("error")
+                                               or "the connection flood did not report it")
             m["existing_sessions_unaffected"] = (m.get("dropped_connections", 0) == 0 and m.get("failed_transactions", 0) == 0)
+
+        if "fault_confirmed" in self.scenario.measure:
+            # independent evidence the fault took effect, beyond the injection call returning
+            entry_detail = {"preflight": self.facts.get("injector_preflight", {}),
+                            "inject": getattr(self, "_inject_detail", {})}
+            try:
+                confirmation = await self.injector.confirm(self.node, entry_detail)
+            except Exception as exc:  # noqa: BLE001 -- recorded; the measure is then not taken
+                confirmation = {"fault_confirmed": None, "note": f"{type(exc).__name__}: {exc}"}
+            self.facts["fault_confirmation"] = confirmation
+            if isinstance(confirmation.get("fault_confirmed"), bool):
+                m["fault_confirmed"] = confirmation["fault_confirmed"]
+            else:
+                m["fault_confirmed"] = NOT_MEASURED
+                self.not_measured["fault_confirmed"] = confirmation.get("note", "the driver could not confirm the fault")
 
         if self.scenario.repeat is not None:
             cycles = per_cycle_recovery(events, self.cycle_t0s, expect_outage=expect_outage)
@@ -789,26 +845,21 @@ class TestOrchestrator:
         except Exception as exc:  # noqa: BLE001 -- recorded; the measure then counts as missing
             self.facts["integrity_error"] = f"{type(exc).__name__}: {exc}"
 
-        # Check transaction history consistency via Elle (Arch §10.3, §17)
-        history_path = self.run_dir / "history.edn"
-        if history_path.exists() and history_path.stat().st_size > 0:
-            elle_res = ElleChecker.check(history_path)
-            self.facts["elle"] = {
-                "valid": elle_res.valid,
-                "anomalies_count": elle_res.anomalies_count,
-                "anomalies": elle_res.anomalies,
-                "checker": elle_res.checker,
-            }
-            if not elle_res.valid:
-                m["elle_anomalies_count"] = elle_res.anomalies_count
+        # Transaction history checked by Elle (Arch §10.3, §17). Only a list-append history
+        # with real reads is checkable; a run without one records no Elle result at all.
+        if self.scenario.workload.history == "list_append":
+            elle = ElleChecker.check(self.run_dir / HISTORY_FILE, self.run_dir / ELLE_DIR)
+            self.facts["elle"] = {k: v for k, v in asdict(elle).items() if k != "raw_output"}
+            (self.run_dir / ELLE_DIR).mkdir(exist_ok=True)
+            (self.run_dir / ELLE_DIR / "elle-cli.out").write_text(elle.raw_output + "\n")
+            if elle.anomalies_count is None:
+                m["elle_anomalies_count"] = NOT_MEASURED
+                self.not_measured["elle_anomalies_count"] = elle.error or "Elle reached no verdict"
+            else:
+                m["elle_anomalies_count"] = elle.anomalies_count
 
-        if self.scenario.id == "NL-C-06" or getattr(self.scenario.fault, "timing", "") == "during_concurrent_index_build":
-            idx_status = await self.adapter.get_index_status("idx_nlc06_concurrent")
-            rebuild_ok = await self.adapter.cleanup_index("idx_nlc06_concurrent")
-            self.facts["concurrent_index"] = {
-                "post_recovery_status": idx_status,
-                "cleanup_or_rebuild_succeeded": rebuild_ok,
-            }
+        if self.scenario.fault.during is not None:
+            m.update(await self._verify_during_operation())
 
         if self.scenario.id == "NL-C-02":
             try:
@@ -884,6 +935,39 @@ class TestOrchestrator:
         self.verdict = threshold_eval.evaluate(self.scenario.accept, m, self.not_measured)
         return {"verdict": "pass" if self.verdict.passed else "fail"}
 
+    # measure name -> key in the adapter's verification result, per `during` operation
+    _DURING_MEASURES: dict[str, dict[str, str]] = {
+        "large_transaction": {"large_txn_rows_visible": "rows_visible",
+                              "large_txn_parent_rows_visible": "parent_rows_visible",
+                              "fk_violations": "fk_violations"},
+        "concurrent_index_build": {"index_left_invalid": "index_left_invalid",
+                                   "table_readable": "table_readable",
+                                   "rebuild_succeeds": "rebuild_succeeds"},
+    }
+
+    async def _verify_during_operation(self) -> dict[str, Any]:
+        """What the interrupted operation left behind (Framework §10.2 NL-C-03 / NL-C-06).
+        Any value the engine could not produce is NOT_MEASURED, never a default."""
+        during = self.scenario.fault.during
+        assert during is not None
+        m: dict[str, Any] = {"operation_in_progress_at_fault": bool((self.facts.get("during") or {}).get("in_progress"))}
+        await self.adapter.abandon_background_operation()
+        verify = {"large_transaction": self.adapter.verify_large_transaction,
+                  "concurrent_index_build": self.adapter.verify_concurrent_index}[during]
+        try:
+            result = await verify()
+            error = None
+        except Exception as exc:  # noqa: BLE001 -- recorded; every measure is then not measured
+            result, error = {}, f"{type(exc).__name__}: {exc}"
+        self.facts["during_verification"] = result if error is None else {"error": error}
+        for name, key in self._DURING_MEASURES[during].items():
+            if key in result and result[key] is not None:
+                m[name] = result[key]
+            else:
+                m[name] = NOT_MEASURED
+                self.not_measured[name] = error or f"the engine did not report {key}"
+        return m
+
     async def _p_report(self, results: dict[str, Any]) -> dict[str, Any]:
         path = report_mod.write_results(self.run_dir, results)
         return {"results": str(path)}
@@ -903,6 +987,13 @@ class TestOrchestrator:
                 await self.adapter.restore_scenario_configuration()
         except Exception as exc:
             self.facts["restore_config_error"] = f"{type(exc).__name__}: {exc}"
+        if self.scenario.fault.during is not None:
+            # after the revert: the service is confirmed running, so the objects can be dropped
+            try:
+                await self.adapter.abandon_background_operation()
+                self.facts["scenario_objects_cleanup"] = await self.adapter.cleanup_scenario_objects()
+            except Exception as exc:  # noqa: BLE001 -- the next run's init removes them too
+                self.facts["scenario_objects_cleanup_error"] = f"{type(exc).__name__}: {exc}"
         return {"reverted": [(e.injection_id, outcome) for e, outcome in reverted]}
 
     def _after_cleanup(self, status: str, error: str | None, *,

@@ -7,6 +7,7 @@ ledger says an injection is undone, and which failures stop a verdict being issu
 """
 
 import asyncio
+import re
 from pathlib import Path
 import time
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 import pytest
 
 from catalog.schema import load_catalog
+from resilience_tests.analysis.elle_checker import ElleResult
 from resilience_tests.adapters.base import Capability, DatabaseSession, IntegrityResult, TransactionOutcome, register_adapter
 from resilience_tests.control import killswitch
 from resilience_tests.control import orchestrator as orch
@@ -39,6 +41,10 @@ class Engine:
     down = False
     store: set[str] = set()
     churn_ops = 0          # update/delete traffic the mixed profile asked for
+    lists: dict[int, list[int]] = {}   # Elle's list-append objects
+    # what the interrupted `during` operation leaves behind after the fake crash
+    during_in_progress = True
+    after_during: dict[str, Any] = {}
 
 
 class OutageSession(DatabaseSession):
@@ -58,6 +64,15 @@ class OutageSession(DatabaseSession):
         if outcome is TransactionOutcome.COMMITTED:
             Engine.churn_ops += 1
         return outcome
+
+    async def commit_marker_list_append(self, seq, marker_id, read_key, append_key):
+        outcome = await self.commit_marker(seq, marker_id)
+        if outcome is not TransactionOutcome.COMMITTED:
+            return outcome, []
+        first = Engine.lists.get(read_key)
+        Engine.lists.setdefault(append_key, []).append(seq)
+        return outcome, [("r", read_key, None if first is None else list(first)),
+                         ("append", append_key, seq), ("r", append_key, list(Engine.lists[append_key]))]
 
     async def try_write(self) -> bool:
         if Engine.down:
@@ -80,8 +95,21 @@ class OutageSession(DatabaseSession):
 class OutageAdapter(FakeAdapter):
     engine = "orch-fake"
     capabilities = frozenset({Capability.TRANSACTIONAL_MARKERS, Capability.WORKLOAD_CHURN,
-                              Capability.STRUCTURAL_INTEGRITY_CHECK, Capability.DURABILITY_SETTINGS})
+                              Capability.STRUCTURAL_INTEGRITY_CHECK, Capability.DURABILITY_SETTINGS,
+                              Capability.LIST_APPEND_HISTORY})
     churn_key_space = 1000
+
+    async def start_large_transaction(self):
+        return {"in_progress": Engine.during_in_progress, "pid": 7777, "note": "fake"}
+
+    async def verify_large_transaction(self):
+        return {"rows_visible": 0, "parent_rows_visible": 0, "fk_violations": 0, **Engine.after_during}
+
+    async def start_concurrent_index_build(self):
+        return {"in_progress": Engine.during_in_progress, "pid": 7778, "phase": "building index: scanning table"}
+
+    async def verify_concurrent_index(self):
+        return {"index_left_invalid": True, "table_readable": True, "rebuild_succeeds": True, **Engine.after_during}
 
     async def session(self, endpoint=None, timeout_s: float = 5.0) -> DatabaseSession:
         if Engine.down:
@@ -147,20 +175,23 @@ class OutageAdapter(FakeAdapter):
             "bloat_alert_fired": False,
         }
 
-    async def exhaust_connections(self, hold_duration_s: float = 2.0) -> dict[str, Any]:
+    async def exhaust_connections(self, hold_s: float) -> dict[str, Any]:
         return {
             "action": "connection_exhaustion",
             "t0_mono_ns": time.monotonic_ns(),
             "max_connections": 100,
             "superuser_reserved": 3,
             "held_connections": 97,
+            "rejected_explicit": 53,
+            "rejected_other": 0,
             "rejections_explicit": True,
-            "rejection_error": "FATAL: remaining connection slots are reserved for roles with the SUPERUSER attribute",
             "superuser_slot_honoured": True,
+            "hold_s": hold_s,
+            "connections_recover_after_release": True,
         }
 
     async def revert_exhaust_connections(self) -> dict[str, Any]:
-        return {"action": "connection_exhaustion_drained", "state": "active"}
+        return {"action": "flood sessions terminated", "remaining": 0}
 
 
 class FakeFault(FaultInjector):
@@ -187,10 +218,13 @@ class FakeFault(FaultInjector):
                 "superuser_reserved": 3,
                 "held_connections": 97,
                 "rejections_explicit": True,
-                "rejection_error": "FATAL: remaining connection slots are reserved",
                 "superuser_slot_honoured": True,
+                "connections_recover_after_release": True,
             }
         return {"action": self.fault_type}
+
+    async def confirm(self, node, detail):
+        return {"fault_confirmed": self.lands}
 
     async def revert(self, node, detail=None):
         FakeFault.reverts.append({"fault_type": self.fault_type, "detail": dict(detail or {})})
@@ -200,7 +234,8 @@ class FakeFault(FaultInjector):
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     Engine.down, FakeFault.lands, FakeFault.reverts = False, True, []
-    Engine.store, Engine.churn_ops = set(), 0
+    Engine.store, Engine.churn_ops, Engine.lists = set(), 0, {}
+    Engine.during_in_progress, Engine.after_during = True, {}
     # The recovery loop must outlast the fake outage, or nothing ever records service
     # returning -- which the harness correctly refuses to score, and which then reads as a
     # flaky test rather than as the timing mistake it is.
@@ -282,35 +317,84 @@ def test_checkpoint_crash_nlc02_passes_verdict(env):
     assert results["measured"]["rpo_txn"] == 0
 
 
-def test_large_transaction_crash_nlc03_passes_verdict(env):
+def elle_clean(monkeypatch):
+    """Elle itself is not run in unit tests; its verdict is stubbed as clean."""
+    def check(history_path, out_dir, **kw):
+        return ElleResult(valid=True, anomalies_count=0, operations=1)
+    monkeypatch.setattr(orch.ElleChecker, "check", staticmethod(check))
+
+
+def test_large_transaction_crash_nlc03_passes_verdict(env, monkeypatch):
+    elle_clean(monkeypatch)
     results = run(env, "NL-C-03")
     assert results["status"] == "passed", why(results)
-    assert results["measured"]["corruption_count"] == 0
-    assert results["measured"]["structural_integrity_errors"] == 0
-    assert results["measured"]["starts_unattended"] is True
-    assert results["measured"]["rpo_txn"] == 0
-    assert "elle" in results["facts"]
-    assert results["facts"]["elle"]["valid"] is True
-    hist_file = Path(results["evidence_dir"]) / "history.edn"
-    assert hist_file.stat().st_size > 0
-    summary_file = Path(results["evidence_dir"]) / "summary.txt"
-    print(f"\n[LOCAL TEST NL-C-03 RUN: {results['run_id']}]")
-    print(f"history.edn lines: {len(hist_file.read_text().splitlines())}")
-    print(f"elle facts: {results['facts']['elle']}")
-    print(f"\n--- summary.txt ---\n{summary_file.read_text()}")
+    m = results["measured"]
+    assert m["operation_in_progress_at_fault"] is True
+    assert m["large_txn_rows_visible"] == 0 and m["large_txn_parent_rows_visible"] == 0
+    assert m["fk_violations"] == 0 and m["elle_anomalies_count"] == 0
+    assert results["facts"]["during"]["operation"] == "large_transaction"
+
+
+def test_nlc03_history_records_what_the_database_returned(env, monkeypatch):
+    """Was: every :ok claimed a read of [seq] -- the transaction's own value, never read."""
+    elle_clean(monkeypatch)
+    results = run(env, "NL-C-03")
+    lines = (Path(results["evidence_dir"]) / "history.edn").read_text().splitlines()
+    oks = [ln for ln in lines if ":type :ok" in ln]
+    assert oks, "no committed transaction recorded"
+    # some list was read back holding more than the transaction's own append
+    assert any(re.search(r"\[:r \d+ \[\d+ \d+", ln) for ln in oks)
+    # a worker whose transaction ended :info never issues another under that process id
+    info_procs = {re.search(r":process (\d+)", ln).group(1) for ln in lines if ":type :info" in ln}
+    for proc in info_procs:
+        after = lines[next(i for i, ln in enumerate(lines) if ":type :info" in ln and f":process {proc}," in ln) + 1:]
+        assert not any(f":process {proc}," in ln for ln in after), proc
+
+
+def test_nlc03_without_elle_is_not_measured_and_fails(env, monkeypatch, tmp_path):
+    real = orch.ElleChecker.check
+    monkeypatch.setattr(orch.ElleChecker, "check",
+                        staticmethod(lambda h, o, **kw: real(h, o, jar=tmp_path / "missing.jar")))
+    results = run(env, "NL-C-03")
+    assert results["status"] == "failed", why(results)
+    assert outcomes(results)["elle_anomalies_count == 0"] == "not_measured"
+    assert results["facts"]["elle"]["valid"] is None
+
+
+def test_nlc03_partial_rows_after_recovery_fail(env, monkeypatch):
+    elle_clean(monkeypatch)
+    Engine.after_during = {"rows_visible": 1_000, "fk_violations": 3}
+    results = run(env, "NL-C-03")
+    assert results["status"] == "failed", why(results)
+    o = outcomes(results)
+    assert o["large_txn_rows_visible == 0"] == "fail" and o["fk_violations == 0"] == "fail"
+
+
+def test_fault_is_not_injected_when_the_operation_is_not_running(env, monkeypatch):
+    """Was: the kill was sent after a fixed 50 ms sleep, running or not."""
+    elle_clean(monkeypatch)
+    Engine.during_in_progress = False
+    results = run(env, "NL-C-03")
+    assert results["status"] == "aborted", why(results)
+    assert "not in progress" in results["error"]
+    assert results["timing"]["t0_mono_ns"] is None    # no fault was ever injected
 
 
 def test_concurrent_index_crash_nlc06_passes_verdict(env):
     results = run(env, "NL-C-06")
     assert results["status"] == "passed", why(results)
-    assert results["measured"]["corruption_count"] == 0
-    assert results["measured"]["structural_integrity_errors"] == 0
-    assert results["measured"]["starts_unattended"] is True
-    assert results["measured"]["rpo_txn"] == 0
-    assert "concurrent_index" in results["facts"]
-    assert results["facts"]["concurrent_index"]["cleanup_or_rebuild_succeeded"] is True
+    m = results["measured"]
+    assert m["operation_in_progress_at_fault"] is True
+    assert m["index_left_invalid"] is True and m["table_readable"] is True and m["rebuild_succeeds"] is True
+    assert "scenario_objects_cleanup_error" not in results["facts"]
 
 
+def test_nlc06_index_found_valid_means_the_kill_missed(env):
+    """An index that finished building before the kill is VALID -- that run tested nothing."""
+    Engine.after_during = {"index_left_invalid": False}
+    results = run(env, "NL-C-06")
+    assert results["status"] == "failed", why(results)
+    assert outcomes(results)["index_left_invalid == true"] == "fail"
 
 
 def test_kill_that_interrupted_nothing_cannot_pass(env):

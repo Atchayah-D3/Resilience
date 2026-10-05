@@ -33,6 +33,11 @@ class Skipped:
     reason: str
 
 
+def missing_infra(scenario: Scenario, profile: EnvProfile) -> list[str]:
+    """Infrastructure the scenario needs that this environment does not provide."""
+    return sorted(set(scenario.needs_infra) - set(profile.infra))
+
+
 def expand(catalog: Catalog, profile: EnvProfile, *, reference_env_class: str,
            only: set[str] | None = None) -> tuple[list[RunPlanItem], list[Skipped]]:
     """Run plan for ONE environment profile. Scenarios whose classes exclude this profile's
@@ -57,6 +62,11 @@ def expand(catalog: Catalog, profile: EnvProfile, *, reference_env_class: str,
         missing = sorted(set(sc.requires) - engine_can)
         if missing:
             skipped.append(Skipped(sid, f"engine {engine!r} lacks {', '.join(missing)}"))
+            continue
+        lacking = missing_infra(sc, profile)
+        if lacking:
+            skipped.append(Skipped(sid, f"blocked by infrastructure: profile {profile.name!r} "
+                                        f"does not provide {', '.join(lacking)}"))
             continue
         try:
             targets = resolver.resolve(sc)

@@ -76,8 +76,11 @@ def render_summary(r: dict[str, Any]) -> str:
     if elle:
         lines += [
             "",
-            f"elle consistency check ({elle.get('checker', 'checker')}):",
-            f"  valid: {elle.get('valid')}  anomalies: {elle.get('anomalies_count')}",
+            f"elle consistency check ({elle.get('checker', 'checker')}, "
+            f"model {elle.get('consistency_model')}, {elle.get('operations')} committed txns):",
+            ("  verdict: not reached -- " + str(elle.get("error")) if elle.get("valid") is None else
+             f"  valid: {elle.get('valid')}  anomaly types: {elle.get('anomalies_count')} "
+             f"{elle.get('anomaly_types') or ''}"),
         ]
     cp = (r.get("facts") or {}).get("checkpoint_injection")
     if cp:
