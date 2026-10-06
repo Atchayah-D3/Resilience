@@ -1178,7 +1178,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         return IntegrityResult(
             structural_errors=findings, checksum_failures=checksum_failures_since(baseline, stats),
             raw_output=output,
-            detail={"exit_status": result.exit_status, "databases": databases,
+            detail={"command": command, "exit_status": result.exit_status, "databases": databases,
                     "excluded_relations": list(self.integrity_exclusions),
                     "checksum_baseline_taken": baseline is not None},
         )

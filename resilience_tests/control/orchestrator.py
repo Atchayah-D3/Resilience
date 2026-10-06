@@ -34,8 +34,8 @@ from resilience_tests.analysis import threshold_eval
 from resilience_tests.analysis.elle_checker import ElleChecker
 from resilience_tests.analysis.predicates import NOT_APPLICABLE, NOT_MEASURED
 from resilience_tests.analysis.bloat import bloat_metrics
+from resilience_tests.analysis import rto_decomposer
 from resilience_tests.analysis.rto_decomposer import (
-    SLO_SUSTAIN_S,
     Baseline,
     baseline_slo_check,
     decompose,
@@ -415,7 +415,7 @@ class TestOrchestrator:
         if not check.sustained_window_found:
             self.disclosures.append(
                 f"The undisturbed baseline never held the SLO definition (>= 80% TPS, p99 <= 1.5x, "
-                f"{SLO_SUSTAIN_S:.0f} s straight) -- {check.compliant} of {check.samples} seconds compliant -- "
+                f"{rto_decomposer.SLO_SUSTAIN_S:.0f} s straight) -- {check.compliant} of {check.samples} seconds compliant -- "
                 f"so time-to-SLO after the fault cannot be measured on this target and is reported as not measured.")
         return asdict(self.baseline)
 
@@ -672,6 +672,11 @@ class TestOrchestrator:
                 detail["note"] = "service did not return to SLO within the soak hold"
             return detail
 
+        # When the undisturbed baseline could not hold the SLO itself, a return to SLO can never
+        # be seen -- waiting for one only runs out the bound. The phase still observes as long as
+        # the measurable path guarantees: until the service accepts writes again, then one full
+        # sustain period, so failures and dropped connections after the fault are still counted.
+        slo_measurable = (self.facts.get("baseline_slo_check") or {}).get("sustained_window_found", True)
         while time.monotonic() < deadline:
             d = decompose(self.stream.events(), slo_t0, baseline, clustered=False,
                           detection_patterns=self.adapter.fault_detection_log_patterns(),
@@ -679,6 +684,14 @@ class TestOrchestrator:
                           expect_outage=fault_type in OUTAGE_FAULTS)
             if d.rto_to_slo_s is not None:
                 detail["slo_reached_s"] = d.rto_to_slo_s
+                return detail
+            back_s = d.rto_first_write_s
+            since_s = (time.monotonic_ns() - slo_t0) / 1e9
+            if (not slo_measurable and isinstance(back_s, (int, float))
+                    and since_s >= back_s + rto_decomposer.SLO_SUSTAIN_S):
+                detail.update(slo_reached_s=None, observed_after_return_s=round(since_s - back_s, 1),
+                              note="time back to SLO cannot be measured on this target (see baseline); "
+                                   "recovery observed until writes returned plus one sustain period")
                 return detail
             await asyncio.sleep(RECOVERY_POLL_S)
         detail["slo_reached_s"] = None
@@ -890,6 +903,9 @@ class TestOrchestrator:
                           if self.adapter.has(Capability.STRUCTURAL_INTEGRITY_CHECK) else NOT_APPLICABLE)
             m["structural_integrity_errors"] = structural
             m["amcheck_errors"] = structural   # the Framework's PostgreSQL wording, same value
+            # what the check covered -- command, databases, relations left out -- so "clean" can be
+            # verified from the evidence rather than taken from the disclosure
+            self.facts["integrity_check"] = dict(integrity.detail)
             self.facts["checksum_failures"] = integrity.checksum_failures
             phantom = len(self.facts.get("markers", {}).get("phantom", [])) if "markers" in self.facts else None
             # corruption: structural findings + page checksum failures + rows nobody wrote. A

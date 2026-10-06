@@ -158,3 +158,71 @@ def test_warm_up_waits_for_every_worker(env, monkeypatch):
     monkeypatch.setattr(WorkloadDriver, "begin_window", begin)
     o, results = run_scenario(env, scenario("NL-C-01"))
     assert seen == [o.scenario.workload.concurrency], why(results)
+
+
+# --- recovery stops waiting for a return to SLO that cannot be measured ------------------------
+
+
+def recovery_record(results):
+    return next(p for p in results["phases"] if p["phase"] == "recovery")
+
+
+def never_back_to_slo(monkeypatch):
+    """A target that, like the lab one, never shows a sustained return to SLO."""
+    from dataclasses import replace
+    real = orch.decompose
+    monkeypatch.setattr(orch, "decompose", lambda *a, **k: replace(real(*a, **k), rto_to_slo_s=None))
+
+
+def test_recovery_stops_once_writes_are_back_plus_one_sustain_period(env, monkeypatch):
+    """Was: with a baseline that never held the SLO, recovery waited out its whole bound (895 s
+    in the NL-I-01 lab run) for a return to SLO that could never be seen."""
+    never_back_to_slo(monkeypatch)
+    _, results = run_scenario(env, scenario("NL-C-01"))
+    assert results["facts"]["baseline_slo_check"]["sustained_window_found"] is False
+    rec = recovery_record(results)
+    bound = env.phase_timeouts_s["recovery"] - orch.RECOVERY_EXIT_MARGIN_S
+    assert rec["duration_s"] < bound - 1, rec
+    assert rec["detail"]["slo_reached_s"] is None and "cannot be measured" in rec["detail"]["note"]
+    # it still observed the whole sustain period after writes came back
+    assert rec["detail"]["observed_after_return_s"] >= 2.0                # SLO_SUSTAIN_S in the fixture
+    assert results["status"] == "passed", why(results)
+
+
+def test_recovery_still_waits_out_the_bound_when_writes_never_return(env, monkeypatch):
+    """No early exit without the service back: a kill that never shows an outage leaves the
+    return time unknown, and the phase must keep watching to its bound."""
+    never_back_to_slo(monkeypatch)
+    from tests.test_orchestrator import FakeFault
+    FakeFault.lands = False
+    _, results = run_scenario(env, scenario("NL-C-01"))
+    rec = recovery_record(results)
+    assert "observed_after_return_s" not in rec["detail"]
+    assert rec["duration_s"] >= env.phase_timeouts_s["recovery"] - orch.RECOVERY_EXIT_MARGIN_S - 0.5
+
+
+def test_a_baseline_that_holds_the_slo_still_ends_recovery_on_the_slo(env):
+    sc = scenario("NL-C-01")
+    sc = sc.model_copy(update={"steady_state": sc.steady_state.model_copy(update={"duration_s": 4})})
+    _, results = run_scenario(env, sc)
+    assert results["facts"]["baseline_slo_check"]["sustained_window_found"] is True
+    rec = recovery_record(results)
+    assert isinstance(rec["detail"]["slo_reached_s"], float) and "observed_after_return_s" not in rec["detail"]
+
+
+# --- the integrity check says what it covered ---------------------------------------------------
+
+
+def test_the_integrity_checks_own_details_are_kept_as_evidence(env, monkeypatch):
+    from resilience_tests.adapters.base import IntegrityResult
+    from tests.test_orchestrator import OutageAdapter
+
+    async def checked(self, timeout_s):
+        return IntegrityResult(structural_errors=0, checksum_failures=0,
+                               detail={"command": "pg_amcheck -d resilience --exclude-relation=x",
+                                       "excluded_relations": ["x"], "exit_status": 0})
+
+    monkeypatch.setattr(OutageAdapter, "integrity_check", checked)
+    _, results = run_scenario(env, scenario("NL-C-01"))
+    assert results["facts"]["integrity_check"]["excluded_relations"] == ["x"]
+    assert "--exclude-relation=x" in results["facts"]["integrity_check"]["command"]

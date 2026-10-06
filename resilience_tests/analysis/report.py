@@ -151,6 +151,7 @@ def render_summary(r: dict[str, Any]) -> str:
             + (f"  ({first.get('rows')} rows returned)" if first.get("rows") is not None else ""),
             f"  pg_amcheck on the damaged relation: detected={(facts.get('amcheck_on_corrupted_relation') or {}).get('detected')}",
             f"  failures in the server log: {facts.get('corruption_log_locations')}",
+            f"  whole-database check left out: {(facts.get('integrity_check') or {}).get('excluded_relations')}",
         ]
     if r.get("measured"):
         rendered = []

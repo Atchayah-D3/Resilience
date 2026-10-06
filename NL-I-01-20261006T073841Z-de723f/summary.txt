@@ -1,0 +1,70 @@
+NL-I-01  Heap page checksum corruption
+run NL-I-01-20261006T073841Z-de723f  env e2-dedicated-vm (E2)  node shaktidb-standalone
+STATUS: PASSED
+
+phases:
+  reset         ok             0.0s  
+  init          ok             1.1s  
+  baseline      ok           122.4s  
+  pre_fault     ok             0.5s  
+  fault_inject  ok             2.5s  
+  recovery      ok           895.0s  
+  validate      ok             3.1s  
+  report        ok             0.1s  
+  cleanup       ok             0.2s  
+
+acceptance (evaluated mechanically):
+  [          PASS] corruption_detected_on_read == true {'corruption_detected_on_read': True}
+  [          PASS] detection_identifies_block == true {'detection_identifies_block': True}
+  [          PASS] amcheck_detects_target == true {'amcheck_detects_target': True}
+  [          PASS] checksum_failure_reported == true {'checksum_failure_reported': True}
+  [          PASS] corruption_outside_target == 0 {'corruption_outside_target': 0}  margin -0.000
+  [          PASS] structural_integrity_errors == 0 {'structural_integrity_errors': 0}  margin -0.000
+  [          PASS] rpo_txn == 0                 {'rpo_txn': 0}  margin -0.000
+
+data-file corruption (NL-I):
+  injected: resilience.corruption_target block 17 (base/16385/762363), byte 63 -> 9c, after a 'shut down' stop
+  pg_checksums before restart: [{'file': '/var/lib/resilience/pgdata/base/16385/762363', 'block': 17}]
+  first read: XX001  invalid page in block 17 of relation base/16385/762363
+  pg_amcheck on the damaged relation: detected=True
+  failures in the server log: [{'block': 17, 'relation_path': 'base/16385/762363'}, {'block': 17, 'relation_path': 'base/16385/762363'}, {'block': 17, 'relation_path': 'base/16385/762363'}]
+
+measured:
+  amcheck_detects_target = True
+  amcheck_errors = 0
+  checksum_failure_reported = True
+  connect_failures = 0
+  corruption_count = 2
+  corruption_detected_on_read = True
+  corruption_outside_target = 0
+  detection_identifies_block = True
+  detection_repeatable = True
+  dropped_connections = 0
+  failed_transactions = 0
+  indeterminate_txn = 71
+  mttd_s = NOT_MEASURED
+  recovery_started_s = NOT_MEASURED
+  rpo_txn = 0
+  rto_first_write_s = 0.171193946
+  rto_to_slo_s = NOT_MEASURED
+  starts_unattended = True
+  structural_integrity_errors = 0
+  t_detect_s = NOT_APPLICABLE
+  t_elect_s = NOT_APPLICABLE
+  t_promote_s = NOT_APPLICABLE
+  t_reconnect_s = 0.171193946
+  t_warm_s = NOT_MEASURED
+
+config deviations (postgresql.auto.conf):
+  track_wal_io_timing = on
+
+disclosures (evidence limitations):
+  - Baseline reset is not configured here: the target is not rolled back to a snapshot before a run.
+  - Storage class is not declared: results certify no storage class.
+  - Harness role 'harness' was granted pg_checkpoint, pg_read_all_stats on the target; the grant persists after the run (it is not revoked at cleanup)
+  - Configuration deviation in postgresql.auto.conf: track_wal_io_timing=on
+  - None of this scenario's abort conditions apply to a standalone target (replication_lag_s > 300, secondary_node_unhealthy); the run was guarded only by the environment's standing aborts (data_fs_used_pct > 90).
+  - The undisturbed baseline never held the SLO definition (>= 80% TPS, p99 <= 1.5x, 60 s straight) -- 87 of 118 seconds compliant -- so time-to-SLO after the fault cannot be measured on this target and is reported as not measured.
+  - The whole-database integrity check excluded the deliberately corrupted relation(s) resilience.corruption_target; they were checked on their own.
+  - Recovery limitation: service did not return to SLO within the recovery bound (900.0s timeout)
+  - corruption_count includes the checksum failures this scenario caused on purpose; damage elsewhere is judged by corruption_outside_target and structural_integrity_errors.

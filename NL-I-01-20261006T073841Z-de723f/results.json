@@ -1,0 +1,528 @@
+{
+  "abort_checks": [
+    {
+      "outcome": "not_applicable",
+      "predicate": "replication_lag_s > 300",
+      "t": 1791272322.626867,
+      "values": {
+        "replication_lag_s": "NOT_APPLICABLE"
+      }
+    },
+    {
+      "outcome": "not_applicable",
+      "predicate": "secondary_node_unhealthy",
+      "t": 1791272322.6268792,
+      "values": {
+        "secondary_node_unhealthy": "NOT_APPLICABLE"
+      }
+    },
+    {
+      "outcome": "not_measured",
+      "predicate": "data_fs_used_pct > 90",
+      "t": 1791272322.6268864,
+      "values": {
+        "data_fs_used_pct": "NOT_MEASURED"
+      }
+    }
+  ],
+  "baseline": {
+    "commits": 18195,
+    "connect_failures": 0,
+    "drops": 0,
+    "duration_s": 120.00065637752414,
+    "errors": 0,
+    "indeterminate": 0,
+    "journal_p99_ms": 1163.6964492499828,
+    "p50_ms": 2.797003835439682,
+    "p95_ms": 5.87235763669014,
+    "p99_ms": 152.64955163002014,
+    "reconnects": 0,
+    "tps": 151.6241706441856
+  },
+  "disclosures": [
+    "Baseline reset is not configured here: the target is not rolled back to a snapshot before a run.",
+    "Storage class is not declared: results certify no storage class.",
+    "Harness role 'harness' was granted pg_checkpoint, pg_read_all_stats on the target; the grant persists after the run (it is not revoked at cleanup)",
+    "Configuration deviation in postgresql.auto.conf: track_wal_io_timing=on",
+    "None of this scenario's abort conditions apply to a standalone target (replication_lag_s > 300, secondary_node_unhealthy); the run was guarded only by the environment's standing aborts (data_fs_used_pct > 90).",
+    "The undisturbed baseline never held the SLO definition (>= 80% TPS, p99 <= 1.5x, 60 s straight) -- 87 of 118 seconds compliant -- so time-to-SLO after the fault cannot be measured on this target and is reported as not measured.",
+    "The whole-database integrity check excluded the deliberately corrupted relation(s) resilience.corruption_target; they were checked on their own.",
+    "Recovery limitation: service did not return to SLO within the recovery bound (900.0s timeout)",
+    "corruption_count includes the checksum failures this scenario caused on purpose; damage elsewhere is judged by corruption_outside_target and structural_integrity_errors."
+  ],
+  "environment": {
+    "class": "E2",
+    "environment": "lab",
+    "profile": "e2-dedicated-vm",
+    "storage_class": null
+  },
+  "error": null,
+  "evidence_dir": "/home/distdbsdb17user/resilience-runs/NL-I-01-20261006T073841Z-de723f",
+  "facts": {
+    "amcheck_on_corrupted_relation": {
+      "detected": true,
+      "exit_status": 2,
+      "output": "heap table \"resilience.resilience.corruption_target\":\n    ERROR:  invalid page in block 17 of relation base/16385/762363\nWARNING:  page verification failed, calculated checksum 65130 but expected 60387"
+    },
+    "baseline_slo_check": {
+      "compliant": 87,
+      "compliant_fraction": 0.7372881355932204,
+      "samples": 118,
+      "sustained_window_found": false
+    },
+    "capabilities": [
+      "durability_settings",
+      "list_append_history",
+      "page_checksums",
+      "structural_integrity_check",
+      "transactional_markers",
+      "workload_churn"
+    ],
+    "checksum_failures": 2,
+    "cleanup_outstanding": [],
+    "clock_offset_s": 0.0034399032592773438,
+    "config_deviations": {
+      "track_wal_io_timing": "on"
+    },
+    "corruption_log_locations": [
+      {
+        "block": 17,
+        "relation_path": "base/16385/762363"
+      },
+      {
+        "block": 17,
+        "relation_path": "base/16385/762363"
+      },
+      {
+        "block": 17,
+        "relation_path": "base/16385/762363"
+      }
+    ],
+    "corruption_parts": {
+      "page_checksum_failures": 2,
+      "phantom_markers": 0,
+      "structural_integrity": 0
+    },
+    "corruption_read": {
+      "attempts": [
+        {
+          "block": 17,
+          "error": "DataCorruptedError",
+          "message": "invalid page in block 17 of relation base/16385/762363",
+          "relation_path": "base/16385/762363",
+          "sqlstate": "XX001"
+        },
+        {
+          "block": 17,
+          "error": "DataCorruptedError",
+          "message": "invalid page in block 17 of relation base/16385/762363",
+          "relation_path": "base/16385/762363",
+          "sqlstate": "XX001"
+        }
+      ]
+    },
+    "data_corruption": {
+      "action": "flip one byte in one heap page",
+      "block": 17,
+      "byte_offset": 147392,
+      "cluster_state": "shut down",
+      "file": "/var/lib/resilience/pgdata/base/16385/762363",
+      "integrity_exclusions": [
+        "resilience.corruption_target"
+      ],
+      "original_byte": "63",
+      "pg_checksums": {
+        "command": "/usr/lib/postgresql/17.11.1.0/bin/pg_checksums --check -D /var/lib/resilience/pgdata --filenode=762363",
+        "exit_status": 1,
+        "failures": [
+          {
+            "block": 17,
+            "file": "/var/lib/resilience/pgdata/base/16385/762363"
+          }
+        ],
+        "output": "Checksum operation completed\nFiles scanned:   2\nBlocks scanned:  38\nBad checksums:  1\nData checksum version: 1\npg_checksums: error: checksum verification failed in file \"/var/lib/resilience/pgdata/base/16385/762363\", block 17: calculated checksum FE6A but block contains EBE3"
+      },
+      "relation": "resilience.corruption_target",
+      "relation_path": "base/16385/762363",
+      "written_byte": "9c"
+    },
+    "declared_not_produced": [],
+    "engine": "postgresql",
+    "fault_driver": {
+      "driver": "os_ssh",
+      "section": "os_ssh"
+    },
+    "fingerprint": {
+      "created_by": "dbre-operator",
+      "disposable": true,
+      "hostname": "BDB-QA-U22-30",
+      "inventory_tag": "resilience-lab-e2"
+    },
+    "injection_id": "5ac14dac-9c8b-47db-b27c-2b4585159763",
+    "injector_preflight": {
+      "service": "shaktidb-resilience.service",
+      "stop_mode": "fast",
+      "target": {
+        "block": 17,
+        "block_size": 8192,
+        "byte_in_page": 8128,
+        "filenode": 762363,
+        "pages": 35,
+        "relation": "resilience.corruption_target",
+        "relation_path": "base/16385/762363",
+        "rows": 2000
+      }
+    },
+    "integrity_baseline": {
+      "checksum_failures": {
+        "<shared>": [
+          0,
+          ""
+        ],
+        "postgres": [
+          0,
+          ""
+        ],
+        "resilience": [
+          0,
+          ""
+        ],
+        "template0": [
+          0,
+          ""
+        ],
+        "template1": [
+          0,
+          ""
+        ]
+      }
+    },
+    "markers": {
+      "acked": 164907,
+      "in_db": 164907,
+      "indeterminate": 71,
+      "indeterminate_committed": 0,
+      "lost": [],
+      "phantom": [],
+      "torn_journal_lines": 0,
+      "unjournalled_ack": [],
+      "written": 164978
+    },
+    "not_measured": {
+      "mttd_s": "this fault leaves the engine no chance to log that it noticed -- a killed process writes nothing. The replacement's own recovery-start line is reported separately as recovery_started_s, which is a restart time, not a detection time",
+      "recovery_started_s": "no recovery-start line from this engine reached the harness during the run",
+      "rto_to_slo_s": "the undisturbed baseline never held the SLO for the sustain period, so a return to SLO after the fault cannot be told apart from the stalls the target always has",
+      "t_warm_s": "the undisturbed baseline never held the SLO for the sustain period, so a return to SLO after the fault cannot be told apart from the stalls the target always has"
+    },
+    "outage_observed": false,
+    "rows_returned_from_damaged_relation": null,
+    "settings": {
+      "data_checksums": "on",
+      "fsync": "on",
+      "full_page_writes": "on",
+      "server_version": "17.11.1.0",
+      "synchronous_commit": "on",
+      "wal_sync_method": "fdatasync"
+    },
+    "slo_t0_mono_ns": 26098090209594792,
+    "slo_window_end_s": null
+  },
+  "measured": {
+    "amcheck_detects_target": true,
+    "amcheck_errors": 0,
+    "checksum_failure_reported": true,
+    "connect_failures": 0,
+    "corruption_count": 2,
+    "corruption_detected_on_read": true,
+    "corruption_outside_target": 0,
+    "detection_identifies_block": true,
+    "detection_repeatable": true,
+    "dropped_connections": 0,
+    "failed_transactions": 0,
+    "indeterminate_txn": 71,
+    "mttd_s": "NOT_MEASURED",
+    "recovery_started_s": "NOT_MEASURED",
+    "rpo_txn": 0,
+    "rto_first_write_s": 0.171193946,
+    "rto_to_slo_s": "NOT_MEASURED",
+    "starts_unattended": true,
+    "structural_integrity_errors": 0,
+    "t_detect_s": "NOT_APPLICABLE",
+    "t_elect_s": "NOT_APPLICABLE",
+    "t_promote_s": "NOT_APPLICABLE",
+    "t_reconnect_s": 0.171193946,
+    "t_warm_s": "NOT_MEASURED"
+  },
+  "options": {
+    "stop_before_fault": false,
+    "target_is_disposable": false
+  },
+  "phases": [
+    {
+      "detail": {
+        "disclosure": "No baseline reset: the target was not rolled back to a snapshot before this run.",
+        "driver": "none"
+      },
+      "duration_s": 9.726732969284058e-05,
+      "error": null,
+      "outcome": "ok",
+      "phase": "reset",
+      "t_wall_start": 1791272321.5198545
+    },
+    {
+      "detail": {
+        "hostname": "BDB-QA-U22-30",
+        "settings": {
+          "data_checksums": "on",
+          "fsync": "on",
+          "full_page_writes": "on",
+          "server_version": "17.11.1.0",
+          "synchronous_commit": "on",
+          "wal_sync_method": "fdatasync"
+        }
+      },
+      "duration_s": 1.0668175145983696,
+      "error": null,
+      "outcome": "ok",
+      "phase": "init",
+      "t_wall_start": 1791272321.5199938
+    },
+    {
+      "detail": {
+        "commits": 18195,
+        "connect_failures": 0,
+        "drops": 0,
+        "duration_s": 120.00065637752414,
+        "errors": 0,
+        "indeterminate": 0,
+        "journal_p99_ms": 1163.6964492499828,
+        "p50_ms": 2.797003835439682,
+        "p95_ms": 5.87235763669014,
+        "p99_ms": 152.64955163002014,
+        "reconnects": 0,
+        "tps": 151.6241706441856
+      },
+      "duration_s": 122.44938591867685,
+      "error": null,
+      "outcome": "ok",
+      "phase": "baseline",
+      "t_wall_start": 1791272322.5869017
+    },
+    {
+      "detail": {
+        "injector_preflight": {
+          "service": "shaktidb-resilience.service",
+          "stop_mode": "fast",
+          "target": {
+            "block": 17,
+            "block_size": 8192,
+            "byte_in_page": 8128,
+            "filenode": 762363,
+            "pages": 35,
+            "relation": "resilience.corruption_target",
+            "relation_path": "base/16385/762363",
+            "rows": 2000
+          }
+        },
+        "steady_state": {
+          "p99_ms <= 300.0": true,
+          "tps >= 150.0": true
+        }
+      },
+      "duration_s": 0.47378699481487274,
+      "error": null,
+      "outcome": "ok",
+      "phase": "pre_fault",
+      "t_wall_start": 1791272445.0363464
+    },
+    {
+      "detail": {
+        "action": "flip one byte in one heap page",
+        "block": 17,
+        "byte_offset": 147392,
+        "cluster_state": "shut down",
+        "cycle": null,
+        "file": "/var/lib/resilience/pgdata/base/16385/762363",
+        "integrity_exclusions": [
+          "resilience.corruption_target"
+        ],
+        "original_byte": "63",
+        "pg_checksums": {
+          "command": "/usr/lib/postgresql/17.11.1.0/bin/pg_checksums --check -D /var/lib/resilience/pgdata --filenode=762363",
+          "exit_status": 1,
+          "failures": [
+            {
+              "block": 17,
+              "file": "/var/lib/resilience/pgdata/base/16385/762363"
+            }
+          ],
+          "output": "Checksum operation completed\nFiles scanned:   2\nBlocks scanned:  38\nBad checksums:  1\nData checksum version: 1\npg_checksums: error: checksum verification failed in file \"/var/lib/resilience/pgdata/base/16385/762363\", block 17: calculated checksum FE6A but block contains EBE3"
+        },
+        "redo_distance_bytes": 165697312,
+        "redo_sampling_delay_ms": 2260.7,
+        "relation": "resilience.corruption_target",
+        "relation_path": "base/16385/762363",
+        "t0_mono_ns": 26098090209594792,
+        "written_byte": "9c"
+      },
+      "duration_s": 2.516204871237278,
+      "error": null,
+      "outcome": "ok",
+      "phase": "fault_inject",
+      "t_wall_start": 1791272445.5102131
+    },
+    {
+      "detail": {
+        "note": "service did not return to SLO within the recovery bound",
+        "recovery": "unattended (no harness action)",
+        "slo_reached_s": null
+      },
+      "duration_s": 895.017490170896,
+      "error": null,
+      "outcome": "ok",
+      "phase": "recovery",
+      "t_wall_start": 1791272448.0265148
+    },
+    {
+      "detail": {
+        "verdict": "pass"
+      },
+      "duration_s": 3.126208197325468,
+      "error": null,
+      "outcome": "ok",
+      "phase": "validate",
+      "t_wall_start": 1791273343.0440779
+    },
+    {
+      "detail": {
+        "results": "/home/distdbsdb17user/resilience-runs/NL-I-01-20261006T073841Z-de723f/results.json"
+      },
+      "duration_s": 0.11100219935178757,
+      "error": null,
+      "outcome": "ok",
+      "phase": "report",
+      "t_wall_start": 1791273346.1707454
+    },
+    {
+      "detail": {
+        "reverted": [
+          [
+            "5ac14dac-9c8b-47db-b27c-2b4585159763",
+            "reverted"
+          ]
+        ]
+      },
+      "duration_s": 0.18616944551467896,
+      "error": null,
+      "outcome": "ok",
+      "phase": "cleanup",
+      "t_wall_start": 1791273346.281832
+    }
+  ],
+  "run_id": "NL-I-01-20261006T073841Z-de723f",
+  "scenario": {
+    "accept": [
+      "corruption_detected_on_read == true",
+      "detection_identifies_block == true",
+      "amcheck_detects_target == true",
+      "checksum_failure_reported == true",
+      "corruption_outside_target == 0",
+      "structural_integrity_errors == 0",
+      "rpo_txn == 0"
+    ],
+    "category": "NL-I",
+    "id": "NL-I-01",
+    "measure": [
+      "corruption_detected_on_read",
+      "detection_identifies_block",
+      "detection_repeatable",
+      "amcheck_detects_target",
+      "checksum_failure_reported",
+      "corruption_outside_target",
+      "structural_integrity_errors",
+      "corruption_count",
+      "rpo_txn",
+      "indeterminate_txn"
+    ],
+    "name": "Heap page checksum corruption",
+    "priority": "P0"
+  },
+  "status": "passed",
+  "target": {
+    "node": "shaktidb-standalone",
+    "role": "standalone",
+    "topology_role": "primary"
+  },
+  "timing": {
+    "t0_mono_ns": 26098090209594792,
+    "t1_mono_ns": 26098090209594792
+  },
+  "verdict": {
+    "passed": true,
+    "results": [
+      {
+        "margin": null,
+        "outcome": "pass",
+        "predicate": "corruption_detected_on_read == true",
+        "reason": null,
+        "values": {
+          "corruption_detected_on_read": true
+        }
+      },
+      {
+        "margin": null,
+        "outcome": "pass",
+        "predicate": "detection_identifies_block == true",
+        "reason": null,
+        "values": {
+          "detection_identifies_block": true
+        }
+      },
+      {
+        "margin": null,
+        "outcome": "pass",
+        "predicate": "amcheck_detects_target == true",
+        "reason": null,
+        "values": {
+          "amcheck_detects_target": true
+        }
+      },
+      {
+        "margin": null,
+        "outcome": "pass",
+        "predicate": "checksum_failure_reported == true",
+        "reason": null,
+        "values": {
+          "checksum_failure_reported": true
+        }
+      },
+      {
+        "margin": -0.0,
+        "outcome": "pass",
+        "predicate": "corruption_outside_target == 0",
+        "reason": null,
+        "values": {
+          "corruption_outside_target": 0
+        }
+      },
+      {
+        "margin": -0.0,
+        "outcome": "pass",
+        "predicate": "structural_integrity_errors == 0",
+        "reason": null,
+        "values": {
+          "structural_integrity_errors": 0
+        }
+      },
+      {
+        "margin": -0.0,
+        "outcome": "pass",
+        "predicate": "rpo_txn == 0",
+        "reason": null,
+        "values": {
+          "rpo_txn": 0
+        }
+      }
+    ]
+  }
+}

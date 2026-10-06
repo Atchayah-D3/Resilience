@@ -319,6 +319,7 @@ def test_the_whole_database_check_excludes_only_the_damaged_relation(monkeypatch
     (amcheck,) = [c for c in commands if "pg_amcheck" in c]
     assert f"--exclude-relation={RELATION}" in amcheck and "--heapallindexed" in amcheck
     assert result.detail["excluded_relations"] == [RELATION]
+    assert f"--exclude-relation={RELATION}" in result.detail["command"]   # kept as evidence
 
 
 def test_log_lines_are_reduced_to_block_and_relation():
