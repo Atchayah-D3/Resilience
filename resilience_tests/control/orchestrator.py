@@ -68,7 +68,11 @@ RECOVERY_EXIT_MARGIN_S = 5.0  # leave the recovery loop before its phase timeout
 IDLE_TRANSACTION_GRACE_S = 2.0
 INDEX_BUILD_HEADSTART_S = 0.05
 # Fault detail kept under its own name in facts, where analysis and the report look for it.
-FAULT_FACT_KEY = {"idle_in_transaction": "idle_transaction", "connection_exhaustion": "connection_exhaustion"}
+FAULT_FACT_KEY = {"idle_in_transaction": "idle_transaction", "connection_exhaustion": "connection_exhaustion",
+                  "data_corruption": "data_corruption"}
+# data_corruption: how long validate waits for the server's own report of the failed read to
+# arrive through the log tailer before declaring it not seen
+CORRUPTION_LOG_WAIT_S = 15.0
 IDLE_TRANSACTION_MIN_SOAK_S = 30.0
 
 
@@ -77,7 +81,8 @@ IDLE_TRANSACTION_MIN_SOAK_S = 30.0
 OUTAGE_FAULTS = frozenset({"process_kill", "service_restart", "host_power_loss"})
 # Faults the service recovers from on its own; the ledger entry stays outstanding until
 # cleanup's revert has confirmed the node is back in its pre-fault state.
-UNATTENDED_FAULTS = frozenset({"process_kill", "service_restart", "config_reload", "connection_exhaustion", "idle_in_transaction"})
+UNATTENDED_FAULTS = frozenset({"process_kill", "service_restart", "config_reload", "connection_exhaustion", "idle_in_transaction",
+                               "data_corruption"})
 
 
 class TargetBusy(RuntimeError):
@@ -488,6 +493,13 @@ class TestOrchestrator:
         self.facts["injection_id"] = entry.injection_id
         if self.scenario.fault.type in FAULT_FACT_KEY:
             self.facts[FAULT_FACT_KEY[self.scenario.fault.type]] = detail
+        if detail.get("integrity_exclusions"):
+            # the deliberately damaged relation is checked on its own; the whole-database check
+            # must still answer "is everything ELSE intact?"
+            self.adapter.integrity_exclusions = tuple(detail["integrity_exclusions"])
+            self.disclosures.append(
+                f"The whole-database integrity check excluded the deliberately corrupted relation(s) "
+                f"{', '.join(detail['integrity_exclusions'])}; they were checked on their own.")
         self._cycle_entries = getattr(self, "_cycle_entries", {})
         self._cycle_entries[cycle] = entry
         self.redo_at_t0.append(redo)
@@ -807,6 +819,16 @@ class TestOrchestrator:
         except Exception as exc:  # noqa: BLE001 -- recorded; the measure then counts as missing
             self.facts["markers_error"] = f"{type(exc).__name__}: {exc}"
 
+        # The damaged page is read BEFORE the integrity check, so the checksum-failure counter the
+        # check samples already includes the reads that should have tripped it.
+        corruption_read: dict[str, Any] | None = None
+        if self.scenario.fault.type == "data_corruption":
+            try:
+                corruption_read = await self.adapter.read_corruption_target()
+            except Exception as exc:  # noqa: BLE001 -- recorded; detection then counts as not measured
+                corruption_read = {"error": f"{type(exc).__name__}: {exc}"}
+            self.facts["corruption_read"] = corruption_read
+
         try:
             integrity = await self.adapter.integrity_check(timeout_s=self.profile.phase_timeouts_s["validate"] / 2)
             raw = (integrity.raw_output or "").strip()
@@ -877,6 +899,8 @@ class TestOrchestrator:
 
         if self.scenario.fault.type == "idle_in_transaction":
             m.update(await self._measure_idle_transaction(events))
+        if self.scenario.fault.type == "data_corruption":
+            m.update(await self._measure_corruption(corruption_read or {}))
 
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).
@@ -988,6 +1012,77 @@ class TestOrchestrator:
             self.disclosures.append(
                 f"Configured idle_in_transaction_session_timeout ({t_s:.1f}s) exceeds the recovery soak bound; "
                 "timeout enforcement was untestable within this run.")
+        return m
+
+    async def _measure_corruption(self, read: dict[str, Any]) -> dict[str, Any]:
+        """NL-I-01: was the damaged page detected, on read, at the right place -- and nowhere else?
+
+        Every value comes from an observation that could have gone the other way: the read the
+        harness made, the engine's own checker run on the damaged relation, the engine's own
+        failure counter, and the engine's own log. A missing observation is NOT_MEASURED."""
+        m: dict[str, Any] = {}
+        injected = self.facts.get("data_corruption") or {}
+        block, path = injected.get("block"), injected.get("relation_path")
+        sqlstates = self.adapter.corruption_sqlstates
+
+        attempts = read.get("attempts") or []
+        if not attempts:
+            for name in ("corruption_detected_on_read", "detection_identifies_block", "detection_repeatable"):
+                m[name] = NOT_MEASURED
+                self.not_measured[name] = read.get("error", "the damaged relation could not be read at all")
+        else:
+            first = attempts[0]
+            detected = first.get("sqlstate") in sqlstates
+            m["corruption_detected_on_read"] = detected
+            # rows returned from a relation we know is damaged is the silent-corruption case itself
+            self.facts["rows_returned_from_damaged_relation"] = first.get("rows")
+            m["detection_identifies_block"] = (detected and first.get("block") == block
+                                               and first.get("relation_path") == path)
+            m["detection_repeatable"] = all(a.get("sqlstate") in sqlstates for a in attempts)
+
+        relation = injected.get("relation")
+        try:
+            checked = await self.adapter.amcheck_relation(relation, timeout_s=self.profile.phase_timeouts_s["validate"] / 4)
+        except Exception as exc:  # noqa: BLE001
+            checked = {"detected": None, "note": f"{type(exc).__name__}: {exc}"}
+        self.facts["amcheck_on_corrupted_relation"] = checked
+        if checked.get("detected") is None:
+            m["amcheck_detects_target"] = NOT_MEASURED
+            self.not_measured["amcheck_detects_target"] = (
+                f"the structural check of {relation} did not say either way: "
+                f"{checked.get('note') or str(checked.get('output', ''))[:200]}")
+        else:
+            m["amcheck_detects_target"] = checked["detected"]
+
+        failures = self.facts.get("checksum_failures")
+        if failures is None:
+            m["checksum_failure_reported"] = NOT_MEASURED
+            self.not_measured["checksum_failure_reported"] = "the engine's checksum-failure counter could not be read"
+        else:
+            m["checksum_failure_reported"] = failures >= 1
+
+        # The engine's own report of each failed read. Wait for it: it travels through the log
+        # tailer and can trail the read by a moment.
+        deadline = time.monotonic() + CORRUPTION_LOG_WAIT_S
+        while True:
+            assert self.stream is not None and self.t0_ns is not None
+            lines = [str(e.data.get("line", "")) for e in self.stream.events()
+                     if e.kind == "log_line" and e.t_mono_ns > self.t0_ns]
+            locations = self.adapter.corruption_log_locations(lines)
+            if (block, path) in locations or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.5)
+        self.facts["corruption_log_locations"] = [{"block": b, "relation_path": p} for b, p in locations]
+        if (block, path) not in locations:
+            m["corruption_outside_target"] = NOT_MEASURED
+            self.not_measured["corruption_outside_target"] = (
+                "the server's report of the failed read never reached the harness, so its log cannot show "
+                "whether any other relation was damaged (check the node's log_file in the profile)")
+        else:
+            m["corruption_outside_target"] = sum(1 for loc in locations if loc != (block, path))
+        self.disclosures.append(
+            "corruption_count includes the checksum failures this scenario caused on purpose; "
+            "damage elsewhere is judged by corruption_outside_target and structural_integrity_errors.")
         return m
 
     async def _p_report(self, results: dict[str, Any]) -> dict[str, Any]:

@@ -151,6 +151,16 @@ VACUUM_PROBE_TIMEOUT_S = 120.0
 _DEAD_NOT_REMOVABLE_RE = re.compile(r"(\d+) are dead but not yet removable")
 _REMOVABLE_CUTOFF_RE = re.compile(r"removable cutoff: (\d+)")
 
+# NL-I (fault type data_corruption): the harness-owned relation the fault corrupts. Its own
+# table, so a byte is only ever flipped in data the harness created; never markers, never
+# operator data. autovacuum is off on it so nothing in the background reads the damaged page
+# before the harness does -- the first read is the one that is measured.
+CORRUPTION_TARGET = "resilience.corruption_target"
+CORRUPTION_TARGET_ROWS = 2_000          # ~35 pages: a page in the middle is surely populated
+CORRUPTION_BYTE_FROM_PAGE_END = 64      # inside the tuple area, far from the page header
+# PostgreSQL: "invalid page in block 17 of relation base/16384/16400" (SQLSTATE XX001)
+_INVALID_PAGE_RE = re.compile(r"invalid page in block (\d+) of relation (\S+)")
+
 _SAME_AS_CONNECT: Any = object()  # sentinel: bound statements by the connect timeout
 
 ChecksumStats = dict[str, tuple[int, str]]  # database -> (checksum_failures, stats_reset)
@@ -332,6 +342,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         try:
             await conn.execute(HARNESS_DDL)
             await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CONCURRENT_INDEX_NAME}")
+            # a corrupted relation left by an earlier run would fail every later integrity check;
+            # DROP never reads its pages, so it is safe even when they are damaged
+            await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
             await conn.execute(TRUNCATE)
             # Seeded every run, after the truncate: the churn table starts from a freshly
             # written, unfragmented state, so the first footprint sample is a real floor and
@@ -340,6 +353,84 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             await conn.execute("VACUUM (ANALYZE) resilience.churn")
         finally:
             await conn.close()
+
+    corruption_sqlstates = ("XX001",)  # data_corrupted
+
+    async def prepare_corruption_target(self) -> dict[str, Any]:
+        """Recreate the corruption target and locate a populated page in its data file."""
+        conn = await self._connect(timeout_s=60.0)
+        try:
+            await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
+            await conn.execute(f"CREATE TABLE {CORRUPTION_TARGET} (id int NOT NULL, payload text NOT NULL) "
+                               "WITH (autovacuum_enabled = false)")
+            await conn.execute(f"INSERT INTO {CORRUPTION_TARGET} SELECT g, repeat('c', 100) "
+                               "FROM generate_series(1, $1) g", CORRUPTION_TARGET_ROWS)
+            row = await conn.fetchrow(
+                "SELECT pg_relation_filepath($1::regclass) AS path, "
+                "pg_relation_filenode($1::regclass)::bigint AS filenode, "
+                "current_setting('block_size')::int AS block_size, "
+                "pg_relation_size($1::regclass)::bigint AS bytes", CORRUPTION_TARGET)
+        finally:
+            await conn.close()
+        pages = int(row["bytes"]) // int(row["block_size"])
+        return {
+            "relation": CORRUPTION_TARGET,
+            "relation_path": str(row["path"]),
+            "filenode": int(row["filenode"]),
+            "block": pages // 2,
+            "pages": pages,
+            "block_size": int(row["block_size"]),
+            "byte_in_page": int(row["block_size"]) - CORRUPTION_BYTE_FROM_PAGE_END,
+            "rows": CORRUPTION_TARGET_ROWS,
+        }
+
+    async def read_corruption_target(self, attempts: int = 2) -> dict[str, Any]:
+        """A full sequential read (count(*) over a table with no index reads every page),
+        on a fresh connection each time so no attempt is answered from a session cache."""
+        out = []
+        for _ in range(attempts):
+            conn = await self._connect(timeout_s=10.0, command_timeout=60.0)
+            try:
+                rows = await conn.fetchval(f"SELECT count(*) FROM {CORRUPTION_TARGET}")
+                out.append({"error": None, "rows": int(rows)})
+            except asyncpg.PostgresError as exc:
+                message = str(exc)
+                where = _INVALID_PAGE_RE.search(message)
+                out.append({"error": type(exc).__name__, "sqlstate": getattr(exc, "sqlstate", None),
+                            "message": message[:500],
+                            "block": int(where.group(1)) if where else None,
+                            "relation_path": where.group(2) if where else None})
+            finally:
+                await conn.close()
+        return {"attempts": out}
+
+    async def amcheck_relation(self, relation: str, timeout_s: float) -> dict[str, Any]:
+        """pg_amcheck on the one relation (Arch §10.1 names it for NL-I-01). A checksum failure
+        surfaces either as a reported finding or as the check's own read failing with the
+        invalid-page error; both mean the checker noticed. A clean exit means it did not."""
+        node = self.node
+        command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
+                   f"-d {shlex.quote(node.db.dbname)} --relation={shlex.quote(relation)}")
+        async with RemoteHost(node.ssh) as host:
+            result = await host.run(as_user(node.os_user, command), timeout_s=timeout_s, check=False)
+        output = (result.stdout + result.stderr).strip()
+        noticed = bool(_AMCHECK_FINDING_RE.search(output) or _INVALID_PAGE_RE.search(output)
+                       or "checksum" in output.lower())
+        if result.exit_status == 0 and not noticed:
+            detected: bool | None = False
+        elif result.exit_status != 0 and noticed:
+            detected = True
+        else:
+            detected = None   # e.g. could not connect, or exited non-zero for another reason
+        return {"detected": detected, "exit_status": result.exit_status, "output": output[:2000]}
+
+    def corruption_log_locations(self, lines: Sequence[str]) -> list[tuple[int, str]]:
+        found = []
+        for line in lines:
+            m = _INVALID_PAGE_RE.search(line)
+            if m:
+                found.append((int(m.group(1)), m.group(2)))
+        return found
 
     async def start_concurrent_index_build(self) -> None:
         await self.create_index_concurrently("resilience.markers", "ts", CONCURRENT_INDEX_NAME)
@@ -845,8 +936,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                     "(CREATE EXTENSION amcheck) -- the harness does not modify target databases"
                 )
             db_args = " ".join(f"-d {shlex.quote(db)}" for db in databases)
+            exclude = "".join(f" --exclude-relation={shlex.quote(r)}" for r in self.integrity_exclusions)
             command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
-                       f"{db_args} --heapallindexed")
+                       f"{db_args} --heapallindexed{exclude}")
             result = await host.run(as_user(node.os_user, command), timeout_s=timeout_s, check=False)
         output = result.stdout + result.stderr
         if result.exit_status not in (0, 2):
@@ -863,6 +955,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             structural_errors=findings, checksum_failures=checksum_failures_since(baseline, stats),
             raw_output=output,
             detail={"exit_status": result.exit_status, "databases": databases,
+                    "excluded_relations": list(self.integrity_exclusions),
                     "checksum_baseline_taken": baseline is not None},
         )
 

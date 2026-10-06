@@ -252,6 +252,37 @@ class BaseDatabaseAdapter(ABC):
         (e.g. crash recovery after an unclean stop). Reported as `recovery_started_s`."""
         return ()
 
+    # --- data-file corruption (fault type data_corruption, Framework NL-I) -------------------
+
+    # Relations deliberately corrupted by the fault, left out of the run's whole-database
+    # integrity check so that check still answers "is everything ELSE intact?". The corrupted
+    # relation is checked on its own (amcheck_relation), where a finding is the expected result.
+    integrity_exclusions: tuple[str, ...] = ()
+    # Error codes this engine raises when a read finds a corrupted page.
+    corruption_sqlstates: tuple[str, ...] = ()
+
+    async def prepare_corruption_target(self) -> dict[str, Any]:
+        """Create (or recreate) the harness-owned relation the fault will corrupt, and say
+        where one of its populated pages lives on disk: `relation`, `relation_path` (relative
+        to the data directory), `filenode`, `block`, `block_size`, `byte_in_page`, `rows`."""
+        raise NotImplementedError(f"{type(self).__name__} cannot host a corruption target")
+
+    async def read_corruption_target(self, attempts: int = 2) -> dict[str, Any]:
+        """Read every page of the corruption target, `attempts` times on fresh connections.
+        Each attempt records either the rows read or the error (`sqlstate`, `message`, and the
+        `block` / `relation_path` the error names)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot read a corruption target")
+
+    async def amcheck_relation(self, relation: str, timeout_s: float) -> dict[str, Any]:
+        """The engine's structural checker on ONE relation. `detected`: True when it reported
+        the relation damaged, False when it ran clean, None when it could not tell."""
+        return {"detected": None, "note": f"{type(self).__name__} has no structural checker"}
+
+    def corruption_log_locations(self, lines: Sequence[str]) -> list[tuple[int, str]]:
+        """(block, relation_path) for every log line in which the engine reported reading a
+        corrupted page. Used to show no OTHER relation was damaged."""
+        return []
+
     async def start_concurrent_index_build(self) -> None:
         """Run an online index build on the harness's own table, for a fault that must land
         mid-build (fault.during: concurrent_index_build). The engine chooses the table, column
