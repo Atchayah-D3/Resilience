@@ -84,11 +84,11 @@ with `pip install -e '.[test]'` on Python 3.11+).
 
 | Owner | Scenarios |
 |---|---|
-| Gowri | NL-C-01, NL-C-03, NL-C-04 (blocked: needs a dedicated pg_wal volume), NL-C-06, NL-M-06, NL-M-07, NL-R-04 |
+| Gowri | NL-C-01, NL-C-03, NL-C-04 (blocked: needs a dedicated pg_wal volume), NL-C-06, NL-M-03, NL-M-06, NL-M-07, NL-R-04 |
 | Teammate (Atchayah) | NL-C-02, NL-C-05, NL-M-05 |
 
 Change another owner's scenario only with that owner (constitution, workflow section).
-Next candidates: NL-M-03 (autovacuum worker killed), NL-N-02 (cgroup CPU throttling, P0).
+Next candidates: NL-N-02 (cgroup CPU throttling, P0) with NL-R-01/02 (shared resource_limit driver).
 
 ## Working rules (summary -- the constitution is authoritative)
 
@@ -125,3 +125,9 @@ Principles I-VII. Feature creation does not create git branches; it writes `spec
   NL-C-03 truncates its bulk tables at cleanup.
 - The harness grants `pg_checkpoint, pg_read_all_stats` to its role; disclosed, not revoked.
 - `vendor/elle/elle-cli.jar` (40 MB) is tracked in git on main.
+- **The target host runs a second PostgreSQL cluster.** Never kill by PID without binding it to
+  our postmaster: NL-M-03's guarded kill checks parent pid (our `postmaster.pid`) and process
+  title in the same command.
+- NL-M-03 keeps `resilience.avac_target` (1M rows, ~40 MB) between runs, seeded once; a run
+  takes ~15-20 min at a 60 s `autovacuum_naptime` (worker wait per cycle up to 2 x naptime + 30 s).
+- `observe_fault_settings` gets `during=` only when the scenario sets one (keeps older fakes valid).

@@ -99,6 +99,31 @@ def process_gone(before: tuple[str, str], after_text: str) -> bool:
     return after is None or after[0] in ("Z", "X") or after[1] != before[1]
 
 
+# Outcome lines of the guarded single-process kill (targeted_kill_command).
+TARGET_KILLED = "KILLED"
+TARGET_GONE = "NOPROC"          # the process exited before the kill: nothing changed
+TARGET_FOREIGN = "PARENT"       # not a child of OUR postmaster (another cluster, or PID reuse)
+TARGET_UNTITLED = "NOTITLE"     # its command line does not carry the expected marker
+
+
+def targeted_kill_command(pid: int, pgdata: str, title_marker: str) -> str:
+    """One POSIX-sh command that SIGKILLs `pid` only if it is still a child of the postmaster
+    named in `pgdata`/postmaster.pid and its command line contains `title_marker`. It prints
+    one status line; after a kill it also prints the postmaster pid and the victim's
+    /proc/<pid>/stat line taken just before the kill (for death confirmation). The checks and
+    the kill are a single round trip: nothing can be observed in one state and acted on in
+    another -- the host may run other clusters, and PIDs are reused."""
+    return (
+        f"T={int(pid)}; PM=$(head -1 {q(pgdata + '/postmaster.pid')}); "
+        f"S=$(cat /proc/$T/stat 2>/dev/null); "
+        f'if [ -z "$S" ]; then echo {TARGET_GONE}; exit 0; fi; '
+        f"PP=$(ps -o ppid= -p $T | tr -d ' '); "
+        f'if [ "$PP" != "$PM" ]; then echo "{TARGET_FOREIGN} $PP $PM"; exit 0; fi; '
+        f"if ! grep -qaF -- {q(title_marker)} /proc/$T/cmdline; then echo {TARGET_UNTITLED}; exit 0; fi; "
+        f'kill -9 $T && echo {TARGET_KILLED} && echo "$PM" && echo "$S"'
+    )
+
+
 def _usec_to_s(value: str) -> float:
     """systemd reports StartLimitIntervalUSec in microseconds, or as 'infinity'."""
     v = value.strip().lower()
@@ -363,7 +388,12 @@ class OsSshProcessDriver(FaultInjector):
         wait lands inside the measured RTO -- a recovery-time budget spent on the harness's
         own untidiness rather than on the database.
 
-        If `arm` prepared the session, it is used as is: the kill is the next command sent."""
+        If `arm` prepared the session, it is used as is: the kill is the next command sent.
+
+        With `kill_target` set (fault.during located one process, e.g. an autovacuum worker),
+        only that process is killed -- see `_kill_target`."""
+        if self.kill_target is not None:
+            return await self._kill_target(node, self.kill_target)
         armed, self._armed = getattr(self, "_armed", None), None
         if armed is None:
             async with RemoteHost(node.ssh) as host:
@@ -374,6 +404,39 @@ class OsSshProcessDriver(FaultInjector):
             return await self._kill_on(host, node, pid, before, pre_armed=True)
         finally:
             await host.close()
+
+    async def _kill_target(self, node: Node, target: Mapping[str, Any]) -> dict[str, Any]:
+        """SIGKILL exactly one process of this instance (NL-M-03: an autovacuum worker). The
+        guarded command refuses anything that is not still a child of our postmaster carrying
+        the expected title; that refusal changed nothing and is reported as such, so the
+        orchestrator may look for the process again. A kill is confirmed from /proc."""
+        pid = int(target["pid"])
+        marker = str(target["title_marker"])
+        async with RemoteHost(node.ssh) as host:
+            result = await host.run(as_root(targeted_kill_command(pid, node.pgdata, marker)),
+                                    timeout_s=SSH_TIMEOUT_S)
+            t0_mono_ns = time.monotonic_ns()
+            lines = result.stdout.strip().splitlines()
+            status = lines[0].split()[0] if lines else ""
+            if status != TARGET_KILLED:
+                raise FaultNotLanded(
+                    f"{node.name}: pid {pid} was not killed ({lines[0] if lines else 'no output'})",
+                    {"changed_nothing": True, "reason": lines[0] if lines else "", "target": dict(target)})
+            postmaster_pid = int(lines[1]) if len(lines) > 1 and lines[1].isdigit() else None
+            before = parse_proc_stat(lines[2] if len(lines) > 2 else "")
+            deadline = time.monotonic() + KILL_CONFIRM_TIMEOUT_S
+            while before is not None and not process_gone(before, await self._proc_stat(host, pid)):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"{node.name}: pid {pid} still alive {KILL_CONFIRM_TIMEOUT_S} s after SIGKILL")
+                await asyncio.sleep(KILL_CONFIRM_POLL_S)
+            confirmed_s = (time.monotonic_ns() - t0_mono_ns) / 1e9
+            postmaster_after = await self._postmaster_pid(host, node)
+        return {"action": f"kill -9 {pid} ({marker}, child of postmaster {postmaster_pid})",
+                "target_pid": pid, "target": dict(target), "postmaster_pid": postmaster_pid,
+                # restart_after_crash: the postmaster resets the instance itself and survives
+                "postmaster_survived": postmaster_after is not None and postmaster_after == postmaster_pid,
+                "t0_mono_ns": t0_mono_ns, "death_confirmed_s": confirmed_s if before is not None else None,
+                "landed": True}
 
     async def _kill_on(self, host: RemoteHost, node: Node, pid: int, before: tuple[str, str], *,
                        pre_armed: bool) -> dict[str, Any]:

@@ -68,6 +68,12 @@ RECOVERY_POLL_S = 1.0
 ABORT_POLL_S = 1.0
 RECOVERY_EXIT_MARGIN_S = 5.0  # leave the recovery loop before its phase timeout fires
 IDLE_TRANSACTION_GRACE_S = 2.0
+# A kill attempt that changed nothing (the targeted process ended first) is retried this many
+# times within one cycle; it never counts as a kill.
+MAX_LANDING_ATTEMPTS = 3
+# Per-cycle evidence of a targeted kill, carried into facts["cycles"].
+CYCLE_KILL_KEYS = ("target_pid", "target", "landed", "death_confirmed_s", "postmaster_pid",
+                   "postmaster_survived", "missed_attempts")
 # Fault detail kept under its own name in facts, where analysis and the report look for it.
 FAULT_FACT_KEY = {"idle_in_transaction": "idle_transaction", "connection_exhaustion": "connection_exhaustion"}
 IDLE_TRANSACTION_MIN_SOAK_S = 30.0
@@ -151,7 +157,8 @@ class TestOrchestrator:
         self.cycle_t0s: list[int] = []          # one T0 per crash cycle (Framework NL-C-05)
         self.cycle_details: list[dict[str, Any]] = []
         self.footprints: list[dict[str, Any]] = []
-        self.redo_at_t0: list[int | None] = []  # WAL left to replay, sampled before each kill
+        self.redo_at_t0: list[int | None] = []
+        self.kills_landed = 0                   # kills confirmed on a targeted process  # WAL left to replay, sampled before each kill
 
     @property
     def ledger(self) -> InjectionLedger:
@@ -355,18 +362,31 @@ class TestOrchestrator:
             self.disclosures.append(
                 f"Harness role {self.node.db.user!r} was granted {', '.join(grants)} on the target; "
                 "the grant persists after the run (it is not revoked at cleanup)")
-        if self.scenario.fault.during in ("large_transaction", "concurrent_index_build"):
+        if self.scenario.fault.during in ("large_transaction", "concurrent_index_build", "autovacuum_worker"):
             self.facts["during_objects"] = await self.adapter.prepare_scenario_objects(self.scenario.fault.during)
         # Read-only: the settings that decide how this fault plays out are recorded, never
         # changed -- a result measured against a configuration the harness chose describes a
         # deployment nobody runs.
-        observed = await self.adapter.observe_fault_settings(self.scenario.fault.type)
+        during_arg = {"during": self.scenario.fault.during} if self.scenario.fault.during else {}
+        observed = await self.adapter.observe_fault_settings(self.scenario.fault.type, **during_arg)
         if observed:
             self.facts["scenario_observed"] = observed
             self.disclosures.append(
                 f"Observed deployment configuration (not modified): "
                 f"{', '.join(f'{k}={v}' for k, v in sorted(observed.items()))}"
             )
+        if self.scenario.fault.during == "autovacuum_worker":
+            off = [k for k in ("autovacuum", "track_counts") if observed.get(k) == "off"]
+            if off:
+                # no worker can ever appear: refuse rather than report a vacuum failure
+                raise PhaseAbort(f"{', '.join(off)} is off in this deployment, so no autovacuum worker can run "
+                                 "(observed, not changed)")
+            options = (self.facts.get("during_objects") or {}).get("table_options")
+            self.disclosures.append(
+                "Each kill of an autovacuum worker is a crash-restart of the whole instance: every "
+                "session is terminated and crash recovery runs."
+                + (f" The harness-owned table it vacuums carries its own storage options {options}, "
+                   "so its vacuum lasts long enough to be killed; no global setting is changed." if options else ""))
         deviations = await self.adapter.config_deviations()
         self.facts["config_deviations"] = deviations
         if deviations:
@@ -483,18 +503,35 @@ class TestOrchestrator:
         redo_sample_mono_ns = time.monotonic_ns()
         redo = await self.adapter.redo_distance_bytes()
 
-        checkpoint_detail, index_task = await self._establish_fault_state()
-        try:
-            detail = await self.injector.inject(self.node)
-        except FaultNotLanded as exc:
-            # the ledger entry stays outstanding: whatever the attempt half-opened is still
-            # undone by cleanup's revert (or the kill switch)
-            if self.scenario.fault.type in FAULT_FACT_KEY:
-                self.facts[FAULT_FACT_KEY[self.scenario.fault.type]] = exc.detail
-            raise PhaseAbort(f"{self.scenario.fault.type} fault did not land: {exc}") from None
-        finally:
-            if index_task is not None and not index_task.done():
-                index_task.cancel()
+        missed: list[dict[str, Any]] = []
+        for attempt in range(1, MAX_LANDING_ATTEMPTS + 1):
+            checkpoint_detail, index_task = await self._establish_fault_state()
+            try:
+                detail = await self.injector.inject(self.node)
+                break
+            except FaultNotLanded as exc:
+                if exc.detail.get("changed_nothing") and attempt < MAX_LANDING_ATTEMPTS:
+                    # nothing was touched (the targeted process ended first): look again; a
+                    # miss is recorded and never counted as a kill
+                    missed.append({"attempt": attempt, "error": str(exc), **exc.detail})
+                    self.stream.emit("injector", "not_landed", cycle=cycle, attempt=attempt, error=str(exc))
+                    continue
+                # the ledger entry stays outstanding: whatever the attempt half-opened is still
+                # undone by cleanup's revert (or the kill switch)
+                if self.scenario.fault.type in FAULT_FACT_KEY:
+                    self.facts[FAULT_FACT_KEY[self.scenario.fault.type]] = exc.detail
+                if missed:
+                    self.facts["missed_attempts"] = missed + [{"attempt": attempt, "error": str(exc), **exc.detail}]
+                raise PhaseAbort(f"{self.scenario.fault.type} fault did not land"
+                                 f"{f' after {attempt} attempts' if missed else ''}: {exc}") from None
+            finally:
+                self.injector.kill_target = None
+                if index_task is not None and not index_task.done():
+                    index_task.cancel()
+        if missed:
+            detail["missed_attempts"] = missed
+        if detail.get("landed"):
+            self.kills_landed += 1
         sampling_delay_ms = round(((detail.get("t0_mono_ns") or time.monotonic_ns()) - redo_sample_mono_ns) / 1e6, 2)
         t0 = detail.pop("t0_mono_ns", None) or time.monotonic_ns()
         self.t0_ns = t0 if self.t0_ns is None else self.t0_ns   # T0 of the run is the first fault
@@ -553,6 +590,18 @@ class TestOrchestrator:
                 await self.adapter.abandon_background_operation()
                 raise PhaseAbort(f"{during} was not in progress at the fault: "
                                  f"{during_detail.get('note', 'not confirmed')}")
+            return {}, None
+        if during == "autovacuum_worker":
+            # Give autovacuum work AFTER the latest recovery, wait for a worker of this instance
+            # to be vacuuming it, and hand the injector exactly that process (it re-checks the
+            # parent and title before killing).
+            during_detail = await self.adapter.start_autovacuum_worker()
+            self.facts["during"] = {"operation": during, **during_detail}
+            self.facts.setdefault("during_attempts", []).append(during_detail)
+            if not during_detail.get("in_progress"):
+                raise PhaseAbort(f"{during} was not in progress at the fault: "
+                                 f"{during_detail.get('note', 'not confirmed')}")
+            self.injector.kill_target = during_detail["kill_target"]
             return {}, None
         return {}, None
 
@@ -781,6 +830,11 @@ class TestOrchestrator:
                     row["redo_sampling_delay_ms"] = self.cycle_details[i].get("redo_sampling_delay_ms")
                     if "quick_integrity" in self.cycle_details[i]:
                         row["quick_integrity"] = self.cycle_details[i]["quick_integrity"]
+                    # a targeted kill (fault.during located one process): which process each
+                    # cycle hit, whether it was confirmed dead, and any attempts that missed
+                    for key in CYCLE_KILL_KEYS:
+                        if key in self.cycle_details[i]:
+                            row[key] = self.cycle_details[i][key]
                 # Partition client-visible errors per cycle window
                 c_start = self.cycle_t0s[i]
                 c_end = self.cycle_t0s[i + 1] if i + 1 < len(self.cycle_t0s) else None
@@ -900,7 +954,7 @@ class TestOrchestrator:
             else:
                 m["elle_anomalies_count"] = elle.anomalies_count
 
-        if self.scenario.fault.during in ("large_transaction", "concurrent_index_build"):
+        if self.scenario.fault.during in ("large_transaction", "concurrent_index_build", "autovacuum_worker"):
             m.update(await self._verify_during_operation())
 
         fault_not_landed: str | None = None
@@ -1049,17 +1103,22 @@ class TestOrchestrator:
         "concurrent_index_build": {"index_left_invalid": "index_left_invalid",
                                    "table_readable": "table_readable",
                                    "rebuild_succeeds": "rebuild_succeeds"},
+        "autovacuum_worker": {"autovacuum_worker_respawned": "autovacuum_worker_respawned",
+                              "relations_eligible": "relations_eligible",
+                              "relations_left_unvacuumed": "relations_left_unvacuumed"},
     }
 
     async def _verify_during_operation(self) -> dict[str, Any]:
-        """What the interrupted operation left behind (Framework §10.2 NL-C-03 / NL-C-06).
+        """What the interrupted operation left behind (Framework §10.2 NL-C-03 / NL-C-06), or
+        whether the process killed came back (Framework §10.7 NL-M-03).
         Any value the engine could not produce is NOT_MEASURED, never a default."""
         during = self.scenario.fault.during
         assert during in self._DURING_MEASURES
         m: dict[str, Any] = {"operation_in_progress_at_fault": bool((self.facts.get("during") or {}).get("in_progress"))}
         await self.adapter.abandon_background_operation()
         verify = {"large_transaction": self.adapter.verify_large_transaction,
-                  "concurrent_index_build": self.adapter.verify_concurrent_index}[during]
+                  "concurrent_index_build": self.adapter.verify_concurrent_index,
+                  "autovacuum_worker": self.adapter.verify_autovacuum_resumed}[during]
         try:
             result = await verify()
             error = None
@@ -1071,7 +1130,10 @@ class TestOrchestrator:
                 m[name] = result[key]
             else:
                 m[name] = NOT_MEASURED
-                self.not_measured[name] = error or f"the engine did not report {key}"
+                self.not_measured[name] = (error or result.get(f"{key}_why")
+                                           or f"the engine did not report {key}")
+        if "kills_landed" in self.scenario.measure:
+            m["kills_landed"] = self.kills_landed
         return m
 
     async def _p_report(self, results: dict[str, Any]) -> dict[str, Any]:
@@ -1087,7 +1149,7 @@ class TestOrchestrator:
         # the run's adapter goes with the revert: faults held inside the database are undone on
         # the connections that hold them, not on a fresh adapter that holds nothing
         reverted = await revert_outstanding(self.profile, self.ledger, run_id=self.run_id, adapter=self.adapter)
-        if self.scenario.fault.during in ("large_transaction", "concurrent_index_build"):
+        if self.scenario.fault.during in ("large_transaction", "concurrent_index_build", "autovacuum_worker"):
             # after the revert: the service is confirmed running, so the objects can be dropped
             try:
                 await self.adapter.abandon_background_operation()

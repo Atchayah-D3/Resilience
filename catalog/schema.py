@@ -134,10 +134,10 @@ class Workload(_Model):
 
 
 # A database state the fault must land inside (Framework §10.2 NL-C-02 "while the checkpointer
-# is active", NL-C-03 "during a 10M-row INSERT", NL-C-06 "mid-build"). The orchestrator
-# establishes the state, confirms it is in progress, then injects; which scenario asked is
-# never consulted -- only this field.
-FaultDuring = Literal["checkpoint", "large_transaction", "concurrent_index_build"]
+# is active", NL-C-03 "during a 10M-row INSERT", NL-C-06 "mid-build"; Framework §10.7 NL-M-03
+# "kill -9 an autovacuum worker"). The orchestrator establishes the state, confirms it is in
+# progress, then injects; which scenario asked is never consulted -- only this field.
+FaultDuring = Literal["checkpoint", "large_transaction", "concurrent_index_build", "autovacuum_worker"]
 
 
 class Fault(_Model):

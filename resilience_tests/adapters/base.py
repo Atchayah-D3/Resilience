@@ -242,10 +242,11 @@ class BaseDatabaseAdapter(ABC):
         """Dead-tuple counters on the churn table, as context for NL-M-05. Default: none."""
         return {}
 
-    async def observe_fault_settings(self, fault_type: str) -> dict[str, str]:
-        """Read -- never write -- the engine settings that decide how `fault_type` plays out
-        (e.g. the idle-in-transaction timeout), so the run can say what it was measured
-        against. Default: nothing to observe."""
+    async def observe_fault_settings(self, fault_type: str, during: str | None = None) -> dict[str, str]:
+        """Read -- never write -- the engine settings that decide how `fault_type` (and the
+        state it lands inside, `during`) plays out -- e.g. the idle-in-transaction timeout,
+        or the autovacuum settings -- so the run can say what it was measured against.
+        Default: nothing to observe."""
         return {}
 
     async def config_deviations(self) -> dict[str, str]:
@@ -288,6 +289,18 @@ class BaseDatabaseAdapter(ABC):
     async def prepare_scenario_objects(self, during: str | None) -> dict[str, Any]:
         """Create what a `during` operation needs (e.g. a table to index), in init, before
         the baseline is measured. Default: nothing."""
+        return {}
+
+    async def start_autovacuum_worker(self) -> dict[str, Any]:
+        """NL-M-03: give autovacuum real work, then wait for one of THIS instance's autovacuum
+        workers to be running and return it as a kill target:
+        {"in_progress": True, "kill_target": {"pid", "parent_pid", "title_marker", ...}}."""
+        return {"in_progress": False, "note": "not implemented by this engine"}
+
+    async def verify_autovacuum_resumed(self) -> dict[str, Any]:
+        """After the final recovery: {"autovacuum_worker_respawned", "relations_eligible",
+        "relations_left_unvacuumed" (None when no relation became eligible), ...}. Evidence
+        must post-date the last crash recovery."""
         return {}
 
     async def start_large_transaction(self) -> dict[str, Any]:

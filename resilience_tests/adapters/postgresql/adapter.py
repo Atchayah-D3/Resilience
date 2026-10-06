@@ -149,6 +149,54 @@ FLOOD_APPLICATION_NAME = "resilience-flood"
 FLOOD_CONNECT_TIMEOUT_S = 3.0
 FLOOD_RECOVERY_TIMEOUT_S = 10.0
 
+# NL-M-03 (Framework §10.7): a harness-owned table whose autovacuum lasts seconds, so a worker
+# can be caught alive and killed. With the deployment's own settings a vacuum of the small
+# churn table ends in milliseconds -- faster than the kill can arrive. These storage options
+# are the harness table's own (a harness object, disclosed), never global configuration:
+# threshold 1,000 dead rows with no scale factor, and a cost delay that paces the vacuum.
+AVAC_TABLE = "resilience.avac_target"
+AVAC_ROWS = 1_000_000
+AVAC_DDL = f"CREATE TABLE IF NOT EXISTS {AVAC_TABLE} (id bigint PRIMARY KEY, v int NOT NULL DEFAULT 0)"
+AVAC_OPTIONS = {"autovacuum_vacuum_threshold": "1000", "autovacuum_vacuum_scale_factor": "0",
+                "autovacuum_vacuum_cost_delay": "20", "autovacuum_vacuum_cost_limit": "200"}
+AVAC_SEED = f"INSERT INTO {AVAC_TABLE} (id) SELECT g FROM generate_series(1, $1) g"
+# a quarter of the rows per round, a different quarter each time: dead tuples on every page
+AVAC_MAKE_DEAD = f"UPDATE {AVAC_TABLE} SET v = v + 1 WHERE id % 4 = $1"
+AVAC_TITLE_MARKER = "autovacuum worker"   # PostgreSQL's process title for the worker
+AVAC_POLL_S = 0.05
+AVAC_WAIT_SLACK_S = 30.0                  # worker wait = 2 x naptime + this
+AVAC_VERIFY_NAPTIMES = 3                  # "permanently" = 3 x naptime + vacuum time (clarified)
+AVAC_VERIFY_SAMPLE_S = 2.0
+AVAC_VERIFY_CAP_S = 900.0                 # half the profiles' validate bound
+# A running autovacuum VACUUM (not ANALYZE-only) of this instance, with the relation it is on.
+AVAC_WORKERS_SQL = """
+SELECT a.pid, a.query, p.phase, p.relid::regclass::text AS relation
+  FROM pg_stat_activity a
+  JOIN pg_stat_progress_vacuum p ON p.pid = a.pid
+ WHERE a.backend_type = 'autovacuum worker'
+"""
+AVAC_ANY_WORKER_SQL = "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'autovacuum worker'"
+# Per relation: dead tuples, the deployment's (or the table's own) vacuum threshold, and
+# whether autovacuum ran after the given database-clock instant.
+AVAC_RELATIONS_SQL = """
+WITH g AS (
+  SELECT current_setting('autovacuum_vacuum_threshold')::float8 AS th,
+         current_setting('autovacuum_vacuum_scale_factor')::float8 AS sf)
+SELECT s.schemaname || '.' || s.relname AS relation,
+       s.n_dead_tup AS dead,
+       coalesce((SELECT split_part(o, '=', 2)::float8 FROM unnest(c.reloptions) o
+                  WHERE o LIKE 'autovacuum_vacuum_threshold=%'), g.th)
+     + coalesce((SELECT split_part(o, '=', 2)::float8 FROM unnest(c.reloptions) o
+                  WHERE o LIKE 'autovacuum_vacuum_scale_factor=%'), g.sf)
+       * greatest(c.reltuples, 0) AS threshold,
+       (s.last_autovacuum IS NOT NULL AND s.last_autovacuum >= $1) AS vacuumed_after
+  FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid, g
+"""
+AVAC_SETTINGS = ("autovacuum", "track_counts", "autovacuum_naptime", "autovacuum_max_workers",
+                 "autovacuum_vacuum_cost_delay", "autovacuum_vacuum_cost_limit",
+                 "autovacuum_vacuum_threshold", "autovacuum_vacuum_scale_factor",
+                 "restart_after_crash", "update_process_title")
+
 DURABILITY_SETTINGS = ["data_checksums", "fsync", "synchronous_commit", "full_page_writes",
                        "wal_sync_method", "server_version"]
 
@@ -449,6 +497,8 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
     async def prepare_scenario_objects(self, during: str | None) -> dict[str, Any]:
         """Objects a `during` operation needs, created in init -- before the baseline, so
         seeding them never disturbs the steady state being measured."""
+        if during == "autovacuum_worker":
+            return await self._prepare_avac_table()
         if during != "concurrent_index_build":
             return {}
         conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
@@ -463,6 +513,105 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                 await conn.execute(CIC_SEED, CIC_ROWS)
                 await conn.execute(f"VACUUM (ANALYZE) {CIC_TABLE}")
             return {"table": CIC_TABLE, "rows": CIC_ROWS, "reseeded": rows != CIC_ROWS}
+        finally:
+            await conn.close()
+
+    async def _prepare_avac_table(self) -> dict[str, Any]:
+        conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
+        try:
+            await conn.execute(AVAC_DDL)
+            opts = ", ".join(f"{k} = {v}" for k, v in AVAC_OPTIONS.items())
+            await conn.execute(f"ALTER TABLE {AVAC_TABLE} SET ({opts})")
+            rows = await conn.fetchval(f"SELECT count(*) FROM {AVAC_TABLE}")
+            if rows != AVAC_ROWS:
+                await conn.execute(f"TRUNCATE {AVAC_TABLE}")
+                await conn.execute(AVAC_SEED, AVAC_ROWS)
+                await conn.execute(f"VACUUM (ANALYZE) {AVAC_TABLE}")
+            self._avac_round = 0
+            return {"table": AVAC_TABLE, "rows": AVAC_ROWS, "reseeded": rows != AVAC_ROWS,
+                    "table_options": dict(AVAC_OPTIONS)}
+        finally:
+            await conn.close()
+
+    async def _naptime_s(self, conn: asyncpg.Connection) -> float:
+        # pg_settings reports seconds; SHOW would say '1min'
+        return float(await conn.fetchval("SELECT setting::float8 FROM pg_settings WHERE name = 'autovacuum_naptime'"))
+
+    async def _make_dead_tuples(self, conn: asyncpg.Connection) -> int:
+        """Dead tuples on the harness table, created AFTER the latest recovery: crash recovery
+        discards the statistics autovacuum uses to choose tables, so earlier ones are unseen."""
+        self._avac_round = (getattr(self, "_avac_round", 0) + 1) % 4
+        status = await conn.execute(AVAC_MAKE_DEAD, self._avac_round)
+        return int(status.split()[-1]) if status.split()[-1].isdigit() else 0
+
+    async def start_autovacuum_worker(self) -> dict[str, Any]:
+        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
+        try:
+            naptime = await self._naptime_s(conn)
+            wait_s = 2 * naptime + AVAC_WAIT_SLACK_S
+            dead = await self._make_dead_tuples(conn)
+            t = time.monotonic()
+            while time.monotonic() - t < wait_s:
+                for row in await conn.fetch(AVAC_WORKERS_SQL):
+                    if row["relation"] == AVAC_TABLE:
+                        query = row["query"] or ""
+                        return {"in_progress": True, "dead_tuples_made": dead, "naptime_s": naptime,
+                                "kill_target": {
+                                    "pid": int(row["pid"]), "title_marker": AVAC_TITLE_MARKER,
+                                    "relation": row["relation"], "phase": row["phase"],
+                                    "wraparound": "to prevent wraparound" in query,
+                                    "observed_after_s": round(time.monotonic() - t, 3)}}
+                await asyncio.sleep(AVAC_POLL_S)
+            return {"in_progress": False, "dead_tuples_made": dead, "naptime_s": naptime,
+                    "note": f"no autovacuum worker vacuumed {AVAC_TABLE} within {wait_s:.0f} s "
+                            f"(2 x autovacuum_naptime {naptime:.0f} s + {AVAC_WAIT_SLACK_S:.0f} s)"}
+        finally:
+            await conn.close()
+
+    async def verify_autovacuum_resumed(self) -> dict[str, Any]:
+        """After the final recovery (research R6). Crash recovery reset the statistics, so a
+        last-autovacuum time at or after `t_recovered` can only come from a vacuum after the
+        last kill. Fresh dead tuples on the harness table guarantee at least one relation is
+        eligible; a run where none became eligible reports None, never 0."""
+        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
+        try:
+            naptime = await self._naptime_s(conn)
+            bound_s = AVAC_VERIFY_NAPTIMES * naptime
+            t_recovered = await conn.fetchval("SELECT now()")
+            dead = await self._make_dead_tuples(conn)
+            eligible: dict[str, dict[str, Any]] = {}
+            vacuumed: set[str] = set()
+            respawned = False
+            t = time.monotonic()
+            while True:
+                if int(await conn.fetchval(AVAC_ANY_WORKER_SQL)) > 0:
+                    respawned = True
+                for r in await conn.fetch(AVAC_RELATIONS_SQL, t_recovered):
+                    rel = r["relation"]
+                    if r["dead"] > r["threshold"] and rel not in eligible:
+                        eligible[rel] = {"dead": int(r["dead"]), "threshold": float(r["threshold"]),
+                                         "eligible_after_s": round(time.monotonic() - t, 1)}
+                    if r["vacuumed_after"]:
+                        vacuumed.add(rel)
+                elapsed = time.monotonic() - t
+                pending = set(eligible) - vacuumed
+                if AVAC_TABLE in eligible and not pending and respawned:
+                    # everything proven, including the table the harness itself made eligible
+                    # after the last recovery (its statistics can lag the update by a second)
+                    break
+                busy = any(row["relation"] in pending for row in await conn.fetch(AVAC_WORKERS_SQL))
+                if elapsed >= AVAC_VERIFY_CAP_S or (elapsed >= bound_s and not busy):
+                    break                                   # bound reached, nothing still vacuuming
+                await asyncio.sleep(AVAC_VERIFY_SAMPLE_S)
+            unvacuumed = sorted(set(eligible) - vacuumed)
+            return {"autovacuum_worker_respawned": respawned,
+                    "relations_eligible": len(eligible),
+                    "relations_left_unvacuumed": len(unvacuumed) if eligible else None,
+                    "relations_left_unvacuumed_why": None if eligible else (
+                        "no relation became eligible for autovacuum during verification"),
+                    "unvacuumed": unvacuumed, "eligible": eligible,
+                    "bound_s": bound_s, "waited_s": round(time.monotonic() - t, 1),
+                    "t_recovered": str(t_recovered), "dead_tuples_made": dead}
         finally:
             await conn.close()
 
@@ -622,7 +771,10 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
             # TRUNCATE gives back the aborted bulk rows' space now, not at the next autovacuum
             await conn.execute("TRUNCATE resilience.bulk_child, resilience.bulk_parent")
-            return {"dropped_index": CIC_INDEX_QUALIFIED, "truncated": ["resilience.bulk_child", "resilience.bulk_parent"]}
+            # NL-M-03's table is kept (as NL-C-06's is): reseeding 1M rows right before the next
+            # baseline would put a checkpoint's spread writes inside the measurement window
+            return {"dropped_index": CIC_INDEX_QUALIFIED,
+                    "truncated": ["resilience.bulk_child", "resilience.bulk_parent"]}
         finally:
             await conn.close()
 
@@ -1336,9 +1488,18 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             "output": text[-2000:],
         }
 
-    async def observe_fault_settings(self, fault_type: str) -> dict[str, str]:
-        """SHOW only -- nothing is written. For the idle-in-transaction fault the deciding
-        setting is the server's own timeout."""
+    async def observe_fault_settings(self, fault_type: str, during: str | None = None) -> dict[str, str]:
+        """Read only -- nothing is written. For the idle-in-transaction fault the deciding
+        setting is the server's own timeout; for a kill that must land on an autovacuum
+        worker, the autovacuum settings (NL-M-03)."""
+        if during == "autovacuum_worker":
+            conn = await self._connect(timeout_s=10.0)
+            try:
+                rows = await conn.fetch("SELECT name, setting || coalesce(unit, '') AS v FROM pg_settings "
+                                        "WHERE name = ANY($1::text[])", list(AVAC_SETTINGS))
+                return {r["name"]: r["v"] for r in rows}
+            finally:
+                await conn.close()
         if fault_type != "idle_in_transaction":
             return {}
         conn = await self._connect(timeout_s=10.0)

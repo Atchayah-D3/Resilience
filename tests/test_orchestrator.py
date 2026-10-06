@@ -45,6 +45,7 @@ class Engine:
     # what the interrupted `during` operation leaves behind after the fake crash
     during_in_progress = True
     after_during: dict[str, Any] = {}
+    targeted_misses = 0     # NL-M-03: upcoming targeted kills that find the worker already gone
 
 
 class OutageSession(DatabaseSession):
@@ -110,6 +111,16 @@ class OutageAdapter(FakeAdapter):
 
     async def verify_concurrent_index(self):
         return {"index_left_invalid": True, "table_readable": True, "rebuild_succeeds": True, **Engine.after_during}
+
+    async def start_autovacuum_worker(self):
+        if not Engine.during_in_progress:
+            return {"in_progress": False, "note": "no autovacuum worker vacuumed the table within 150 s"}
+        return {"in_progress": True, "kill_target": {"pid": 9001, "title_marker": "autovacuum worker",
+                                                     "relation": "resilience.avac_target"}}
+
+    async def verify_autovacuum_resumed(self):
+        return {"autovacuum_worker_respawned": True, "relations_eligible": 2,
+                "relations_left_unvacuumed": 0, **Engine.after_during}
 
     async def session(self, endpoint=None, timeout_s: float = 5.0) -> DatabaseSession:
         if Engine.down:
@@ -219,6 +230,9 @@ class FakeFault(FaultInjector):
             if not detail.get("supported"):
                 raise FaultNotLanded(f"idle session not established: {detail.get('error')}", detail)
             return detail | {"action": "idle_in_transaction", "t0_mono_ns": time.monotonic_ns()}
+        if self.fault_type == "process_kill" and self.kill_target is not None and Engine.targeted_misses:
+            Engine.targeted_misses -= 1      # the worker ended first: nothing was touched
+            raise FaultNotLanded("pid 9001 was not killed (NOPROC)", {"changed_nothing": True, "reason": "NOPROC"})
         if self.fault_type == "process_kill" and self.lands:
             Engine.down = True
             asyncio.get_running_loop().call_later(OUTAGE_S, lambda: setattr(Engine, "down", False))
@@ -233,6 +247,9 @@ class FakeFault(FaultInjector):
                 "superuser_slot_honoured": True,
                 "connections_recover_after_release": True,
             }
+        if self.kill_target is not None:
+            return {"action": "kill -9 9001", "target_pid": 9001, "landed": self.lands,
+                    "t0_mono_ns": time.monotonic_ns()}
         return {"action": self.fault_type}
 
     async def confirm(self, node, detail):
@@ -250,7 +267,7 @@ class FakeFault(FaultInjector):
 def env(tmp_path, monkeypatch):
     Engine.down, FakeFault.lands, FakeFault.reverts = False, True, []
     Engine.store, Engine.churn_ops, Engine.lists = set(), 0, {}
-    Engine.during_in_progress, Engine.after_during = True, {}
+    Engine.during_in_progress, Engine.after_during, Engine.targeted_misses = True, {}, 0
     # The recovery loop must outlast the fake outage, or nothing ever records service
     # returning -- which the harness correctly refuses to score, and which then reads as a
     # flaky test rather than as the timing mistake it is.
@@ -412,6 +429,91 @@ def test_nlc06_index_found_valid_means_the_kill_missed(env):
     results = run(env, "NL-C-06")
     assert results["status"] == "failed", why(results)
     assert outcomes(results)["index_left_invalid == true"] == "fail"
+
+
+def run_nlm03(profile):
+    """NL-M-03 with its five cycles, settling 0.1 s instead of 10 s between them."""
+    sc = scenario("NL-M-03")
+    sc = sc.model_copy(update={"repeat": sc.repeat.model_copy(update={"interval_s": 0.1})})
+    item = RunPlanItem(scenario=sc, env_class=profile.env_class, role="standalone", node=profile.nodes[0])
+    return asyncio.run(TestOrchestrator(item, profile, RunOptions()).run())
+
+
+def failing(results):
+    return {p for p, o in outcomes(results).items() if o != "pass"}
+
+
+def test_autovacuum_kill_nlm03_passes_verdict(env):
+    results = run_nlm03(env)
+    assert results["status"] == "passed", why(results)
+    m = results["measured"]
+    assert m["kills_landed"] == 5 and m["cycles_recovered"] == m["cycles_run"] == 5
+    assert m["autovacuum_worker_respawned"] is True and m["relations_left_unvacuumed"] == 0
+    assert all(c["target_pid"] == 9001 for c in results["facts"]["cycles"])
+
+
+def test_nlm03_unvacuumed_relation_fails(env):
+    Engine.after_during = {"relations_left_unvacuumed": 1, "unvacuumed": ["resilience.churn"]}
+    results = run_nlm03(env)
+    assert results["status"] == "failed", why(results)
+    assert failing(results) == {"relations_left_unvacuumed == 0"}, why(results)
+
+
+def test_nlm03_no_respawn_fails(env):
+    Engine.after_during = {"autovacuum_worker_respawned": False}
+    results = run_nlm03(env)
+    assert failing(results) == {"autovacuum_worker_respawned == true"}, why(results)
+
+
+def test_nlm03_zero_eligible_is_not_measured(env):
+    """A vacuous '0 of 0 relations left unvacuumed' must not pass."""
+    Engine.after_during = {"relations_eligible": 0, "relations_left_unvacuumed": None,
+                           "relations_left_unvacuumed_why": "no relation became eligible for autovacuum during verification"}
+    results = run_nlm03(env)
+    assert outcomes(results)["relations_left_unvacuumed == 0"] == "not_measured", why(results)
+    assert "no relation became eligible" in results["facts"]["not_measured"]["relations_left_unvacuumed"]
+
+
+def test_nlm03_lost_commit_fails(env, monkeypatch):
+    async def lose_one(self):
+        ids = set(Engine.store)
+        ids.discard(next(iter(ids)))       # an acknowledged marker missing after recovery
+        return ids
+    monkeypatch.setattr(OutageAdapter, "marker_ids", lose_one)
+    results = run_nlm03(env)
+    assert "rpo_txn == 0" in failing(results), why(results)
+
+
+def test_nlm03_corruption_fails(env, monkeypatch):
+    async def corrupt(self, timeout_s):
+        return IntegrityResult(structural_errors=1, checksum_failures=0)
+    monkeypatch.setattr(OutageAdapter, "integrity_check", corrupt)
+    results = run_nlm03(env)
+    assert failing(results) == {"corruption_count == 0", "structural_integrity_errors == 0"}, why(results)
+
+
+def test_nlm03_no_worker_aborts(env):
+    Engine.during_in_progress = False
+    results = run_nlm03(env)
+    assert results["status"] == "aborted", why(results)
+    assert "no autovacuum worker" in results["error"]
+    assert results["timing"]["t0_mono_ns"] is None          # nothing was killed
+
+
+def test_nlm03_miss_is_retried_not_counted(env):
+    Engine.targeted_misses = 2           # first cycle: two misses, then a kill lands
+    results = run_nlm03(env)
+    assert results["status"] == "passed", why(results)
+    assert results["measured"]["kills_landed"] == 5          # misses never counted
+    assert len(results["facts"]["cycles"][0]["missed_attempts"]) == 2
+
+
+def test_nlm03_three_misses_abort(env):
+    Engine.targeted_misses = 3
+    results = run_nlm03(env)
+    assert results["status"] == "aborted", why(results)
+    assert "after 3 attempts" in results["error"]
+    assert len(results["facts"]["missed_attempts"]) == 3
 
 
 def test_kill_that_interrupted_nothing_cannot_pass(env):

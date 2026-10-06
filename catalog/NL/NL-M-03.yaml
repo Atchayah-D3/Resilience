@@ -1,0 +1,109 @@
+# NL-M-03 -- Autovacuum worker killed (Framework §10.7, Tier 1, P1).
+# Fault injection: kill -9 an autovacuum worker repeatedly. Acceptance: a new worker spawns;
+# no relation is left permanently unvacuumed.
+#
+# Spec: specs/001-nl-m-03-autovacuum-kill/ (spec, plan, research, contracts).
+#
+# Each cycle the harness gives autovacuum work on its own table (fault.during:
+# autovacuum_worker), waits for a worker of THIS instance to be vacuuming it, and kills exactly
+# that process -- after re-checking, in the same command, that it is still a child of our
+# postmaster and carries the autovacuum-worker title (the lab host runs a second cluster). A
+# worker that ended before the kill arrived changed nothing; it is retried, never counted.
+#
+# Killing any child of the postmaster is a crash-restart of the whole instance: every session
+# is terminated and crash recovery runs. So each kill is also scored as a crash (Framework
+# §10.2): no acknowledged transaction lost, recovery unattended.
+#
+# "Permanently" (clarified 2026-10-06) = 3 x the deployment's observed autovacuum_naptime, plus
+# the time a vacuum still in progress takes. Crash recovery resets the statistics, so a
+# last-autovacuum time after the final recovery can only come from a vacuum after the last
+# kill. The harness creates fresh dead tuples first, so at least one relation is eligible; if
+# none ever is, relations_left_unvacuumed is NOT_MEASURED -- never a vacuous 0. Covers the
+# harness database (pg_stat_user_tables is per database).
+#
+# Configuration is observed, never written. The harness table (resilience.avac_target) carries
+# its own storage options so its vacuum lasts seconds -- long enough to be killed.
+#
+# NEEDS SIGN-OFF: 5 kills ("repeatedly" has no count in the Framework; clarified 2026-10-06);
+# steady-state and workload numbers match NL-C-05. Expected run length ~15-20 min at a 60 s
+# naptime (the worker wait per cycle is up to 2 x naptime + 30 s).
+id: NL-M-03
+name: Autovacuum worker killed
+tier: node_local
+category: NL-M
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-M is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 150                   # floor, not a target: the load offered is 200/s
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: mixed                 # markers (for RPO) plus update/delete churn (dead rows)
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 200
+
+fault:
+  type: process_kill
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+  during: autovacuum_worker      # Framework §10.7: "kill -9 an autovacuum worker"
+
+repeat:
+  cycles: 5                      # "repeatedly" -- NEEDS SIGN-OFF (clarified 2026-10-06)
+  interval_s: 10                 # settle after each recovery before giving autovacuum new work
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:                        # engine capabilities this scenario needs (Arch §8)
+  - transactional_markers
+  - workload_churn
+  - structural_integrity_check
+
+measure:
+  - kills_landed                    # kills confirmed on a live autovacuum worker of this instance
+  - cycles_run
+  - cycles_recovered
+  - autovacuum_worker_respawned     # a worker seen after the final recovery
+  - relations_eligible              # reported: relations that crossed their vacuum threshold
+  - relations_left_unvacuumed       # eligible relations with no autovacuum after the last kill
+  - operation_in_progress_at_fault
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - starts_unattended
+  - corruption_count
+  - structural_integrity_errors     # engine-neutral name; 'amcheck_errors' is the same value
+
+accept:
+  - kills_landed == 5                    # Framework §10.7 "repeatedly" (5: NEEDS SIGN-OFF)
+  - cycles_recovered == cycles_run       # every crash-restart came back on its own
+  - autovacuum_worker_respawned == true  # Framework §10.7: a new worker spawns
+  - relations_left_unvacuumed == 0       # Framework §10.7: no relation left permanently unvacuumed
+  - rpo_txn == 0                         # Framework §10.2: each kill is a crash
+  - starts_unattended == true            # Framework §10.2
+  - corruption_count == 0                # Framework §16.3
+  - structural_integrity_errors == 0     # Framework §16.3: pg_amcheck clean after every scenario
+
+priority: P1
+
+description: >
+  An autovacuum worker confirmed to be vacuuming is killed with SIGKILL five times under
+  marker-instrumented write load; each kill crash-restarts the instance. Afterwards a new
+  autovacuum worker must appear and every relation that crossed its vacuum threshold must be
+  vacuumed again within three autovacuum naptimes, with no acknowledged transaction lost and
+  no corruption.
+
+see_also: [NL-C-05]

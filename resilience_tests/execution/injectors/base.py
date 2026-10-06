@@ -54,6 +54,10 @@ class FaultInjector(ABC):
         # the scenario's fault.duration in seconds, for faults that are held and then released
         # (None for a permanent fault)
         self.duration_s: float | None = None
+        # A single process the fault must hit instead of the whole service, found by the
+        # adapter: {"pid", "parent_pid", "title_marker"}. Generic -- the driver re-checks
+        # parent and title before acting. Set per attempt by the orchestrator, cleared after.
+        self.kill_target: Mapping[str, Any] | None = None
 
     async def confirm(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
         """After recovery: independent evidence that the fault took effect, beyond the

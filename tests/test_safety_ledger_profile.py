@@ -248,7 +248,18 @@ def test_every_fault_type_can_be_injected_and_reverted(monkeypatch):
     assert any("systemctl kill -s SIGKILL" in c for c in calls)   # Arch §5: the unit's cgroup
     assert any("systemctl restart" in c for c in calls)
     assert any("pg_reload_conf" in c for c in calls)
+
     assert "flood held 0.01s" in calls and "flood terminated" in calls
+    # targeted process_kill (fault.during: autovacuum_worker): one guarded command, never the
+    # whole service; a guard that reports nothing killed is a fault that did not land
+    from resilience_tests.execution.injectors.base import FaultNotLanded
+    calls.clear()
+    injector = process_mod.OsSshProcessDriver(PROFILE, "process_kill")
+    injector.kill_target = {"pid": 4242, "title_marker": "autovacuum worker"}
+    with pytest.raises(FaultNotLanded):
+        asyncio.run(injector.inject(NODE))
+    assert any("kill -9" in c and "T=4242" in c for c in calls)
+    assert not any("systemctl kill" in c for c in calls)
 
 
 def test_matrix_expands_every_scenario_once_on_the_reference_class():
