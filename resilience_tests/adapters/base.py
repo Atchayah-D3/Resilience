@@ -321,6 +321,13 @@ class BaseDatabaseAdapter(ABC):
         the baseline is measured. Default: nothing."""
         return {}
 
+    async def change_pages_before_checkpoint(self) -> dict[str, Any]:
+        """Leave a known amount of changed-but-unwritten data in memory right before the
+        checkpoint of `during: checkpoint`, so the checkpoint lasts long enough for the kill to
+        land inside it. Default: not supported -- the run proceeds without it and the
+        after-the-fact proof still decides whether the kill landed in time."""
+        return {"supported": False}
+
     async def start_large_transaction(self) -> dict[str, Any]:
         """Begin the large uncommitted transaction of NL-C-03 (Framework §10.2: a 10M-row
         INSERT) and return once it has demonstrably written part of its rows."""

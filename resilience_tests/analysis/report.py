@@ -94,6 +94,11 @@ def render_summary(r: dict[str, Any]) -> str:
             event_desc = "none (checkpointer running, not waiting)"
 
         verification = (r.get("facts") or {}).get("checkpoint_verification") or {}
+        changed = (r.get("facts") or {}).get("checkpoint_pages_changed") or {}
+        if changed.get("supported"):
+            lines += ["", f"data changed just before the checkpoint: {changed.get('rows_updated')} rows of "
+                          f"{changed.get('table')} ({(changed.get('table_bytes') or 0) / 1024**2:.1f} MB) "
+                          f"in {changed.get('update_s')} s"]
         lines += [
             "",
             "checkpoint fault injection (NL-C-02):",

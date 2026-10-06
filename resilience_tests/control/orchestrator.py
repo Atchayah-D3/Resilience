@@ -360,7 +360,7 @@ class TestOrchestrator:
             self.disclosures.append(
                 f"Harness role {self.node.db.user!r} was granted {', '.join(grants)} on the target; "
                 "the grant persists after the run (it is not revoked at cleanup)")
-        if self.scenario.fault.during in ("large_transaction", "concurrent_index_build"):
+        if self.scenario.fault.during in ("checkpoint", "large_transaction", "concurrent_index_build"):
             self.facts["during_objects"] = await self.adapter.prepare_scenario_objects(self.scenario.fault.during)
         # Read-only: the settings that decide how this fault plays out are recorded, never
         # changed -- a result measured against a configuration the harness chose describes a
@@ -538,6 +538,18 @@ class TestOrchestrator:
             # starts, so once the checkpointer is seen working the kill is a single command.
             # Whether it actually landed in time is proven after recovery (validate).
             await self.injector.arm(self.node)
+            try:
+                # Give the checkpoint a known amount of data to write, so it is still running
+                # when the kill arrives rather than finishing in the gap before it.
+                changed = await self.adapter.change_pages_before_checkpoint()
+            except Exception as exc:
+                await self.injector.disarm()
+                raise PhaseAbort(f"could not prepare data for the checkpoint to write: "
+                                 f"{type(exc).__name__}: {exc}") from None
+            except BaseException:
+                await self.injector.disarm()
+                raise
+            self.facts["checkpoint_pages_changed"] = changed
             try:
                 checkpoint_detail = await self.adapter.trigger_checkpoint_and_await_active()
             except Exception as exc:

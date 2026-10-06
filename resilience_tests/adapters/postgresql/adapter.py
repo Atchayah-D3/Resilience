@@ -130,6 +130,22 @@ CIC_INDEX = "cic_nlc06_idx"               # created in the table's schema
 CIC_INDEX_QUALIFIED = f"resilience.{CIC_INDEX}"
 CIC_ROWS = 2_000_000
 CIC_CONFIRM_TIMEOUT_S = 30.0
+# fault.during: checkpoint (NL-C-02). The harness's own CHECKPOINT runs at full speed; with
+# little changed data it can complete before the kill arrives, and the run is then aborted
+# because it tested an ordinary crash. Just before the CHECKPOINT the harness updates every
+# row of this harness-owned table, so the checkpoint has a known amount of data to write.
+# Sized from the server's shared_buffers so the changed pages stay in memory and are written
+# by the checkpoint itself. fillfactor 50 and no index keep each update on its own page, so
+# the table is rewritten in place on every run rather than growing.
+CKPT_TABLE = "resilience.checkpoint_ballast"
+CKPT_FRACTION_OF_SHARED_BUFFERS = 0.25
+CKPT_BYTES_PER_ROW = 500               # a ~250-byte row on a half-filled page
+CKPT_DDL = (f"CREATE TABLE IF NOT EXISTS {CKPT_TABLE} (id bigint NOT NULL, v bigint NOT NULL DEFAULT 0, "
+            "pad text NOT NULL) WITH (fillfactor = 50)")
+CKPT_SEED = f"INSERT INTO {CKPT_TABLE} (id, pad) SELECT g, repeat('b', 200) FROM generate_series(1, $1) g"
+SHARED_BUFFERS_BYTES_SQL = ("SELECT setting::bigint * current_setting('block_size')::bigint "
+                            "FROM pg_settings WHERE name = 'shared_buffers'")
+
 CIC_DDL = f"CREATE TABLE IF NOT EXISTS {CIC_TABLE} (id bigint NOT NULL, k text NOT NULL)"
 CIC_SEED = f"INSERT INTO {CIC_TABLE} (id, k) SELECT g, md5(g::text) FROM generate_series(1, $1) g"
 CIC_BUILD = f"CREATE INDEX CONCURRENTLY {CIC_INDEX} ON {CIC_TABLE} (k)"
@@ -540,6 +556,8 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
     async def prepare_scenario_objects(self, during: str | None) -> dict[str, Any]:
         """Objects a `during` operation needs, created in init -- before the baseline, so
         seeding them never disturbs the steady state being measured."""
+        if during == "checkpoint":
+            return await self._prepare_checkpoint_table()
         if during != "concurrent_index_build":
             return {}
         conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
@@ -556,6 +574,41 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             return {"table": CIC_TABLE, "rows": CIC_ROWS, "reseeded": rows != CIC_ROWS}
         finally:
             await conn.close()
+
+    async def _prepare_checkpoint_table(self) -> dict[str, Any]:
+        """Create the checkpoint table, sized to a fraction of this server's shared_buffers.
+        An existing table of the right size is reused; otherwise it is reseeded."""
+        conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
+        try:
+            shared = int(await conn.fetchval(SHARED_BUFFERS_BYTES_SQL))
+            target_bytes = int(shared * CKPT_FRACTION_OF_SHARED_BUFFERS)
+            rows = max(1, target_bytes // CKPT_BYTES_PER_ROW)
+            await conn.execute(CKPT_DDL)
+            have = int(await conn.fetchval(f"SELECT count(*) FROM {CKPT_TABLE}"))
+            if have != rows:
+                await conn.execute(f"TRUNCATE {CKPT_TABLE}")
+                await conn.execute(CKPT_SEED, rows)
+                await conn.execute(f"VACUUM (ANALYZE) {CKPT_TABLE}")
+            size = int(await conn.fetchval(f"SELECT pg_relation_size('{CKPT_TABLE}')"))
+            return {"table": CKPT_TABLE, "rows": rows, "reseeded": have != rows,
+                    "table_bytes": size, "shared_buffers_bytes": shared}
+        finally:
+            await conn.close()
+
+    async def change_pages_before_checkpoint(self) -> dict[str, Any]:
+        """Update every row of the checkpoint table, so its pages are changed in memory and
+        not yet on disk: the CHECKPOINT that follows has to write all of them."""
+        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
+        try:
+            started = time.monotonic()
+            status = await conn.execute(f"UPDATE {CKPT_TABLE} SET v = v + 1")
+            elapsed = time.monotonic() - started
+            size = int(await conn.fetchval(f"SELECT pg_relation_size('{CKPT_TABLE}')"))
+        finally:
+            await conn.close()
+        updated = int(status.split()[-1]) if status and status.split()[-1].isdigit() else None
+        return {"supported": True, "table": CKPT_TABLE, "rows_updated": updated,
+                "table_bytes": size, "update_s": round(elapsed, 3)}
 
     async def _start_background(self, statements: list[tuple[str, tuple[Any, ...]]],
                                 in_transaction: bool) -> int:
