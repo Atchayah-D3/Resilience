@@ -59,11 +59,14 @@ measure:
   - rto_first_write_s
   - corruption_count
   - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
+  - fault_confirmed              # a fresh session reports the reloaded value
 
 accept:
   - failed_transactions == 0     # Framework §10.7: zero failed transactions
   - dropped_connections == 0     # Framework §10.7: zero dropped connections
   - rpo_txn == 0
+  - fault_confirmed == true      # the changed parameter actually took effect
+  - structural_integrity_errors == 0 # Framework §16.3: pg_amcheck clean after every scenario
 
 priority: P1
 

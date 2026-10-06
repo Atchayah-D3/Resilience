@@ -58,10 +58,13 @@ measure:
   - corruption_count
   - structural_integrity_errors  # engine-neutral name; 'amcheck_errors' is the same value
   - starts_unattended
+  - fault_confirmed              # the postmaster after recovery is a new process
 
 accept:
   - rpo_txn == 0
   - rto_first_write_s <= 5       # Framework §10.7: availability gap <= 5 s per node
+  - fault_confirmed == true      # the restart really happened, not merely was requested
+  - structural_integrity_errors == 0 # Framework §16.3: pg_amcheck clean after every scenario
 
 priority: P1
 

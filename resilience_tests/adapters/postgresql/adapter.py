@@ -20,6 +20,7 @@ from resilience_tests.adapters.base import (
     Capability,
     DatabaseSession,
     IntegrityResult,
+    MicroOp,
     TransactionOutcome,
     register_adapter,
 )
@@ -52,6 +53,22 @@ CREATE TABLE IF NOT EXISTS resilience.churn (
     autovacuum_vacuum_cost_delay = 0
 );
 CREATE INDEX IF NOT EXISTS churn_v_idx ON resilience.churn (v);
+-- Elle's list-append objects (Arch §10.3): one row per list, the list held as an array so an
+-- append is a single upsert and a read returns the whole list in commit order.
+CREATE TABLE IF NOT EXISTS resilience.elle_lists (
+    k bigint PRIMARY KEY,
+    v bigint[] NOT NULL
+);
+-- NL-C-03: the large transaction inserts one parent and millions of children referencing it,
+-- so after recovery "no partial rows" and "FK invariants hold" are both checkable.
+CREATE TABLE IF NOT EXISTS resilience.bulk_parent (
+    id bigint PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS resilience.bulk_child (
+    id        bigint NOT NULL,
+    parent_id bigint NOT NULL REFERENCES resilience.bulk_parent (id),
+    payload   text NOT NULL
+);
 """
 
 # Rows held live in the churn table -- CALIBRATED, not chosen. The fault phase is only ~10,000
@@ -83,7 +100,54 @@ CHURN_PAYLOAD = "y" * 180
 INSERT_MARKER = "INSERT INTO resilience.markers(uuid, seq, ts) VALUES ($1, $2, clock_timestamp())"
 SELECT_MARKERS = "SELECT uuid::text FROM resilience.markers"
 PROBE_WRITE = "INSERT INTO resilience.probe_writes DEFAULT VALUES"
-TRUNCATE = "TRUNCATE resilience.markers, resilience.probe_writes, resilience.churn"
+TRUNCATE = ("TRUNCATE resilience.markers, resilience.probe_writes, resilience.churn, "
+            "resilience.elle_lists, resilience.bulk_child, resilience.bulk_parent")
+
+# Elle list-append micro-operations (Arch §10.3). Run at SERIALIZABLE, the level Elle is told
+# to check: PostgreSQL's REPEATABLE READ permits G2 (write skew) by design, so checking a
+# weaker level against a serializable model would report the documented behaviour as a bug.
+ELLE_ISOLATION = "serializable"
+ELLE_READ = "SELECT v FROM resilience.elle_lists WHERE k = $1"
+ELLE_APPEND = ("INSERT INTO resilience.elle_lists AS l (k, v) VALUES ($1, ARRAY[$2::bigint]) "
+               "ON CONFLICT (k) DO UPDATE SET v = l.v || $2::bigint")
+
+# NL-C-03 (Framework §10.2): "kill -9 during a 10M-row INSERT". The kill is sent once the
+# child table has demonstrably grown by BULK_IN_FLIGHT_BYTES inside the open transaction --
+# far enough in that partial rows exist on disk, far from the end so the INSERT cannot finish
+# first. Whether it did is checked after recovery anyway: a committed transaction would leave
+# rows visible and fail the scenario.
+BULK_ROWS = 10_000_000
+BULK_PARENT_ID = 1
+BULK_IN_FLIGHT_BYTES = 64 * 1024 * 1024
+BULK_CONFIRM_TIMEOUT_S = 60.0
+BULK_INSERT = ("INSERT INTO resilience.bulk_child (id, parent_id, payload) "
+               "SELECT g, $1, 'nl-c-03' FROM generate_series(1, $2) g")
+
+# NL-C-06: the index is built on its own table, large enough that the build is still running
+# when the kill lands, and never on a table other scenarios write to.
+CIC_TABLE = "resilience.cic_target"
+CIC_INDEX = "cic_nlc06_idx"               # created in the table's schema
+CIC_INDEX_QUALIFIED = f"resilience.{CIC_INDEX}"
+CIC_ROWS = 2_000_000
+CIC_CONFIRM_TIMEOUT_S = 30.0
+CIC_DDL = f"CREATE TABLE IF NOT EXISTS {CIC_TABLE} (id bigint NOT NULL, k text NOT NULL)"
+CIC_SEED = f"INSERT INTO {CIC_TABLE} (id, k) SELECT g, md5(g::text) FROM generate_series(1, $1) g"
+CIC_BUILD = f"CREATE INDEX CONCURRENTLY {CIC_INDEX} ON {CIC_TABLE} (k)"
+CIC_INDEX_STATE = """
+SELECT i.indisvalid, i.indisready
+  FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'resilience' AND c.relname = $1
+"""
+# A previous version of NL-C-06 built its index on resilience.markers; removed if still there.
+LEGACY_CIC_INDEX = "resilience.idx_nlc06_concurrent"
+
+# NL-R-04: flood sessions carry this application_name, so a revert -- even from a kill switch
+# in another process -- can find and terminate exactly them and nothing else.
+FLOOD_APPLICATION_NAME = "resilience-flood"
+FLOOD_CONNECT_TIMEOUT_S = 3.0
+FLOOD_RECOVERY_TIMEOUT_S = 10.0
 
 DURABILITY_SETTINGS = ["data_checksums", "fsync", "synchronous_commit", "full_page_writes",
                        "wal_sync_method", "server_version"]
@@ -91,6 +155,9 @@ DURABILITY_SETTINGS = ["data_checksums", "fsync", "synchronous_commit", "full_pa
 # Errors where the server said the transaction did not happen. Everything else -- timeout,
 # reset, killed server -- is UNKNOWN (Arch §7.1).
 _DEFINITE_ABORT = (asyncpg.exceptions.IntegrityConstraintViolationError, asyncpg.exceptions.SerializationError)
+# A serializable list-append transaction can also be chosen as a deadlock victim; the server
+# rolled it back and said so, which is a definite abort (:fail), not an unknown outcome.
+_LIST_APPEND_ABORT = _DEFINITE_ABORT + (asyncpg.exceptions.DeadlockDetectedError,)
 _CONNECTION_ERRORS = (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError)
 
 # pg_amcheck reports one header line per corrupt object, then indented detail.
@@ -142,8 +209,6 @@ REDO_DISTANCE_SQL = ("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), redo_lsn)::bi
 # NL-M-05: the injected idle session carries this application_name, so it -- and only it --
 # can be found and ended again, by cleanup or by the kill switch after a harness crash.
 IDLE_SESSION_APPLICATION_NAME = "resilience-harness-idle"
-# fault.during: concurrent_index_build -- the index whose online build the fault interrupts
-CONCURRENT_INDEX_NAME = "idx_nlc06_concurrent"
 TERMINATE_IDLE_SESSIONS_SQL = ("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
                                "WHERE application_name = $1 AND pid <> pg_backend_pid()")
 IDLE_CONFIRM_TIMEOUT_S = 5.0
@@ -259,6 +324,25 @@ class PostgreSQLSession(DatabaseSession):
             return TransactionOutcome.UNKNOWN
         return TransactionOutcome.COMMITTED
 
+    async def commit_marker_list_append(self, seq: int, marker_id: str, read_key: int,
+                                        append_key: int) -> tuple[TransactionOutcome, list[MicroOp]]:
+        try:
+            async with self._conn.transaction(isolation=ELLE_ISOLATION):
+                await self._conn.execute(INSERT_MARKER, marker_id, seq)
+                first = await self._conn.fetchval(ELLE_READ, read_key)
+                await self._conn.execute(ELLE_APPEND, append_key, seq)
+                after = await self._conn.fetchval(ELLE_READ, append_key)
+        except _LIST_APPEND_ABORT:
+            return TransactionOutcome.DEFINITELY_ABORTED, []
+        except _CONNECTION_ERRORS:
+            await self.close()
+            return TransactionOutcome.UNKNOWN, []
+        return TransactionOutcome.COMMITTED, [
+            ("r", read_key, None if first is None else list(first)),
+            ("append", append_key, seq),
+            ("r", append_key, None if after is None else list(after)),
+        ]
+
     async def try_write(self) -> bool:
         try:
             await self._conn.execute(PROBE_WRITE)
@@ -295,6 +379,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         Capability.STRUCTURAL_INTEGRITY_CHECK,
         Capability.PAGE_CHECKSUMS,
         Capability.DURABILITY_SETTINGS,
+        Capability.LIST_APPEND_HISTORY,
     })
 
     churn_key_space = CHURN_ROWS
@@ -315,6 +400,14 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                                      timeout=timeout_s, server_settings=server_settings,
                                      command_timeout=timeout_s if command_timeout is _SAME_AS_CONNECT else command_timeout)
 
+    def _psql_as_os_user(self, sql: str, *, tuples_only: bool = True) -> str:
+        """psql over SSH as the cluster's OS user: a superuser on the local socket, which is
+        what reads and acts on other roles' sessions."""
+        flags = "-X -At -v ON_ERROR_STOP=1" if tuples_only else "-X -v ON_ERROR_STOP=1"
+        return as_user(self.node.os_user,
+                       f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} {flags} -p {self.node.db.port} "
+                       f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(sql)}")
+
     async def session(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0) -> DatabaseSession:
         """A workload/probe session. Statements are NOT bounded by the connect timeout: the
         caller bounds its own operation (the workload gives a marker transaction
@@ -326,7 +419,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
     async def prepare_harness_state(self) -> None:
         # Pre-grant required roles to harness user if running against a cluster with SSH access.
         # PostgreSQL 15+ restricts CHECKPOINT to superusers and members of 'pg_checkpoint',
-        # and pg_stat_activity detailed monitoring to 'pg_read_all_stats'.
+        # and pg_stat_activity detailed monitoring to 'pg_read_all_stats'. The grant persists
+        # (it is not revoked at cleanup), so it is recorded for the report's disclosures.
+        self.harness_grants: list[str] = []
         try:
             async with RemoteHost(self.node.ssh) as host:
                 grant_cmd = (
@@ -334,14 +429,19 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                     f"-d {shlex.quote(self.node.db.dbname)} -c "
                     f"{shlex.quote(f'GRANT pg_checkpoint, pg_read_all_stats TO {self.node.db.user};')}"
                 )
-                await host.run(as_user(self.node.os_user, grant_cmd), timeout_s=10.0, check=False)
+                r = await host.run(as_user(self.node.os_user, grant_cmd), timeout_s=10.0, check=False)
+                if r.exit_status == 0:
+                    self.harness_grants = ["pg_checkpoint", "pg_read_all_stats"]
         except Exception:
             pass  # Best effort: fake adapters, unit tests, or environments without SSH
 
         conn = await self._connect(timeout_s=120.0)   # the churn seed is 20k rows
         try:
             await conn.execute(HARNESS_DDL)
-            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CONCURRENT_INDEX_NAME}")
+            # Schema-qualified: unqualified, the drop resolves through search_path, misses the
+            # resilience schema, and silently leaves the index behind.
+            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {LEGACY_CIC_INDEX}")
+            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
             # a corrupted relation left by an earlier run would fail every later integrity check;
             # DROP never reads its pages, so it is safe even when they are damaged
             await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
@@ -432,64 +532,188 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                 found.append((int(m.group(1)), m.group(2)))
         return found
 
-    async def start_concurrent_index_build(self) -> None:
-        await self.create_index_concurrently("resilience.markers", "ts", CONCURRENT_INDEX_NAME)
-
-    async def concurrent_index_outcome(self) -> dict[str, Any]:
-        return {"post_recovery_status": await self.get_index_status(CONCURRENT_INDEX_NAME),
-                "cleanup_or_rebuild_succeeded": await self.cleanup_index(CONCURRENT_INDEX_NAME)}
-
     def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
         return parse_pg_interval_s(observed.get("idle_in_transaction_session_timeout"))
 
-    async def create_index_concurrently(self, table: str, column: str, index_name: str) -> None:
-        """Launch a CREATE INDEX CONCURRENTLY statement. When crash occurs mid-build, this will raise
-        a connection error which is expected."""
-        conn = await self._connect(timeout_s=120.0, command_timeout=None)
-        try:
-            await conn.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} ON {table} ({column})")
-        finally:
-            try:
-                await conn.close()
-            except Exception:
-                pass
+    # ------------------------------------------------------------------ fault.during
 
-    async def get_index_status(self, index_name: str) -> dict[str, Any] | None:
-        """Query pg_class and pg_index to inspect whether index exists, and if it is marked valid/ready."""
+    async def prepare_scenario_objects(self, during: str | None) -> dict[str, Any]:
+        """Objects a `during` operation needs, created in init -- before the baseline, so
+        seeding them never disturbs the steady state being measured."""
+        if during != "concurrent_index_build":
+            return {}
+        conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
         try:
-            conn = await self._connect(timeout_s=10.0)
-        except Exception:
-            return None
-        try:
-            row = await conn.fetchrow(
-                "SELECT c.relname, i.indisvalid, i.indisready "
-                "FROM pg_class c JOIN pg_index i ON c.oid = i.indexrelid "
-                "WHERE c.relname = $1",
-                index_name,
-            )
-            if row:
-                return {"name": row["relname"], "is_valid": row["indisvalid"], "is_ready": row["indisready"]}
-            return None
-        except Exception:
-            return None
+            await conn.execute(CIC_DDL)
+            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
+            rows = await conn.fetchval(f"SELECT count(*) FROM {CIC_TABLE}")
+            if rows != CIC_ROWS:
+                # reseeded only when it is not exactly the expected size, so a run normally
+                # reuses the table rather than rewriting it
+                await conn.execute(f"TRUNCATE {CIC_TABLE}")
+                await conn.execute(CIC_SEED, CIC_ROWS)
+                await conn.execute(f"VACUUM (ANALYZE) {CIC_TABLE}")
+            return {"table": CIC_TABLE, "rows": CIC_ROWS, "reseeded": rows != CIC_ROWS}
         finally:
             await conn.close()
 
-    async def cleanup_index(self, index_name: str) -> bool:
-        """Drop the index concurrently or directly. Returns True if dropped or non-existent."""
+    async def _start_background(self, statements: list[tuple[str, tuple[Any, ...]]],
+                                in_transaction: bool) -> int:
+        """Run `statements` on a dedicated session in the background; returns its backend pid."""
+        conn = await self._connect(timeout_s=10.0, command_timeout=None)
+        pid = int(await conn.fetchval("SELECT pg_backend_pid()"))
+
+        async def run() -> None:
+            if in_transaction:
+                async with conn.transaction():
+                    for sql, args in statements:
+                        await conn.execute(sql, *args)
+            else:
+                for sql, args in statements:
+                    await conn.execute(sql, *args)
+
+        self._bg_conn, self._bg_pid = conn, pid
+        self._bg_task = asyncio.create_task(run(), name="during-operation")
+        return pid
+
+    def _bg_finished(self) -> str | None:
+        """None while the background operation runs; otherwise how it ended."""
+        task = getattr(self, "_bg_task", None)
+        if task is None or not task.done():
+            return None
+        if task.cancelled():
+            return "cancelled"
+        exc = task.exception()
+        return f"failed: {type(exc).__name__}: {exc}" if exc else "completed"
+
+    async def start_large_transaction(self) -> dict[str, Any]:
+        pid = await self._start_background(
+            [("INSERT INTO resilience.bulk_parent (id) VALUES ($1)", (BULK_PARENT_ID,)),
+             (BULK_INSERT, (BULK_PARENT_ID, BULK_ROWS))],
+            in_transaction=True)
+        t = time.monotonic()
+        deadline = t + BULK_CONFIRM_TIMEOUT_S
+        poll = await self._connect(timeout_s=10.0)
         try:
-            conn = await self._connect(timeout_s=30.0)
-        except Exception:
-            return False
+            while time.monotonic() < deadline:
+                ended = self._bg_finished()
+                if ended is not None:
+                    return {"in_progress": False, "pid": pid, "note": f"the INSERT {ended} before the kill"}
+                row = await poll.fetchrow(
+                    "SELECT a.state, a.xact_start IS NOT NULL AS in_xact, "
+                    "pg_relation_size('resilience.bulk_child') AS child_bytes "
+                    "FROM pg_stat_activity a WHERE a.pid = $1", pid)
+                if row and row["state"] == "active" and row["in_xact"] and row["child_bytes"] >= BULK_IN_FLIGHT_BYTES:
+                    return {"in_progress": True, "pid": pid, "rows_target": BULK_ROWS,
+                            "child_bytes_at_confirm": int(row["child_bytes"]),
+                            "confirmed_after_s": round(time.monotonic() - t, 3)}
+                await asyncio.sleep(0.05)
+        finally:
+            await poll.close()
+        return {"in_progress": False, "pid": pid,
+                "note": f"the INSERT had not written {BULK_IN_FLIGHT_BYTES} bytes within {BULK_CONFIRM_TIMEOUT_S} s"}
+
+    async def verify_large_transaction(self) -> dict[str, Any]:
+        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
         try:
-            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
-            return True
-        except Exception:
+            return {
+                "rows_visible": int(await conn.fetchval("SELECT count(*) FROM resilience.bulk_child")),
+                "parent_rows_visible": int(await conn.fetchval("SELECT count(*) FROM resilience.bulk_parent")),
+                "fk_violations": int(await conn.fetchval(
+                    "SELECT count(*) FROM resilience.bulk_child c "
+                    "LEFT JOIN resilience.bulk_parent p ON p.id = c.parent_id WHERE p.id IS NULL")),
+            }
+        finally:
+            await conn.close()
+
+    async def start_concurrent_index_build(self) -> dict[str, Any]:
+        pid = await self._start_background([(CIC_BUILD, ())], in_transaction=False)
+        t = time.monotonic()
+        deadline = t + CIC_CONFIRM_TIMEOUT_S
+        poll = await self._connect(timeout_s=10.0)
+        try:
+            while time.monotonic() < deadline:
+                ended = self._bg_finished()
+                if ended is not None:
+                    return {"in_progress": False, "pid": pid, "note": f"the index build {ended} before the kill"}
+                # the engine's own progress view: the build is running, past initialisation
+                row = await poll.fetchrow(
+                    "SELECT phase, blocks_done, blocks_total, tuples_done, tuples_total "
+                    "FROM pg_stat_progress_create_index WHERE pid = $1", pid)
+                if row and row["phase"] != "initializing":
+                    return {"in_progress": True, "pid": pid, "index": CIC_INDEX_QUALIFIED,
+                            "phase": row["phase"], "blocks_done": row["blocks_done"],
+                            "blocks_total": row["blocks_total"], "tuples_done": row["tuples_done"],
+                            "tuples_total": row["tuples_total"],
+                            "confirmed_after_s": round(time.monotonic() - t, 3)}
+                await asyncio.sleep(0.01)
+        finally:
+            await poll.close()
+        return {"in_progress": False, "pid": pid,
+                "note": f"no index build progress was reported within {CIC_CONFIRM_TIMEOUT_S} s"}
+
+    async def verify_concurrent_index(self) -> dict[str, Any]:
+        """Framework §10.2 NL-C-06: index left INVALID, table readable, rebuild succeeds."""
+        conn = await self._connect(timeout_s=10.0, command_timeout=600.0)
+        try:
+            state = await conn.fetchrow(CIC_INDEX_STATE, CIC_INDEX)
+            detail: dict[str, Any] = {
+                "index_present": state is not None,
+                "index_left_invalid": state is not None and not state["indisvalid"],
+            }
             try:
-                await conn.execute(f"DROP INDEX IF EXISTS {index_name}")
-                return True
-            except Exception:
-                return False
+                detail["table_rows"] = int(await conn.fetchval(f"SELECT count(*) FROM {CIC_TABLE}"))
+                detail["table_readable"] = True
+            except asyncpg.PostgresError as exc:
+                detail["table_readable"] = False
+                detail["table_read_error"] = str(exc)
+            # PostgreSQL's documented recovery for a failed concurrent build: drop it, build again
+            try:
+                await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
+                await conn.execute(CIC_BUILD)
+                rebuilt = await conn.fetchrow(CIC_INDEX_STATE, CIC_INDEX)
+                detail["rebuild_succeeds"] = rebuilt is not None and bool(rebuilt["indisvalid"])
+            except asyncpg.PostgresError as exc:
+                detail["rebuild_succeeds"] = False
+                detail["rebuild_error"] = str(exc)
+            return detail
+        finally:
+            await conn.close()
+
+    async def abandon_background_operation(self) -> dict[str, Any]:
+        detail: dict[str, Any] = {}
+        task = getattr(self, "_bg_task", None)
+        conn = getattr(self, "_bg_conn", None)
+        pid = getattr(self, "_bg_pid", None)
+        if task is not None:
+            detail["ended"] = self._bg_finished() or "still running"
+            if not task.done():
+                # never leave a 10M-row INSERT or an index build running behind the harness
+                try:
+                    killer = await self._connect(timeout_s=5.0)
+                    try:
+                        detail["terminated"] = await killer.fetchval("SELECT pg_terminate_backend($1)", pid)
+                    finally:
+                        await killer.close()
+                except Exception as exc:  # noqa: BLE001 -- recorded; the task is cancelled anyway
+                    detail["terminate_error"] = f"{type(exc).__name__}: {exc}"
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if conn is not None:
+            try:
+                conn.terminate()
+            except Exception:  # noqa: BLE001 -- the server already closed it
+                pass
+        self._bg_task = self._bg_conn = self._bg_pid = None
+        return detail
+
+    async def cleanup_scenario_objects(self) -> dict[str, Any]:
+        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
+        try:
+            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
+            # TRUNCATE gives back the aborted bulk rows' space now, not at the next autovacuum
+            await conn.execute("TRUNCATE resilience.bulk_child, resilience.bulk_parent")
+            return {"dropped_index": CIC_INDEX_QUALIFIED, "truncated": ["resilience.bulk_child", "resilience.bulk_parent"]}
         finally:
             await conn.close()
 
@@ -1265,123 +1489,122 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         except Exception as exc:
             return {"checksum_failures": 0, "ok": False, "error": str(exc)}
 
-    async def exhaust_connections(self, hold_duration_s: float = 2.0) -> dict[str, Any]:
-        """Connection exhaustion under load (NL-R-04: max_connections + 50% concurrent attempts)."""
+    async def exhaust_connections(self, hold_s: float) -> dict[str, Any]:
+        """NL-R-04 (Framework §10.5): open max_connections + 50% sessions under load, hold them
+        for `hold_s`, release them, and confirm the server accepts a new session again.
+
+        Every flood session carries FLOOD_APPLICATION_NAME, so revert_exhaust_connections can
+        terminate exactly these from any process. The flood is released here, inside the fault,
+        so validate's own connections never compete with it."""
         t0_mono_ns = time.monotonic_ns()
-        max_conn = 100
-        su_reserved = 3
-
-        # Query live database GUC settings for max_connections and superuser_reserved_connections
+        conn = await self._connect(timeout_s=5.0)
         try:
-            conn = await self._connect(timeout_s=5.0)
-            try:
-                row = await conn.fetchrow("SHOW max_connections")
-                if row and str(row[0]).isdigit():
-                    max_conn = int(row[0])
-                row2 = await conn.fetchrow("SHOW superuser_reserved_connections")
-                if row2 and str(row2[0]).isdigit():
-                    su_reserved = int(row2[0])
-            finally:
-                await conn.close()
-        except Exception:
-            # Fallback to SSH psql if direct connection is blocked
-            try:
-                async with RemoteHost(self.node.ssh) as host:
-                    res = await host.run(
-                        f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -At -p {self.node.db.port} "
-                        f"-d {shlex.quote(self.node.db.dbname)} -c 'SHOW max_connections; SHOW superuser_reserved_connections;'",
-                        timeout_s=10.0, check=False
-                    )
-                    if res.exit_status == 0:
-                        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip().isdigit()]
-                        if len(lines) >= 1:
-                            max_conn = int(lines[0])
-                        if len(lines) >= 2:
-                            su_reserved = int(lines[1])
-            except Exception:
-                pass
+            max_conn = int(await conn.fetchval("SHOW max_connections"))
+            su_reserved = int(await conn.fetchval("SHOW superuser_reserved_connections"))
+        finally:
+            await conn.close()
 
-        # Framework §10.5: Open max_connections + 50% concurrent sessions under active load
-        total_flood_target = max(10, int(max_conn * 1.5))
-        self._holding_conns = []
-        rejection_errors: list[str] = []
+        attempted = max(10, int(max_conn * 1.5))
+        explicit: list[str] = []      # SQLSTATE 53300: the server said why it refused
+        other: list[str] = []         # timeouts, resets: a refusal nobody explained
+        self._holding_conns: list[asyncpg.Connection] = []
 
-        async def _flood_worker():
+        async def one() -> None:
             try:
-                return await self._connect(self.node.client, timeout_s=3.0, command_timeout=None)
+                self._holding_conns.append(await self._connect(
+                    self.node.client, timeout_s=FLOOD_CONNECT_TIMEOUT_S, command_timeout=None,
+                    server_settings={"application_name": FLOOD_APPLICATION_NAME}))
             except asyncpg.TooManyConnectionsError as exc:
-                rejection_errors.append(str(exc))
-                return None
-            except Exception as exc:
-                rejection_errors.append(str(exc))
-                return None
+                explicit.append(str(exc))
+            except Exception as exc:  # noqa: BLE001 -- classified as an unexplained refusal
+                other.append(f"{type(exc).__name__}: {exc}")
 
+        await asyncio.gather(*(one() for _ in range(attempted)))
+        held = len(self._holding_conns)
+
+        # Reserved slots, probed while the flood is held, as a role that is entitled to them.
+        # Only a superuser proves anything here: a non-superuser who gets in found an ordinary
+        # free slot, which says nothing about the reserved ones.
+        superuser_slot_honoured: bool | None
+        superuser_probe: dict[str, Any]
         try:
-            tasks = [_flood_worker() for _ in range(total_flood_target)]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for c in results:
-                if c is not None and not isinstance(c, Exception):
-                    self._holding_conns.append(c)
-        except Exception:
-            pass
-
-        rejections_explicit = False
-        rejection_error = ""
-        if self._holding_conns and rejection_errors:
-            rejection_error = rejection_errors[0]
-            explicit_count = sum(
-                1 for err in rejection_errors
-                if "53300" in err or "too many clients" in err.lower() or "remaining connection slots are reserved" in err.lower()
-            )
-            if explicit_count > 0:
-                rejections_explicit = True
-
-        # Verify if superuser reserved slot is honoured under connection exhaustion
-        superuser_slot_honoured = False
-        if self._holding_conns:
-            # 1. First probe via SSH as node.os_user (postgres superuser)
-            try:
-                async with RemoteHost(self.node.ssh) as host:
-                    psql = shlex.quote(self.node.pg_bin + '/psql')
-                    su_cmd = f"cd /tmp && {psql} -X -p {self.node.db.port} -d {shlex.quote(self.node.db.dbname)} -c 'SELECT 1;'"
-                    r = await host.run(as_user(self.node.os_user, su_cmd), timeout_s=5.0, check=False)
-                    if r.exit_status == 0:
-                        superuser_slot_honoured = True
-            except Exception:
+            async with RemoteHost(self.node.ssh) as host:
+                r = await host.run(self._psql_as_os_user("SELECT rolsuper FROM pg_roles WHERE rolname = current_user"),
+                                   timeout_s=10.0, check=False)
+            out = (r.stdout + r.stderr).strip()
+            superuser_probe = {"exit_status": r.exit_status, "output": out[:300]}
+            if r.exit_status == 0 and r.stdout.strip() == "t":
+                superuser_slot_honoured = True
+            elif r.exit_status == 0:
+                superuser_slot_honoured = None
+                superuser_probe["note"] = "the probing role is not a superuser, so reserved slots were not tested"
+            else:
                 superuser_slot_honoured = False
+        except Exception as exc:  # noqa: BLE001 -- no probe means not measured, never a pass
+            superuser_slot_honoured = None
+            superuser_probe = {"error": f"{type(exc).__name__}: {exc}"}
 
-            # 2. Fallback to direct asyncpg connect if SSH probe is not available
-            if not superuser_slot_honoured:
-                try:
-                    su_conn = await self._connect(self.node.db, timeout_s=2.0, command_timeout=None)
-                    superuser_slot_honoured = True
-                    await su_conn.close()
-                except Exception:
-                    superuser_slot_honoured = False
+        await asyncio.sleep(hold_s)
+        released = await self._release_flood()
 
-        held_count = len(self._holding_conns)
+        # After release a new ordinary session must be accepted again, within a bound
+        recovered, recovery_s = False, None
+        t_rel = time.monotonic()
+        while time.monotonic() - t_rel < FLOOD_RECOVERY_TIMEOUT_S:
+            try:
+                probe = await self._connect(self.node.client, timeout_s=2.0)
+                await probe.close()
+                recovered, recovery_s = True, round(time.monotonic() - t_rel, 3)
+                break
+            except Exception:  # noqa: BLE001 -- retried until the bound
+                await asyncio.sleep(0.2)
 
         return {
             "action": "connection_exhaustion",
             "t0_mono_ns": t0_mono_ns,
             "max_connections": max_conn,
             "superuser_reserved": su_reserved,
-            "attempted_connections": total_flood_target,
-            "held_connections": held_count,
-            "rejected_connections": len(rejection_errors),
-            "rejections_explicit": rejections_explicit,
-            "rejection_error": rejection_error,
+            "attempted_connections": attempted,
+            "held_connections": held,
+            "rejected_explicit": len(explicit),
+            "rejected_other": len(other),
+            "rejection_samples": (explicit[:2] + other[:3]),
+            # explicit only if the limit was actually reached AND every refusal said why
+            "rejections_explicit": bool(explicit) and not other,
             "superuser_slot_honoured": superuser_slot_honoured,
+            "superuser_probe": superuser_probe,
+            "hold_s": hold_s,
+            "released_connections": released,
+            "connections_recover_after_release": recovered,
+            "recovery_after_release_s": recovery_s,
         }
 
-    async def revert_exhaust_connections(self) -> dict[str, Any]:
-        drained = 0
+    async def _release_flood(self) -> int:
+        released = 0
         for c in getattr(self, "_holding_conns", []):
             try:
-                await c.close()
-                drained += 1
-            except Exception:
-                pass
+                await c.close(timeout=5.0)
+                released += 1
+            except Exception:  # noqa: BLE001 -- the server side is terminated by revert if needed
+                c.terminate()
         self._holding_conns = []
-        return {"action": "connection_exhaustion_drained", "drained": drained, "state": "active"}
+        return released
 
+    async def revert_exhaust_connections(self) -> dict[str, Any]:
+        released = await self._release_flood()
+        terminate = ("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+                     f"WHERE application_name = '{FLOOD_APPLICATION_NAME}'")
+        remaining_sql = f"SELECT count(*) FROM pg_stat_activity WHERE application_name = '{FLOOD_APPLICATION_NAME}'"
+        async with RemoteHost(self.node.ssh) as host:
+            t = await host.run(self._psql_as_os_user(terminate), timeout_s=15.0)
+            remaining = 0
+            for _ in range(25):   # terminated backends take a moment to leave pg_stat_activity
+                r = await host.run(self._psql_as_os_user(remaining_sql), timeout_s=15.0)
+                remaining = int(r.stdout.strip() or 0)
+                if remaining == 0:
+                    break
+                await asyncio.sleep(0.2)
+        if remaining:
+            raise RuntimeError(f"{remaining} flood session(s) ({FLOOD_APPLICATION_NAME}) still open after terminate")
+        return {"action": "flood sessions terminated", "released_in_process": released,
+                "terminated_on_server": int(t.stdout.strip() or 0), "remaining": 0}

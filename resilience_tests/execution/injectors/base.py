@@ -51,6 +51,16 @@ class FaultInjector(ABC):
         # (cycles, interval_s) when the scenario repeats its fault, so preflight can check the
         # target can actually take that cadence (Framework NL-C-05)
         self.repeat_plan: tuple[int, float] | None = None
+        # the scenario's fault.duration in seconds, for faults that are held and then released
+        # (None for a permanent fault)
+        self.duration_s: float | None = None
+
+    async def confirm(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
+        """After recovery: independent evidence that the fault took effect, beyond the
+        injection call having returned. {"fault_confirmed": True/False/None, ...}; None means
+        this driver cannot tell, which is reported as not measured -- never as confirmed.
+        `detail` is the injection's ledger detail (`preflight` and `inject`)."""
+        return {"fault_confirmed": None, "note": f"{self.driver_name} has no confirmation for {self.fault_type}"}
 
     @abstractmethod
     async def preflight(self, node: Node) -> dict[str, Any]:

@@ -207,7 +207,12 @@ def test_run_plan_skips_scenarios_an_engine_cannot_support():
     catalog = load_catalog()
 
     on_postgres, skipped_pg = expand(catalog, profile, reference_env_class="E2")
-    assert {p.scenario.id for p in on_postgres} == set(catalog.scenarios) and not skipped_pg
+    # PostgreSQL supports every authored scenario; the only skips are infrastructure the
+    # profile does not provide (NL-C-04: a dedicated pg_wal volume)
+    blocked = {sid for sid, sc in catalog.scenarios.items() if sc.needs_infra}
+    assert {p.scenario.id for p in on_postgres} == set(catalog.scenarios) - blocked
+    assert {s.scenario_id for s in skipped_pg} == blocked
+    assert all("blocked by infrastructure" in s.reason for s in skipped_pg)
 
     fake = profile.model_copy(update={"database": profile.database.model_copy(update={"engine": "fake-engine"})})
     on_fake, skipped_fake = expand(catalog, fake, reference_env_class="E2")
