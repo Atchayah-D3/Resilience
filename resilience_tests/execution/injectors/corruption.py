@@ -13,7 +13,8 @@ back for the run to read. Precision and proof come before anything is measured:
   3. corrupt     the byte is read, inverted, written in place and forced to disk, then read
                  back: it must have changed
   4. verify      pg_checksums (Arch §10.1, offline checksum verification) must report a
-                 checksum failure at exactly that block of exactly that relation
+                 checksum failure at exactly that block of exactly that relation; its own output
+                 is kept in the evidence, so an abort here always says what the tool said
   5. start       the service is started again; T0 is when it is back, with the damaged page on
                  disk and nothing yet having read it
 
@@ -48,6 +49,8 @@ SEGMENT_BYTES = 1024 ** 3          # files are split into 1 GB segments; the tar
 _CLUSTER_STATE_RE = re.compile(r"Database cluster state:\s*(.+)")
 # pg_checksums: 'checksum verification failed in file "<path>", block 17: calculated ...'
 _CHECKSUM_FAILURE_RE = re.compile(r'checksum verification failed in file "([^"]+)", block (\d+)')
+# printed only when pg_checksums actually scanned: "Bad checksums:  1"
+_CHECKSUM_SUMMARY_RE = re.compile(r"Bad checksums:\s*\d+")
 
 
 def parse_checksum_failures(output: str) -> list[tuple[str, int]]:
@@ -152,13 +155,20 @@ class OsSshCorruptionDriver(OsSshProcessDriver):
                 raise FaultNotLanded(f"byte at {offset} reads {after!r} after the write, "
                                      f"expected {detail['written_byte']}", detail)
 
-            checked = await host.run(
-                as_user(node.os_user, f"{self._tool(node, 'pg_checksums')} --check -D {q(node.pgdata)} "
-                                      f"-r {int(target['filenode'])}"),
-                timeout_s=REVERT_TOTAL_BUDGET_S, check=False)
-            failures = parse_checksum_failures(checked.stdout + checked.stderr)
-            detail["pg_checksums"] = {"exit_status": checked.exit_status,
-                                      "failures": [{"file": f, "block": b} for f, b in failures]}
+            # --filenode (PostgreSQL 13+; the PostgreSQL 12 spelling -r is rejected by current builds)
+            command = (f"{self._tool(node, 'pg_checksums')} --check -D {q(node.pgdata)} "
+                       f"--filenode={int(target['filenode'])}")
+            checked = await host.run(as_user(node.os_user, command), timeout_s=REVERT_TOTAL_BUDGET_S, check=False)
+            output = (checked.stdout + checked.stderr).strip()
+            failures = parse_checksum_failures(output)
+            # kept in the evidence: an abort must say what the tool itself said
+            detail["pg_checksums"] = {"command": command, "exit_status": checked.exit_status,
+                                      "failures": [{"file": f, "block": b} for f, b in failures],
+                                      "output": output[-2000:]}
+            if not failures and not _CHECKSUM_SUMMARY_RE.search(output):
+                # no failure line AND no summary: the tool never got as far as checking
+                raise FaultNotLanded(f"pg_checksums could not verify the page (exit {checked.exit_status}): "
+                                     f"{output[-300:] or 'no output'}", detail)
             expected = [(f, b) for f, b in failures
                         if b == int(target["block"]) and f.endswith(str(target["relation_path"]))]
             if len(failures) != 1 or len(expected) != 1:

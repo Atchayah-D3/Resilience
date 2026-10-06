@@ -147,6 +147,9 @@ def test_the_byte_is_flipped_with_the_database_cleanly_down_and_proven_by_pg_che
                   if k in c) for c in calls
              if any(k in c for k in ("systemctl stop", "pg_controldata", "dd of=", "pg_checksums", "systemctl start"))]
     assert order == ["systemctl stop", "pg_controldata", "dd of=", "pg_checksums", "systemctl start"]
+    (check,) = [c for c in calls if "pg_checksums" in c]
+    assert "--filenode=16400" in check and " -r " not in check     # -r is the PostgreSQL 12 spelling
+    assert "Bad checksums:  1" in detail["pg_checksums"]["output"]  # the tool's own words are evidence
     (write,) = [c for c in calls if "dd of=" in c]
     assert f"seek={OFFSET}" in write and "\\267" in write          # 0x48 ^ 0xff = 0xb7 = octal 267
     assert host.state["running"]
@@ -173,6 +176,18 @@ def test_a_page_whose_checksum_still_verifies_aborts(monkeypatch):
     with pytest.raises(FaultNotLanded, match="exactly one checksum failure"):
         asyncio.run(driver.inject(NODE))
     assert not [c for c in calls if "systemctl start" in c]      # left down; the revert brings it back
+
+
+def test_a_pg_checksums_that_never_checked_says_so(monkeypatch):
+    """The first lab run: the tool rejected its option, exited 1, and checked nothing. That must
+    read as 'could not verify' with the tool's own message -- not as 'no checksum failure'."""
+    rejected = ("pg_checksums: invalid option -- 'r'\n"
+                'pg_checksums: hint: Try "pg_checksums --help" for more information.\n')
+    driver, _, _ = corruption_driver(monkeypatch, checksums=rejected)
+    with pytest.raises(FaultNotLanded, match="could not verify the page") as raised:
+        asyncio.run(driver.inject(NODE))
+    assert "invalid option" in str(raised.value)
+    assert "invalid option" in raised.value.detail["pg_checksums"]["output"]
 
 
 def test_a_checksum_failure_at_another_block_aborts(monkeypatch):
