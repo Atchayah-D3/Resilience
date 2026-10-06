@@ -7,6 +7,7 @@ reports/*.html
 evidence/*
 !*/README.md
 .venv-ansible/
-.specify/
-.claude/
+# Spec Kit (.specify/) and its Claude Code skills (.claude/skills/) are shared with the team;
+# .specify/.gitignore keeps its own machine-local state out. Personal settings stay local.
+.claude/settings.local.json
 vendor/elle/elle-cli.jar
