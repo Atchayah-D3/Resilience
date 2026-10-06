@@ -55,7 +55,7 @@ phase_timeouts_s:                # every phase is bounded; an unbounded wait is 
   baseline: 300
   pre_fault: 300
   fault_inject: 120
-  recovery: 900
+  recovery: 120
   validate: 1800
   report: 120
   cleanup: 600
