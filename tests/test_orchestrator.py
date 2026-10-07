@@ -263,8 +263,8 @@ class FakeFault(FaultInjector):
         return {"action": "revert"}
 
 
-@pytest.fixture
-def env(tmp_path, monkeypatch):
+@pytest.fixture(params=["builtin"])
+def env(request, tmp_path, monkeypatch):
     Engine.down, FakeFault.lands, FakeFault.reverts = False, True, []
     Engine.store, Engine.churn_ops, Engine.lists = set(), 0, {}
     Engine.during_in_progress, Engine.after_during, Engine.targeted_misses = True, {}, 0
@@ -274,10 +274,12 @@ def env(tmp_path, monkeypatch):
     timeouts = dict(BASE_PROFILE.phase_timeouts_s, recovery=12.0)   # loop runs ~7 s
     monkeypatch.setattr(rto_decomposer, "SLO_SUSTAIN_S", 2.0)       # reachable: exercises the early exit
     monkeypatch.setattr(orch, "IDLE_TRANSACTION_MIN_SOAK_S", 2.0)
+    generator = request.param
     profile = BASE_PROFILE.model_copy(update={
         "database": BASE_PROFILE.database.model_copy(update={"engine": "orch-fake"}),
         "driver_host": BASE_PROFILE.driver_host.model_copy(update={"host": "127.0.0.1", "run_dir": str(tmp_path)}),
         "phase_timeouts_s": timeouts,
+        "workload": BASE_PROFILE.workload.model_copy(update={"generator": generator}),
     })
 
     async def hostname(endpoint, command, *, timeout_s, check=True):
@@ -659,4 +661,62 @@ def test_nl_m_05_execution(env):
     assert m["idle_in_transaction_session_timeout_enforced"] is True
     assert str(m["bloat_alert_fired"]) == "NOT_MEASURED"   # no alert source is connected
     assert "idle_transaction" in results["facts"]
+
+
+def test_orchestrator_runs_with_pgbench_generator(env, monkeypatch):
+    """T048: Orchestrator executes cleanly with generator=pgbench when channel double is registered."""
+    from pathlib import Path
+    from resilience_tests.execution.workload.interface import register_record_channel_factory
+    from resilience_tests.execution.workload.record_channel import InMemoryRecordChannel
+
+    fake_pg = str(Path(__file__).parent / "fakes" / "fake_pgbench.py")
+    profile = env.model_copy(update={
+        "workload": env.workload.model_copy(update={
+            "generator": "pgbench",
+            "pgbench_bin": fake_pg,
+        })
+    })
+
+    channel = InMemoryRecordChannel()
+    register_record_channel_factory(lambda: channel, tests_passed=True)
+
+    try:
+        from resilience_tests.adapters.base import Capability, PgbenchLaunchSpec
+        monkeypatch.setattr(OutageAdapter, "capabilities", frozenset({
+            Capability.TRANSACTIONAL_MARKERS,
+            Capability.WORKLOAD_CHURN,
+            Capability.STRUCTURAL_INTEGRITY_CHECK,
+            Capability.DURABILITY_SETTINGS,
+            Capability.LIST_APPEND_HISTORY,
+            Capability.PGBENCH_WORKLOAD,
+        }))
+        monkeypatch.setattr(
+            OutageAdapter,
+            "pgbench_launch",
+            lambda self, shape, launch, client: PgbenchLaunchSpec(
+                script="SELECT 1;\n",
+                variables={},
+                connection=self.node.client,
+                application_name=f"resilience-pgbench-test-{launch}",
+            ),
+        )
+
+        async def fake_server_version(self):
+            return "PostgreSQL 17.11.1.0 on x86_64"
+
+        async def fake_sessions(self, name):
+            return 0
+
+        monkeypatch.setattr(OutageAdapter, "server_version", fake_server_version)
+        monkeypatch.setattr(OutageAdapter, "sessions_with_application_name", fake_sessions)
+
+
+        item = RunPlanItem(scenario=scenario("NL-C-01"), env_class=profile.env_class, role="standalone", node=profile.nodes[0])
+        orch_inst = TestOrchestrator(item, profile, RunOptions(stop_before_fault=True))
+        results = asyncio.run(orch_inst.run())
+        assert results["facts"]["workload_generator"] == "pgbench"
+        assert "17.11" in results["facts"]["pgbench_version"]
+    finally:
+        register_record_channel_factory(None, tests_passed=False)
+
 

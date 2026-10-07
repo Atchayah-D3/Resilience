@@ -210,8 +210,10 @@ class WorkloadDriver:
             p50_ms=percentile(w.latencies_ms or [], 0.50), p95_ms=percentile(w.latencies_ms or [], 0.95),
         )
 
+    generator: str = "builtin"
+
     async def start(self) -> None:
-        self.stream.emit("workload", "start", profile=self.workload.profile,
+        self.stream.emit("workload", "start", generator=self.generator, profile=self.workload.profile,
                          concurrency=self.workload.concurrency, rate_tps=self.workload.rate_tps)
         self._tasks = [asyncio.create_task(self._worker(i), name=f"worker-{i}") for i in range(self.workload.concurrency)]
         self._tasks.append(asyncio.create_task(self._sampler(), name="sampler"))

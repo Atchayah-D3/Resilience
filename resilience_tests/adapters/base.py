@@ -30,6 +30,15 @@ class Capability(str, Enum):
     PAGE_CHECKSUMS = "page_checksums"
     DURABILITY_SETTINGS = "durability_settings"
     LIST_APPEND_HISTORY = "list_append_history"
+    PGBENCH_WORKLOAD = "pgbench_workload"
+
+
+@dataclass(frozen=True)
+class PgbenchLaunchSpec:
+    script: str
+    variables: dict[str, Any]
+    connection: DbEndpoint
+    application_name: str
 
 
 class TransactionOutcome(str, Enum):
@@ -385,6 +394,17 @@ class BaseDatabaseAdapter(ABC):
         including a harness process that died mid-hold. Must work from a fresh adapter (the
         kill switch has no other). Default: returns empty dict."""
         return {}
+
+    def pgbench_launch(self, shape: str, launch: int, client: int) -> PgbenchLaunchSpec:
+        """Return the launch specification for a pgbench worker process."""
+        raise NotImplementedError(f"{type(self).__name__} does not implement pgbench_launch")
+
+    async def sessions_with_application_name(self, name: str) -> int | None:
+        """Count active sessions with the given application_name.
+
+        Returns None if the engine cannot report this.
+        """
+        return None
 
 
 

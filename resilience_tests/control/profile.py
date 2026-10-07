@@ -99,6 +99,11 @@ class OsSsh(_Model):
     driver: Literal["os_ssh"]
 
 
+class WorkloadConfig(_Model):
+    generator: Literal["pgbench", "builtin"] = "pgbench"
+    pgbench_bin: str = "pgbench"
+
+
 class StorageFault(_Model):
     dm_shim: bool
 
@@ -155,6 +160,7 @@ class EnvProfile(_Model):
     driver_host: DriverHost
     nodes: list[Node] = Field(min_length=1)
     safety: Safety
+    workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
     phase_timeouts_s: dict[str, float]
     # Framework §19 decision 2 / Arch §18 decision 2: evidence limitations must be stated in
     # every report produced against this environment.

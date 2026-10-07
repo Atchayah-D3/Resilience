@@ -21,6 +21,7 @@ from resilience_tests.adapters.base import (
     DatabaseSession,
     IntegrityResult,
     MicroOp,
+    PgbenchLaunchSpec,
     TransactionOutcome,
     register_adapter,
 )
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS resilience.elle_lists (
     k bigint PRIMARY KEY,
     v bigint[] NOT NULL
 );
+CREATE OR REPLACE VIEW resilience.lists AS SELECT * FROM resilience.elle_lists;
 -- NL-C-03: the large transaction inserts one parent and millions of children referencing it,
 -- so after recovery "no partial rows" and "FK invariants hold" are both checkable.
 CREATE TABLE IF NOT EXISTS resilience.bulk_parent (
@@ -444,6 +446,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         Capability.PAGE_CHECKSUMS,
         Capability.DURABILITY_SETTINGS,
         Capability.LIST_APPEND_HISTORY,
+        Capability.PGBENCH_WORKLOAD,
     })
 
     churn_key_space = CHURN_ROWS
@@ -1822,3 +1825,61 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             raise RuntimeError(f"{remaining} flood session(s) ({FLOOD_APPLICATION_NAME}) still open after terminate")
         return {"action": "flood sessions terminated", "released_in_process": released,
                 "terminated_on_server": int(t.stdout.strip() or 0), "remaining": 0}
+
+    async def sessions_with_application_name(self, name: str) -> int:
+        conn = await self._connect()
+        try:
+            val = await conn.fetchval("SELECT count(*) FROM pg_stat_activity WHERE application_name = $1", name)
+            return int(val) if val is not None else 0
+        finally:
+            await conn.close()
+
+    def pgbench_launch(self, shape: str, launch: int, client: int) -> PgbenchLaunchSpec:
+        app_name = f"resilience-pgbench-l{launch}-c{client}"
+        variables: dict[str, Any] = {
+            "launch": launch,
+            "client": client,
+            "seq": 0,
+        }
+        if shape == "marker":
+            script = (
+                "\\set seq :seq + 1\n"
+                "INSERT INTO resilience.markers (uuid, seq) "
+                "VALUES (md5('L'||:launch||'-C'||:client||'-S'||:seq)::uuid, :seq);\n"
+            )
+        elif shape == "churn":
+            variables["churn_keys"] = self.churn_key_space
+            variables["replace_every"] = 10
+            script = (
+                "\\set seq :seq + 1\n"
+                "\\set churn_id random(1, :churn_keys)\n"
+                "\\set r :seq % :replace_every\n"
+                "\\if :r == 0\n"
+                "DELETE FROM resilience.churn WHERE id = :churn_id;\n"
+                "INSERT INTO resilience.churn (id, v, payload) VALUES (:churn_id, :seq, repeat('x', 256));\n"
+                "\\else\n"
+                "UPDATE resilience.churn SET v = :seq WHERE id = :churn_id;\n"
+                "\\endif\n"
+                "INSERT INTO resilience.markers (uuid, seq) "
+                "VALUES (md5('L'||:launch||'-C'||:client||'-S'||:seq)::uuid, :seq);\n"
+            )
+        elif shape == "list_append":
+            variables["read_key"] = 1
+            variables["append_key"] = 1
+            script = (
+                "\\set seq :seq + 1\n"
+                "SELECT v AS read_v FROM resilience.lists WHERE k = :read_key \\gset\n"
+                "INSERT INTO resilience.lists AS l (k, v) VALUES (:append_key, ARRAY[:seq::bigint]) "
+                "ON CONFLICT (k) DO UPDATE SET v = l.v || :seq RETURNING v AS append_v \\gset\n"
+                "INSERT INTO resilience.markers (uuid, seq) "
+                "VALUES (md5('L'||:launch||'-C'||:client||'-S'||:seq)::uuid, :seq);\n"
+            )
+        else:
+            raise ValueError(f"unknown shape {shape!r} for pgbench_launch")
+
+        return PgbenchLaunchSpec(
+            script=script,
+            variables=variables,
+            connection=self.node.client,
+            application_name=app_name,
+        )

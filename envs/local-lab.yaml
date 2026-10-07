@@ -26,6 +26,10 @@ storage_fault:
 reset:
   driver: none
 
+# Build-out rule (plan.md): explicit builtin generator until switched to pgbench in T052
+workload:
+  generator: builtin
+
 sla_tier_target: platinum
 
 driver_host:                     # separate from the target (Arch §6.2)

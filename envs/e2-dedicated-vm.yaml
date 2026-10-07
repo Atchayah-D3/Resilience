@@ -23,6 +23,10 @@ storage_fault:
 reset:
   driver: none                   # snapshot reset driver, when the environment provides one
 
+# Build-out rule (plan.md): explicit builtin generator until switched to pgbench in T052
+workload:
+  generator: builtin
+
 sla_tier_target: platinum
 
 driver_host:                     # workload driver and marker journals, separate from the target (Arch §6.2)

@@ -40,6 +40,11 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 def test_scenario(plan_item: RunPlanItem, request: pytest.FixtureRequest) -> None:
     cfg = request.config
     profile = load_profile(cfg.getoption("--env"))
+    workload_override = cfg.getoption("--workload")
+    if workload_override:
+        profile = profile.model_copy(
+            update={"workload": profile.workload.model_copy(update={"generator": workload_override})}
+        )
     options = RunOptions(
         target_is_disposable=cfg.getoption("--target-is-disposable"),
         stop_before_fault=cfg.getoption("--stop-before-fault"),

@@ -56,7 +56,9 @@ from resilience_tests.execution.probes.probers import DiskUsageProber, LogTailer
 from resilience_tests.execution.remote import run_once
 from resilience_tests.execution.workload.driver import MeasuredWindow, WorkloadDriver
 from resilience_tests.execution.workload.history_writer import HistoryWriter
+from resilience_tests.execution.workload.interface import make_workload_driver
 from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals
+from resilience_tests.execution.workload.pgbench_driver import PgbenchWorkloadDriver
 from resilience_tests.observability.event_stream import EventStream
 
 EVENTS_FILE = "events.jsonl"
@@ -138,7 +140,7 @@ class TestOrchestrator:
         self.stream: EventStream | None = None
         self.journals: MarkerJournals | None = None
         self.history: HistoryWriter | None = None
-        self.workload: WorkloadDriver | None = None
+        self.workload: WorkloadDriver | PgbenchWorkloadDriver | None = None
         self.write_prober: WriteProber | None = None
         self.log_tailer: LogTailer | None = None
         self.disk_prober: DiskUsageProber | None = None
@@ -403,8 +405,17 @@ class TestOrchestrator:
         self.journals = MarkerJournals(self.run_dir)
         if self.scenario.workload.history == "list_append":
             self.history = HistoryWriter(self.run_dir / HISTORY_FILE)
-        self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream,
-                                       history=self.history)
+        self.workload = await make_workload_driver(
+            self.profile,
+            self.adapter,
+            self.scenario.workload,
+            self.journals,
+            self.stream,
+            history=self.history,
+        )
+        self.facts["workload_generator"] = self.workload.generator
+        if hasattr(self.workload, "pgbench_version") and self.workload.pgbench_version:
+            self.facts["pgbench_version"] = self.workload.pgbench_version
         return {"hostname": hostname, "settings": settings}
 
     async def _p_baseline(self) -> dict[str, Any]:
@@ -456,7 +467,10 @@ class TestOrchestrator:
             # name the likely limiter: driver-side flush latency vs database latency
             jp99 = self.baseline.journal_p99_ms
             dp99 = self.baseline.p99_ms   # None when the window committed nothing
-            where = "driver journal flush" if jp99 is not None and dp99 is not None and jp99 > dp99 else "target database"
+            if getattr(self.workload, "generator", "") == "pgbench":
+                where = "driver record steps" if jp99 is not None and dp99 is not None and jp99 > dp99 else "target database"
+            else:
+                where = "driver journal flush" if jp99 is not None and dp99 is not None and jp99 > dp99 else "target database"
             raise PhaseAbort(
                 f"steady state did not hold (tps={self.baseline.tps:.1f}, "
                 f"db p99={dp99 if dp99 is None else round(dp99, 1)} ms, "
@@ -1039,6 +1053,14 @@ class TestOrchestrator:
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).
         self.facts["declared_not_produced"] = sorted(set(self.scenario.measure) - set(m))
+        if isinstance(self.workload, PgbenchWorkloadDriver):
+            overhead = self.workload.recording_overhead_pct()
+            if overhead is not None:
+                self.facts["pgbench_recording_overhead"] = overhead
+            self.facts["pgbench_launches"] = self.workload._launch_counter
+            if self.workload.scheduling_lags_us:
+                self.facts["pgbench_scheduling_lag_p50_us"] = percentile(self.workload.scheduling_lags_us, 0.50)
+                self.facts["pgbench_scheduling_lag_p99_us"] = p99(self.workload.scheduling_lags_us)
         self.measured = m
         if journal_problem:
             # integrity output was still collected above, as evidence; no verdict is issued

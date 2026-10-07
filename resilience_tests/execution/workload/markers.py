@@ -111,8 +111,9 @@ class MarkerJournals:
     """The two journals of the protocol, owned by the workload driver."""
 
     def __init__(self, run_dir: Path) -> None:
-        self.marker = DurableJournal(run_dir / MARKER_JOURNAL)
-        self.acked = DurableJournal(run_dir / ACKED_JOURNAL)
+        self.run_dir = Path(run_dir)
+        self.marker = DurableJournal(self.run_dir / MARKER_JOURNAL)
+        self.acked = DurableJournal(self.run_dir / ACKED_JOURNAL)
         self._seq = 0
 
     def next_marker(self) -> tuple[int, str]:

@@ -14,3 +14,4 @@ vendor/elle/elle-cli.jar
 
 # harness run folders (evidence belongs on the driver host, not in git): <ID>-<YYYYMMDD>T<HHMMSS>Z-<hex>
 /*-20[0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-*/
+*.pyc

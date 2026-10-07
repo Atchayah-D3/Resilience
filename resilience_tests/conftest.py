@@ -15,3 +15,5 @@ def pytest_addoption(parser: pytest.Parser) -> None:
                 help="dry run: execute reset..pre_fault only, never inject, never produce a verdict")
     g.addoption("--reference-class", action="store", default="E2",
                 help="reference environment class for env-insensitive scenarios (Arch §14: E2)")
+    g.addoption("--workload", action="store", choices=["pgbench", "builtin"], default=None,
+                help="override profile workload.generator (pgbench | builtin)")

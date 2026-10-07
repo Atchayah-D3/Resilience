@@ -34,8 +34,27 @@ def render_summary(r: dict[str, Any]) -> str:
         f"{r['scenario']['id']}  {r['scenario']['name']}",
         f"run {r['run_id']}  env {r['environment']['profile']} ({r['environment']['class']})  node {r['target']['node']}",
         f"STATUS: {r['status'].upper()}",
-        "",
     ]
+    facts = r.get("facts") or {}
+    generator = facts.get("workload_generator")
+    if generator:
+        gen_line = f"workload generator: {generator}"
+        if generator == "pgbench":
+            pg_ver = facts.get("pgbench_version")
+            if pg_ver:
+                gen_line += f" ({pg_ver})"
+            launches = facts.get("pgbench_launches")
+            if launches is not None:
+                gen_line += f", launches: {launches}"
+            overhead = facts.get("pgbench_recording_overhead")
+            if overhead is not None:
+                gen_line += f"\n  recording overhead: {overhead:.1f}%"
+            lag_p50 = facts.get("pgbench_scheduling_lag_p50_us")
+            lag_p99 = facts.get("pgbench_scheduling_lag_p99_us")
+            if lag_p50 is not None and lag_p99 is not None:
+                gen_line += f"\n  scheduling lag: p50 {lag_p50:.1f} us, p99 {lag_p99:.1f} us"
+        lines.append(gen_line)
+    lines.append("")
     if r.get("error"):
         lines += [f"error: {r['error']}", ""]
     lines.append("phases:")

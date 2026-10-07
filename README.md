@@ -465,6 +465,30 @@ shows the whole interface exercised by a fake engine.
 **A new environment** — one YAML in `envs/`. The model rejects a profile whose harness machine is
 also a target, or that leaves any phase unbounded.
 
+### Workload Generator Selection (`workload` profile section)
+
+Environment profiles support an optional `workload` section configuring the workload driver:
+
+```yaml
+workload:
+  generator: pgbench     # pgbench (default) | builtin
+  pgbench_bin: pgbench   # executable on driver host PATH or absolute path
+```
+
+- **Generators**:
+  - `pgbench`: Supervised pgbench execution (one process per client with `-c 1 -j 1`, evenly spaced transactions without `-R`, automatic drop detection, and per-client relaunch).
+  - `builtin`: Built-in asyncpg workload driver.
+- **Selection & CLI Override**:
+  - Configured per environment in `envs/<profile>.yaml`.
+  - Overridable via `pytest --workload {pgbench,builtin}`.
+- **Refusals (Fail Closed)**:
+  - `pgbench_bin` missing or not executable.
+  - pgbench major version differing from target PostgreSQL major version (`FR-004`).
+  - Adapter lacking `Capability.PGBENCH_WORKLOAD`.
+  - Scenarios requiring `transaction_markers: true` when no verified `RecordChannel` is active (gated on `R1`).
+- **Evidence Files**:
+  - `<run_dir>/pgbench/launch-<n>.txt`: Contains exact argv without secrets, stderr, stdout, and parsed summary with per-command latencies.
+
 ## 12. Target database footprint
 
 ### Objects created
