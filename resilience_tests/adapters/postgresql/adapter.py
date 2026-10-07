@@ -130,6 +130,22 @@ CIC_INDEX = "cic_nlc06_idx"               # created in the table's schema
 CIC_INDEX_QUALIFIED = f"resilience.{CIC_INDEX}"
 CIC_ROWS = 2_000_000
 CIC_CONFIRM_TIMEOUT_S = 30.0
+# fault.during: checkpoint (NL-C-02). The harness's own CHECKPOINT runs at full speed; with
+# little changed data it can complete before the kill arrives, and the run is then aborted
+# because it tested an ordinary crash. Just before the CHECKPOINT the harness updates every
+# row of this harness-owned table, so the checkpoint has a known amount of data to write.
+# Sized from the server's shared_buffers so the changed pages stay in memory and are written
+# by the checkpoint itself. fillfactor 50 and no index keep each update on its own page, so
+# the table is rewritten in place on every run rather than growing.
+CKPT_TABLE = "resilience.checkpoint_ballast"
+CKPT_FRACTION_OF_SHARED_BUFFERS = 0.25
+CKPT_BYTES_PER_ROW = 500               # a ~250-byte row on a half-filled page
+CKPT_DDL = (f"CREATE TABLE IF NOT EXISTS {CKPT_TABLE} (id bigint NOT NULL, v bigint NOT NULL DEFAULT 0, "
+            "pad text NOT NULL) WITH (fillfactor = 50)")
+CKPT_SEED = f"INSERT INTO {CKPT_TABLE} (id, pad) SELECT g, repeat('b', 200) FROM generate_series(1, $1) g"
+SHARED_BUFFERS_BYTES_SQL = ("SELECT setting::bigint * current_setting('block_size')::bigint "
+                            "FROM pg_settings WHERE name = 'shared_buffers'")
+
 CIC_DDL = f"CREATE TABLE IF NOT EXISTS {CIC_TABLE} (id bigint NOT NULL, k text NOT NULL)"
 CIC_SEED = f"INSERT INTO {CIC_TABLE} (id, k) SELECT g, md5(g::text) FROM generate_series(1, $1) g"
 CIC_BUILD = f"CREATE INDEX CONCURRENTLY {CIC_INDEX} ON {CIC_TABLE} (k)"
@@ -263,6 +279,16 @@ IDLE_CONFIRM_TIMEOUT_S = 5.0
 VACUUM_PROBE_TIMEOUT_S = 120.0
 _DEAD_NOT_REMOVABLE_RE = re.compile(r"(\d+) are dead but not yet removable")
 _REMOVABLE_CUTOFF_RE = re.compile(r"removable cutoff: (\d+)")
+
+# NL-I (fault type data_corruption): the harness-owned relation the fault corrupts. Its own
+# table, so a byte is only ever flipped in data the harness created; never markers, never
+# operator data. autovacuum is off on it so nothing in the background reads the damaged page
+# before the harness does -- the first read is the one that is measured.
+CORRUPTION_TARGET = "resilience.corruption_target"
+CORRUPTION_TARGET_ROWS = 2_000          # ~35 pages: a page in the middle is surely populated
+CORRUPTION_BYTE_FROM_PAGE_END = 64      # inside the tuple area, far from the page header
+# PostgreSQL: "invalid page in block 17 of relation base/16384/16400" (SQLSTATE XX001)
+_INVALID_PAGE_RE = re.compile(r"invalid page in block (\d+) of relation (\S+)")
 
 _SAME_AS_CONNECT: Any = object()  # sentinel: bound statements by the connect timeout
 
@@ -480,6 +506,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             # resilience schema, and silently leaves the index behind.
             await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {LEGACY_CIC_INDEX}")
             await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
+            # a corrupted relation left by an earlier run would fail every later integrity check;
+            # DROP never reads its pages, so it is safe even when they are damaged
+            await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
             await conn.execute(TRUNCATE)
             # Seeded every run, after the truncate: the churn table starts from a freshly
             # written, unfragmented state, so the first footprint sample is a real floor and
@@ -488,6 +517,84 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             await conn.execute("VACUUM (ANALYZE) resilience.churn")
         finally:
             await conn.close()
+
+    corruption_sqlstates = ("XX001",)  # data_corrupted
+
+    async def prepare_corruption_target(self) -> dict[str, Any]:
+        """Recreate the corruption target and locate a populated page in its data file."""
+        conn = await self._connect(timeout_s=60.0)
+        try:
+            await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
+            await conn.execute(f"CREATE TABLE {CORRUPTION_TARGET} (id int NOT NULL, payload text NOT NULL) "
+                               "WITH (autovacuum_enabled = false)")
+            await conn.execute(f"INSERT INTO {CORRUPTION_TARGET} SELECT g, repeat('c', 100) "
+                               "FROM generate_series(1, $1) g", CORRUPTION_TARGET_ROWS)
+            row = await conn.fetchrow(
+                "SELECT pg_relation_filepath($1::regclass) AS path, "
+                "pg_relation_filenode($1::regclass)::bigint AS filenode, "
+                "current_setting('block_size')::int AS block_size, "
+                "pg_relation_size($1::regclass)::bigint AS bytes", CORRUPTION_TARGET)
+        finally:
+            await conn.close()
+        pages = int(row["bytes"]) // int(row["block_size"])
+        return {
+            "relation": CORRUPTION_TARGET,
+            "relation_path": str(row["path"]),
+            "filenode": int(row["filenode"]),
+            "block": pages // 2,
+            "pages": pages,
+            "block_size": int(row["block_size"]),
+            "byte_in_page": int(row["block_size"]) - CORRUPTION_BYTE_FROM_PAGE_END,
+            "rows": CORRUPTION_TARGET_ROWS,
+        }
+
+    async def read_corruption_target(self, attempts: int = 2) -> dict[str, Any]:
+        """A full sequential read (count(*) over a table with no index reads every page),
+        on a fresh connection each time so no attempt is answered from a session cache."""
+        out = []
+        for _ in range(attempts):
+            conn = await self._connect(timeout_s=10.0, command_timeout=60.0)
+            try:
+                rows = await conn.fetchval(f"SELECT count(*) FROM {CORRUPTION_TARGET}")
+                out.append({"error": None, "rows": int(rows)})
+            except asyncpg.PostgresError as exc:
+                message = str(exc)
+                where = _INVALID_PAGE_RE.search(message)
+                out.append({"error": type(exc).__name__, "sqlstate": getattr(exc, "sqlstate", None),
+                            "message": message[:500],
+                            "block": int(where.group(1)) if where else None,
+                            "relation_path": where.group(2) if where else None})
+            finally:
+                await conn.close()
+        return {"attempts": out}
+
+    async def amcheck_relation(self, relation: str, timeout_s: float) -> dict[str, Any]:
+        """pg_amcheck on the one relation (Arch §10.1 names it for NL-I-01). A checksum failure
+        surfaces either as a reported finding or as the check's own read failing with the
+        invalid-page error; both mean the checker noticed. A clean exit means it did not."""
+        node = self.node
+        command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
+                   f"-d {shlex.quote(node.db.dbname)} --relation={shlex.quote(relation)}")
+        async with RemoteHost(node.ssh) as host:
+            result = await host.run(as_user(node.os_user, command), timeout_s=timeout_s, check=False)
+        output = (result.stdout + result.stderr).strip()
+        noticed = bool(_AMCHECK_FINDING_RE.search(output) or _INVALID_PAGE_RE.search(output)
+                       or "checksum" in output.lower())
+        if result.exit_status == 0 and not noticed:
+            detected: bool | None = False
+        elif result.exit_status != 0 and noticed:
+            detected = True
+        else:
+            detected = None   # e.g. could not connect, or exited non-zero for another reason
+        return {"detected": detected, "exit_status": result.exit_status, "output": output[:2000]}
+
+    def corruption_log_locations(self, lines: Sequence[str]) -> list[tuple[int, str]]:
+        found = []
+        for line in lines:
+            m = _INVALID_PAGE_RE.search(line)
+            if m:
+                found.append((int(m.group(1)), m.group(2)))
+        return found
 
     def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
         return parse_pg_interval_s(observed.get("idle_in_transaction_session_timeout"))
@@ -499,6 +606,8 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         seeding them never disturbs the steady state being measured."""
         if during == "autovacuum_worker":
             return await self._prepare_avac_table()
+        if during == "checkpoint":
+            return await self._prepare_checkpoint_table()
         if during != "concurrent_index_build":
             return {}
         conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
@@ -614,6 +723,41 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                     "t_recovered": str(t_recovered), "dead_tuples_made": dead}
         finally:
             await conn.close()
+
+    async def _prepare_checkpoint_table(self) -> dict[str, Any]:
+        """Create the checkpoint table, sized to a fraction of this server's shared_buffers.
+        An existing table of the right size is reused; otherwise it is reseeded."""
+        conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
+        try:
+            shared = int(await conn.fetchval(SHARED_BUFFERS_BYTES_SQL))
+            target_bytes = int(shared * CKPT_FRACTION_OF_SHARED_BUFFERS)
+            rows = max(1, target_bytes // CKPT_BYTES_PER_ROW)
+            await conn.execute(CKPT_DDL)
+            have = int(await conn.fetchval(f"SELECT count(*) FROM {CKPT_TABLE}"))
+            if have != rows:
+                await conn.execute(f"TRUNCATE {CKPT_TABLE}")
+                await conn.execute(CKPT_SEED, rows)
+                await conn.execute(f"VACUUM (ANALYZE) {CKPT_TABLE}")
+            size = int(await conn.fetchval(f"SELECT pg_relation_size('{CKPT_TABLE}')"))
+            return {"table": CKPT_TABLE, "rows": rows, "reseeded": have != rows,
+                    "table_bytes": size, "shared_buffers_bytes": shared}
+        finally:
+            await conn.close()
+
+    async def change_pages_before_checkpoint(self) -> dict[str, Any]:
+        """Update every row of the checkpoint table, so its pages are changed in memory and
+        not yet on disk: the CHECKPOINT that follows has to write all of them."""
+        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
+        try:
+            started = time.monotonic()
+            status = await conn.execute(f"UPDATE {CKPT_TABLE} SET v = v + 1")
+            elapsed = time.monotonic() - started
+            size = int(await conn.fetchval(f"SELECT pg_relation_size('{CKPT_TABLE}')"))
+        finally:
+            await conn.close()
+        updated = int(status.split()[-1]) if status and status.split()[-1].isdigit() else None
+        return {"supported": True, "table": CKPT_TABLE, "rows_updated": updated,
+                "table_bytes": size, "update_s": round(elapsed, 3)}
 
     async def _start_background(self, statements: list[tuple[str, tuple[Any, ...]]],
                                 in_transaction: bool) -> int:
@@ -1221,8 +1365,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                     "(CREATE EXTENSION amcheck) -- the harness does not modify target databases"
                 )
             db_args = " ".join(f"-d {shlex.quote(db)}" for db in databases)
+            exclude = "".join(f" --exclude-relation={shlex.quote(r)}" for r in self.integrity_exclusions)
             command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
-                       f"{db_args} --heapallindexed")
+                       f"{db_args} --heapallindexed{exclude}")
             result = await host.run(as_user(node.os_user, command), timeout_s=timeout_s, check=False)
         output = result.stdout + result.stderr
         if result.exit_status not in (0, 2):
@@ -1238,7 +1383,8 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         return IntegrityResult(
             structural_errors=findings, checksum_failures=checksum_failures_since(baseline, stats),
             raw_output=output,
-            detail={"exit_status": result.exit_status, "databases": databases,
+            detail={"command": command, "exit_status": result.exit_status, "databases": databases,
+                    "excluded_relations": list(self.integrity_exclusions),
                     "checksum_baseline_taken": baseline is not None},
         )
 

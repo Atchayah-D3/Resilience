@@ -145,12 +145,92 @@ def test_nl_c_02_arms_the_kill_before_the_checkpoint_starts(env, monkeypatch):
         order.append("kill")
         return await real_inject(self, node)
 
+    async def change(self):
+        order.append("change data")
+        return {"supported": True, "table": "resilience.checkpoint_ballast", "rows_updated": 67108,
+                "table_bytes": 33554432, "update_s": 0.4}
+
     monkeypatch.setattr(FakeFault, "arm", arm, raising=False)
     monkeypatch.setattr(FakeFault, "inject", inject)
     monkeypatch.setattr(OutageAdapter, "trigger_checkpoint_and_await_active", trigger)
+    monkeypatch.setattr(OutageAdapter, "change_pages_before_checkpoint", change)
     results = _run_nlc02(env)
     assert results["status"] == "passed", why(results)
-    assert order == ["arm", "checkpoint", "kill"]
+    # the data is changed after the kill is armed and immediately before the checkpoint
+    assert order == ["arm", "change data", "checkpoint", "kill"]
+    assert results["facts"]["checkpoint_pages_changed"]["rows_updated"] == 67108
+    from resilience_tests.analysis.report import render_summary
+    assert "data changed just before the checkpoint: 67108 rows" in render_summary(results)
+
+
+def test_nl_c_02_aborts_if_the_data_for_the_checkpoint_cannot_be_prepared(env, monkeypatch):
+    """No checkpoint, no kill: the run stops before the fault and releases the armed kill."""
+    from tests.test_orchestrator import FakeFault
+    disarmed: list[bool] = []
+
+    async def fails(self):
+        raise RuntimeError("permission denied for table checkpoint_ballast")
+
+    async def disarm(self):
+        disarmed.append(True)
+
+    monkeypatch.setattr(OutageAdapter, "change_pages_before_checkpoint", fails)
+    monkeypatch.setattr(FakeFault, "disarm", disarm, raising=False)
+    results = _run_nlc02(env)
+    assert results["status"] == "aborted", why(results)
+    assert "could not prepare data for the checkpoint" in results["error"]
+    assert "checkpoint_injection" not in results["facts"] and disarmed
+
+
+class _CkptConn:
+    """Fake connection for the checkpoint table: shared_buffers 128 MB, `have` rows present."""
+
+    def __init__(self, have):
+        self.have, self.sql = have, []
+
+    async def fetchval(self, sql, *args):
+        self.sql.append(sql)
+        if "shared_buffers" in sql:
+            return 128 * 1024 * 1024
+        if "count(*)" in sql:
+            return self.have
+        return 33_554_432                      # pg_relation_size
+
+    async def execute(self, sql, *args):
+        self.sql.append(sql)
+        return "UPDATE 67108" if sql.startswith("UPDATE") else "OK"
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.parametrize("have,reseeded", [(67108, False), (500, True)])
+def test_the_checkpoint_table_is_sized_from_shared_buffers_and_reused(have, reseeded):
+    """A quarter of 128 MB at ~500 bytes per row = 67,108 rows; a table of exactly that size is
+    reused, anything else is reseeded."""
+    adapter = _pg_adapter()
+    conn = _CkptConn(have)
+
+    async def connect(*a, **k):
+        return conn
+
+    adapter._connect = connect
+    out = asyncio.run(adapter.prepare_scenario_objects("checkpoint"))
+    assert (out["rows"], out["reseeded"], out["shared_buffers_bytes"]) == (67108, reseeded, 128 * 1024 * 1024)
+    assert any(q.startswith("TRUNCATE") for q in conn.sql) is reseeded
+
+
+def test_every_row_is_updated_right_before_the_checkpoint():
+    adapter = _pg_adapter()
+    conn = _CkptConn(67108)
+
+    async def connect(*a, **k):
+        return conn
+
+    adapter._connect = connect
+    out = asyncio.run(adapter.change_pages_before_checkpoint())
+    assert out["supported"] is True and out["rows_updated"] == 67108
+    assert "UPDATE resilience.checkpoint_ballast SET v = v + 1" in conn.sql
 
 
 def test_nl_c_02_fails_if_checkpoint_not_active(env, monkeypatch):

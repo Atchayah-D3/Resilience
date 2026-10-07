@@ -1,0 +1,102 @@
+# NL-I-01 -- Heap page checksum corruption (Framework §10.4, Tier 1, P0).
+# Fault injection: corrupt a byte in the heap file.
+# Acceptance: detected on read; the error identifies the relation and block.
+#
+# Integrity property (Framework §2.2): corruption is always detected and surfaced, never
+# silent -- conditional on data_checksums=on, which the harness refuses to run without
+# (Framework §3.5, §16.2). Tools per Arch §10.1: pg_checksums (offline checksum verification)
+# proves the fault; pg_amcheck is the structural checker for heap corruption.
+#
+# The fault is applied to a relation the harness creates for it (never markers, never operator
+# data): one byte in a page in the middle of the table is inverted with the database cleanly
+# shut down, and pg_checksums must then report a checksum failure at exactly that block before
+# the database is started again. A clean shutdown matters: after a crash, recovery could
+# restore the page from a full-page image in the WAL and silently undo the fault. If any of
+# that does not hold, the run is aborted -- nothing is scored against a fault that did not land.
+#
+# What each acceptance rule proves, and why it is needed against a false pass:
+#   corruption_detected_on_read   the first read FAILED with the data-corruption error code.
+#                                 A read that returns rows -- with ignore_checksum_failure or
+#                                 zero_damaged_pages on, say -- is the silent case and fails.
+#   detection_identifies_block    the error names THIS relation and THIS block, so an error from
+#                                 some older, unrelated damage cannot satisfy the rule.
+#   amcheck_detects_target        the structural checker, run on the damaged relation alone,
+#                                 notices it (Arch §10.1).
+#   checksum_failure_reported     the engine counted the failure (pg_stat_database), so it is
+#                                 surfaced to monitoring and not only to the reading client.
+#   corruption_outside_target     no other relation appears in the engine's own failure reports.
+#   structural_integrity_errors   pg_amcheck over the rest of the database is clean (§16.3).
+#   rpo_txn                       the fault's clean stop and start lost no acknowledged commit.
+#
+# corruption_count is reported, not gated: it includes the failures this scenario causes on
+# purpose. The Framework gives no steady-state or workload numbers for this row; the values
+# below match NL-C-01. NEEDS SIGN-OFF.
+id: NL-I-01
+name: Heap page checksum corruption
+tier: node_local
+category: NL-I
+applies_to: [standalone, distdb.pc, distdb.qc, distdb.worker]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false           # Framework §7.3: NL-I is PostgreSQL-internal behaviour
+
+steady_state:
+  tps_min: 150
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: oltp_write_heavy
+  concurrency: 64
+  transaction_markers: true      # RPO across the fault's clean stop and start
+  rate_tps: 200
+
+fault:
+  type: data_corruption
+  driver: os_ssh                 # env-profile section; the profile picks the driver
+  target: primary
+  duration: permanent
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:                        # engine capabilities this scenario needs (Arch §8)
+  - transactional_markers
+  - structural_integrity_check
+  - page_checksums
+
+measure:
+  - corruption_detected_on_read
+  - detection_identifies_block
+  - detection_repeatable         # reported: a second fresh read fails the same way
+  - amcheck_detects_target
+  - checksum_failure_reported
+  - corruption_outside_target
+  - structural_integrity_errors  # every relation except the deliberately damaged one
+  - corruption_count             # reported only: includes the failures caused on purpose
+  - rpo_txn
+  - indeterminate_txn
+
+accept:
+  - corruption_detected_on_read == true
+  - detection_identifies_block == true
+  - amcheck_detects_target == true
+  - checksum_failure_reported == true
+  - corruption_outside_target == 0
+  - structural_integrity_errors == 0
+  - rpo_txn == 0
+
+priority: P0
+
+description: >
+  One byte in one page of a harness-owned table is corrupted with the database cleanly shut
+  down, the corruption is confirmed by offline checksum verification at exactly that block,
+  and the database is started again. Reading the table must fail with an error naming the
+  relation and the block, the structural checker must notice it, the engine must count the
+  failure, and nothing else may be damaged (Framework §10.4, Arch §10.1).

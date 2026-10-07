@@ -94,6 +94,11 @@ def render_summary(r: dict[str, Any]) -> str:
             event_desc = "none (checkpointer running, not waiting)"
 
         verification = (r.get("facts") or {}).get("checkpoint_verification") or {}
+        changed = (r.get("facts") or {}).get("checkpoint_pages_changed") or {}
+        if changed.get("supported"):
+            lines += ["", f"data changed just before the checkpoint: {changed.get('rows_updated')} rows of "
+                          f"{changed.get('table')} ({(changed.get('table_bytes') or 0) / 1024**2:.1f} MB) "
+                          f"in {changed.get('update_s')} s"]
         lines += [
             "",
             "checkpoint fault injection (NL-C-02):",
@@ -133,6 +138,25 @@ def render_summary(r: dict[str, Any]) -> str:
             f"dead but not removable: {probe.get('dead_not_removable')}  "
             f"removable cutoff: {probe.get('removable_cutoff')}  "
             f"bloat alert fired: {measured.get('bloat_alert_fired')}",
+        ]
+    corrupted = (r.get("facts") or {}).get("data_corruption")
+    if corrupted:
+        facts = r.get("facts") or {}
+        attempts = (facts.get("corruption_read") or {}).get("attempts") or []
+        first = attempts[0] if attempts else {}
+        checks = corrupted.get("pg_checksums") or {}
+        lines += [
+            "",
+            "data-file corruption (NL-I):",
+            f"  injected: {corrupted.get('relation')} block {corrupted.get('block')} "
+            f"({corrupted.get('relation_path')}), byte {corrupted.get('original_byte')} -> "
+            f"{corrupted.get('written_byte')}, after a {corrupted.get('cluster_state')!r} stop",
+            f"  pg_checksums before restart: {checks.get('failures')}",
+            f"  first read: {first.get('sqlstate') or 'no error'}  {first.get('message') or ''}"
+            + (f"  ({first.get('rows')} rows returned)" if first.get("rows") is not None else ""),
+            f"  pg_amcheck on the damaged relation: detected={(facts.get('amcheck_on_corrupted_relation') or {}).get('detected')}",
+            f"  failures in the server log: {facts.get('corruption_log_locations')}",
+            f"  whole-database check left out: {(facts.get('integrity_check') or {}).get('excluded_relations')}",
         ]
     if r.get("measured"):
         rendered = []
