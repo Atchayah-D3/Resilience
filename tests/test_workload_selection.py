@@ -15,10 +15,7 @@ from resilience_tests.adapters.base import (
 )
 from resilience_tests.control.profile import EnvProfile, WorkloadConfig, load_profile
 from resilience_tests.execution.workload.driver import UnsupportedWorkload, WorkloadDriver
-from resilience_tests.execution.workload.interface import (
-    make_workload_driver,
-    register_record_channel_factory,
-)
+from resilience_tests.execution.workload.interface import make_workload_driver
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.execution.workload.pgbench_driver import PgbenchWorkloadDriver
 from resilience_tests.observability.event_stream import EventStream
@@ -58,12 +55,12 @@ class MockAdapter(BaseDatabaseAdapter):
     async def server_version(self) -> str:
         return self._server_version_str
 
-    def pgbench_launch(self, shape: str, launch: int, client: int) -> PgbenchLaunchSpec:
+    def pgbench_launch(self, shape: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec:
         return PgbenchLaunchSpec(
             script="SELECT 1;\n",
             variables={},
             connection=self.node.client,
-            application_name=f"resilience-pgbench-test-{launch}",
+            application_name="resilience-pgbench-test",
         )
 
 
@@ -181,28 +178,25 @@ def test_adapter_without_capability_refuses(tmp_path):
         )
 
 
-def test_transaction_markers_without_r1_channel_refuses(tmp_path):
-    """(f) a scenario with transaction_markers: true while no record channel is registered -> refusal citing research R1."""
-    # Ensure no record channel is registered
-    register_record_channel_factory(None, tests_passed=False)
-
+def test_marker_scenarios_run_on_pgbench(tmp_path):
+    """(f) every catalog scenario records markers; pgbench carries them through its record steps."""
     profile = _base_profile(WorkloadConfig(generator="pgbench", pgbench_bin=FAKE_PGBENCH))
-    node = profile.nodes[0]
-    adapter = MockAdapter(node, server_version_str="PostgreSQL 17.11 on x86_64")
+    adapter = MockAdapter(profile.nodes[0], server_version_str="PostgreSQL 17.11 on x86_64")
     scenario = load_catalog().scenarios["NL-C-01"]  # transaction_markers: true
-    journals = MarkerJournals(tmp_path)
-    stream = EventStream(tmp_path / "events.jsonl")
+    driver = asyncio.run(make_workload_driver(profile, adapter, scenario.workload, MarkerJournals(tmp_path),
+                                              EventStream(tmp_path / "events.jsonl")))
+    assert isinstance(driver, PgbenchWorkloadDriver) and driver.shape == "marker"
+    assert "17.11" in driver.pgbench_version
 
-    with pytest.raises(UnsupportedWorkload, match="R1"):
-        asyncio.run(
-            make_workload_driver(
-                profile,
-                adapter,
-                scenario.workload,
-                journals,
-                stream,
-            )
-        )
+
+def test_a_shape_the_engine_cannot_run_is_refused_before_probing(tmp_path):
+    """The built-in driver's refusals apply to pgbench too: no churn capability, no NL-C-05."""
+    profile = _base_profile(WorkloadConfig(generator="pgbench", pgbench_bin="/nonexistent/path"))
+    adapter = MockAdapter(profile.nodes[0])   # no WORKLOAD_CHURN
+    scenario = load_catalog().scenarios["NL-C-05"]
+    with pytest.raises(UnsupportedWorkload, match="churn workload"):
+        asyncio.run(make_workload_driver(profile, adapter, scenario.workload, MarkerJournals(tmp_path),
+                                         EventStream(tmp_path / "events.jsonl")))
 
 
 def test_never_returns_other_driver_on_failure(tmp_path):

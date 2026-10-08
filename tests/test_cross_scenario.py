@@ -140,6 +140,12 @@ def test_failed_attempts_count_towards_latency(env, monkeypatch):
         return await real(self, seq, marker_id)
 
     monkeypatch.setattr(OutageSession, "commit_marker", every_tenth_hangs_then_fails)
+    from tests.test_orchestrator import Engine
+    if Engine.pgbench_db is not None:
+        # the same through pgbench: every third COMMIT of a client (5 per second each) waits
+        # 0.25 s, then the server rejects it
+        Engine.pgbench_db.flag("serialize-every", value="3")
+        Engine.pgbench_db.flag("serialize-delay", value="0.25")
     _, results = run_scenario(env, scenario("NL-C-01"))
     assert results["baseline"]["p99_ms"] >= 250
 
@@ -147,15 +153,15 @@ def test_failed_attempts_count_towards_latency(env, monkeypatch):
 def test_warm_up_waits_for_every_worker(env, monkeypatch):
     """The window opens only once the declared concurrency is actually connected."""
     from resilience_tests.execution.workload.driver import WorkloadDriver
+    from resilience_tests.execution.workload.pgbench_driver import PgbenchWorkloadDriver
 
     seen: list[int] = []
-    real = WorkloadDriver.begin_window
+    for cls in (WorkloadDriver, PgbenchWorkloadDriver):
+        def begin(self, real=cls.begin_window):
+            seen.append(self.connected_workers)
+            return real(self)
 
-    def begin(self):
-        seen.append(self.connected_workers)
-        return real(self)
-
-    monkeypatch.setattr(WorkloadDriver, "begin_window", begin)
+        monkeypatch.setattr(cls, "begin_window", begin)
     o, results = run_scenario(env, scenario("NL-C-01"))
     assert seen == [o.scenario.workload.concurrency], why(results)
 

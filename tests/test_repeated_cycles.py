@@ -20,7 +20,7 @@ from resilience_tests.execution.injectors.process import OsSshProcessDriver, _us
 from tests.test_measurement_and_safety import NODE, PROFILE, use_host
 
 # reuse the orchestrator's fake engine, fake fault and fixture wiring
-from tests.test_orchestrator import CATALOG, Engine, FakeFault, OutageAdapter, env, run, why  # noqa: F401
+from tests.test_orchestrator import CATALOG, Engine, FakeFault, OutageAdapter, churn_ops, env, run, why  # noqa: F401
 from tests.test_orchestrator import scenario as _scenario
 from resilience_tests.control import orchestrator as orch
 from resilience_tests.control.matrix import RunPlanItem
@@ -395,7 +395,7 @@ def test_the_workload_actually_churns(env, footprints):
     """`mixed` must issue update/delete traffic, not just marker inserts. If it silently fell
     back to append-only, bloat_ratio would sit at 1.0 for any database, healthy or not."""
     run_cycles(env)
-    assert Engine.churn_ops > 100, f"only {Engine.churn_ops} churn operations were issued"
+    assert churn_ops() > 100, f"only {churn_ops()} churn operations were issued"
 
 
 def test_an_engine_without_churn_is_refused_not_quietly_downgraded(env, monkeypatch):

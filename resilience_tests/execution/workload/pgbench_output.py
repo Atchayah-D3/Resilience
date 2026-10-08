@@ -29,6 +29,9 @@ class PgbenchAbortLine:
     command_idx: int | None
     script: str | None
     message: str
+    # "sql": a statement failed -- the database (or the way to it) ended the client.
+    # "meta": a meta-command (\\shell, \\setshell, ...) failed -- never the database's doing.
+    kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -60,10 +63,19 @@ _PROGRESS_RE = re.compile(
     r"^progress:\s+([0-9.]+)\s+s,\s+([0-9.]+)\s+tps,\s+lat\s+([0-9.]+)\s+ms\s+stddev\s+([0-9.]+),\s+(\d+)\s+failed"
 )
 
-# Pattern: client 0 aborted in command 2 (SQL) of script foo.sql: ERROR: ...
+# ShaktiDB / PostgreSQL 17 pgbench (recorded on the lab build), with or without the
+# "pgbench: error: " prefix:
+#   client 0 aborted in command 3 (SQL) of script 0; perhaps the backend died while processing
+#   client 0 script 0 aborted in command 3 query 0: FATAL:  terminating connection due to ...
+#   client 0 aborted in command 0 (shell) of script 0; execution of meta-command failed
 _ABORT_RE = re.compile(
-    r"^client\s+(\d+)\s+aborted(?:\s+in\s+command\s+(\d+)(?:\s+\([^)]+\))?)?(?:\s+of\s+script\s+([^:]+))?:\s*(.*)$"
+    r"^(?:pgbench:\s+error:\s+)?client\s+(\d+)\s+(?:script\s+(\S+)\s+)?aborted"
+    r"(?:\s+in\s+command\s+(\d+))?(?:\s+\(([^)]+)\))?(?:\s+(query)\s+\d+)?"
+    r"(?:\s+of\s+script\s+([^:;]+))?\s*[:;]?\s*(.*)$"
 )
+# pgbench could not open its connection at all (the server is down or refusing): it exits
+# before running a transaction, with no abort line.
+_CONNECT_FAILURE_RE = re.compile(r"connection to server .* failed|could not create connection", re.IGNORECASE)
 
 _CMD_LATENCY_RE = re.compile(
     r"^\s*([0-9.]+)\s+(\d+)\s+(.+)$"
@@ -89,16 +101,24 @@ def parse_abort_line(line: str) -> PgbenchAbortLine:
     m = _ABORT_RE.match(line)
     if not m:
         raise PgbenchParseError(f"unparseable abort line: {line!r}")
+    tag = (m.group(4) or "").lower()
+    kind = "sql" if tag == "sql" or m.group(5) else ("meta" if tag else None)
     return PgbenchAbortLine(
         client=int(m.group(1)),
-        command_idx=int(m.group(2)) if m.group(2) else None,
-        script=m.group(3) if m.group(3) else None,
-        message=m.group(4).strip(),
+        command_idx=int(m.group(3)) if m.group(3) else None,
+        script=m.group(2) or (m.group(6).strip() if m.group(6) else None),
+        message=m.group(7).strip(),
+        kind=kind,
     )
 
 
 def is_abort_line(line: str) -> bool:
     return bool(_ABORT_RE.match(line.strip()))
+
+
+def is_connect_failure(stderr_text: str) -> bool:
+    """pgbench exited because it could not connect (no transaction was attempted)."""
+    return bool(_CONNECT_FAILURE_RE.search(stderr_text))
 
 
 def parse_summary(text: str) -> PgbenchSummary:

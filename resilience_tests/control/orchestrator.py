@@ -467,10 +467,7 @@ class TestOrchestrator:
             # name the likely limiter: driver-side flush latency vs database latency
             jp99 = self.baseline.journal_p99_ms
             dp99 = self.baseline.p99_ms   # None when the window committed nothing
-            if getattr(self.workload, "generator", "") == "pgbench":
-                where = "driver record steps" if jp99 is not None and dp99 is not None and jp99 > dp99 else "target database"
-            else:
-                where = "driver journal flush" if jp99 is not None and dp99 is not None and jp99 > dp99 else "target database"
+            where = "driver journal flush" if jp99 is not None and dp99 is not None and jp99 > dp99 else "target database"
             raise PhaseAbort(
                 f"steady state did not hold (tps={self.baseline.tps:.1f}, "
                 f"db p99={dp99 if dp99 is None else round(dp99, 1)} ms, "
@@ -1053,14 +1050,6 @@ class TestOrchestrator:
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).
         self.facts["declared_not_produced"] = sorted(set(self.scenario.measure) - set(m))
-        if isinstance(self.workload, PgbenchWorkloadDriver):
-            overhead = self.workload.recording_overhead_pct()
-            if overhead is not None:
-                self.facts["pgbench_recording_overhead"] = overhead
-            self.facts["pgbench_launches"] = self.workload._launch_counter
-            if self.workload.scheduling_lags_us:
-                self.facts["pgbench_scheduling_lag_p50_us"] = percentile(self.workload.scheduling_lags_us, 0.50)
-                self.facts["pgbench_scheduling_lag_p99_us"] = p99(self.workload.scheduling_lags_us)
         self.measured = m
         if journal_problem:
             # integrity output was still collected above, as evidence; no verdict is issued
@@ -1392,7 +1381,15 @@ class TestOrchestrator:
             await asyncio.gather(self.abort_task, return_exceptions=True)
             self.abort_task = None
         if self.workload:
-            await self.workload.stop()
+            try:
+                await self.workload.stop()
+            finally:
+                if isinstance(self.workload, PgbenchWorkloadDriver):
+                    self.facts.update(self.workload.report_facts())
+                    if not self.facts["pgbench_exit_with_harness"]:
+                        self.disclosures.append(
+                            "setpriv is not available on the driver host, so a harness that crashed "
+                            "would leave its pgbench processes running; stop() still ended them in this run.")
             self._workload_failure = self._workload_failure or self.workload.failure
             self.workload = None
         if self.write_prober:

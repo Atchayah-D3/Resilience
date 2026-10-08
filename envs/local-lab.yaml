@@ -26,9 +26,12 @@ storage_fault:
 reset:
   driver: none
 
-# Build-out rule (plan.md): explicit builtin generator until switched to pgbench in T052
+# Load is offered by pgbench on the driver host (specs/002, research R1 option B); the
+# built-in asyncpg driver stays selectable with `generator: builtin`. Full path: Debian's
+# /usr/bin/pgbench is pg_wrapper. Its major version must match the server's (FR-004).
 workload:
-  generator: builtin
+  generator: pgbench
+  pgbench_bin: /opt/shaktidb/bin/pgbench
 
 sla_tier_target: platinum
 

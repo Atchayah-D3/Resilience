@@ -131,3 +131,9 @@ Principles I-VII. Feature creation does not create git branches; it writes `spec
 - NL-M-03 keeps `resilience.avac_target` (1M rows, ~40 MB) between runs, seeded once; a run
   takes ~15-20 min at a 60 s `autovacuum_naptime` (worker wait per cycle up to 2 x naptime + 30 s).
 - `observe_fault_settings` gets `during=` only when the scenario sets one (keeps older fakes valid).
+- **Workload generator is pgbench on the `pgbench` branch** (`envs/*.yaml` `workload:`). The driver host needs a
+  pgbench of the server's major version at `pgbench_bin` (full path; `/usr/bin/pgbench` is pg_wrapper) and
+  `/bin/sh`; without `setpriv` a crashed harness can orphan pgbench (disclosed). `--workload builtin` runs the asyncpg driver instead. Record steps talk to the
+  harness through named pipes in `<run_dir>/pgbench/`; the run directory path must not contain whitespace.
+- Orchestrator unit tests run on both generators; the pgbench side uses `tests/fakes/fake_pgbench.py` at 8
+  clients / 40 TPS (a Python process per client). Its fake database lives in files (`down`, `lose`, `hang`, ...).

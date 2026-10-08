@@ -5,6 +5,7 @@ import pytest
 from resilience_tests.execution.workload.pgbench_output import (
     PgbenchParseError,
     is_abort_line,
+    is_connect_failure,
     parse_abort_line,
     parse_progress_line,
     parse_summary,
@@ -44,6 +45,30 @@ def test_parse_abort_line():
     assert a2.command_idx is None
     assert a2.script is None
     assert a2.message == "server closed the connection unexpectedly"
+
+
+def test_parse_abort_lines_of_the_lab_pgbench():
+    """Recorded from ShaktiDB 17 pgbench: a terminated backend, a crashed server, and a failed
+    record step. The first two are the database's doing; the third never is."""
+    term = parse_abort_line("pgbench: error: client 0 script 0 aborted in command 3 query 0: FATAL:  "
+                            "terminating connection due to administrator command")
+    assert (term.client, term.command_idx, term.kind) == (0, 3, "sql")
+    assert "terminating connection" in term.message
+    crash = parse_abort_line("pgbench: error: client 0 aborted in command 3 (SQL) of script 0; "
+                             "perhaps the backend died while processing")
+    assert (crash.command_idx, crash.kind, crash.script) == (3, "sql", "0")
+    meta = parse_abort_line("pgbench: error: client 0 aborted in command 0 (shell) of script 0; "
+                            "execution of meta-command failed")
+    assert meta.kind == "meta"
+    assert parse_abort_line("pgbench: error: client 0 aborted in command 1 (setshell) of script 0; "
+                            "execution of meta-command failed").kind == "meta"
+    assert not is_abort_line("pgbench: error: Run was aborted; the above results are incomplete.")
+
+
+def test_connect_failure_is_recognised():
+    assert is_connect_failure('pgbench: error: connection to server at "127.0.0.1", port 55433 failed: '
+                              "Connection refused\npgbench: error: could not create connection for setup")
+    assert not is_connect_failure("pgbench: error: client 0 aborted in command 3 (SQL) of script 0")
 
 
 def test_parse_abort_line_unparseable_raises():

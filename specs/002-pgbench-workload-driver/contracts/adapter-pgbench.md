@@ -1,33 +1,43 @@
 # Contract: What the Adapter Supplies to the pgbench Driver
 
-Constitution V: only the adapter knows the database. The pgbench driver treats everything below as opaque.
+Constitution V: only the adapter knows the database. The pgbench driver adds the record steps (research R1, option B) around the adapter's transaction and never reads its SQL.
 
 ## Capability
 
-`Capability.PGBENCH_WORKLOAD`, declared by the PostgreSQL adapter. An engine without it makes `generator: pgbench` refuse (FR-004).
+`Capability.PGBENCH_WORKLOAD`, declared by the PostgreSQL adapter. An engine without it makes `generator: pgbench` refuse (FR-004). The built-in driver's refusals apply too: `TRANSACTIONAL_MARKERS`, `WORKLOAD_CHURN` for `mixed`, `LIST_APPEND_HISTORY` for `history: list_append`.
 
-## Hook
+## Hooks
 
 ```text
-adapter.pgbench_launch(shape: str, launch: int, client: int) -> PgbenchLaunchSpec
+adapter.pgbench_launch(shape: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec
+adapter.pgbench_marker_uuid(seq: int) -> str
 ```
 
-- `shape`: `marker` | `churn` | `list_append`, derived by the driver from `workload.profile` / `workload.history` exactly as the built-in driver derives it today.
+- `shape`: `marker` | `churn` | `list_append`, derived exactly as the built-in driver derives it.
+- `pgbench_marker_uuid(seq)`: the uuid the transaction with `seq` inserts. PostgreSQL: `md5('resilience-pgbench-' || seq)::uuid`. The record service journals this uuid, so `marker_ids()` and the journals compare as today.
 
 `PgbenchLaunchSpec`:
 
 | Field | Meaning |
 |---|---|
-| `script` | the pgbench script text for this shape (marker insert; churn update or replace; list-append read and append with `\gset` reads), including the record steps defined by research R1 |
-| `variables` | `-D` values: `launch`, `client`, `seq=0`, and shape parameters such as the churn key space and the replace-every-Nth value |
-| `connection` | host, port, dbname, user from the node's **client** endpoint. No password: libpq reads `~/.pgpass` on the driver host, as today. |
-| `application_name` | `resilience-pgbench-<run_id>`; used to confirm no session remains at cleanup (research R9) |
+| `script` | the transaction only, `BEGIN` to `COMMIT`: the built-in driver's statements (`commit_marker`, `commit_marker_with_churn`, `commit_marker_list_append`) in the same order, at the same isolation level |
+| `variables` | extra `-D` values (none for PostgreSQL) |
+| `connection` | host, port, dbname, user from the node's **client** endpoint. No password: libpq reads `~/.pgpass` on the driver host, as asyncpg does. |
+| `application_name` | the prefix `resilience-pgbench`; the driver appends `-<run_id>` and sets it as `PGAPPNAME` |
+
+Variables the driver sets before the transaction, which the script uses:
+
+| Variable | Shapes | Meaning |
+|---|---|---|
+| `seq` | all | the run-wide marker sequence number (also the Elle append value) |
+| `ckey`, `creplace` | churn | the churn row, and 1 when the row is replaced instead of updated |
+| `rk`, `ak`, `vbase` | list_append | the read key, the append key, and the key window's first value |
+
+A list-append transaction leaves each read in `r1len`, `r1c1..r1c<read_chunks>` (read of `rk`) and `r2len`, `r2c1..` (read of `ak` after the append): the list as offsets from `vbase` joined by `.`, or `nil` when there is no row, cut into chunks of `chunk_chars` characters. pgbench refuses a shell command of 255 bytes or more, so the record steps carry the reads in chunks.
 
 ## Hooks reused unchanged
 
-- `marker_ids()`: must return the same UUID form the records use (data-model.md, MarkerRow).
-- `churn_key_space`: the same number the churn script uses; never a second copy.
-- `prepare_harness_state()`: the harness tables (`markers`, `churn`, `lists`) as today.
+- `marker_ids()`, `churn_key_space`, `prepare_harness_state()`, `session()` (the driver's reconnect probe).
 
 ## Post-run check
 

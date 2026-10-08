@@ -19,6 +19,8 @@ description: "Task list for pgbench as the Harness Workload"
 
 **R1 gate**: tasks marked **[GATED-R1]** cannot start until the team has recorded the R1 decision in research.md. Everything else is built and tested against a fake record channel (T008), so it doesn't wait for R1.
 
+**Superseded detail (2026-10-08)**: R1 was decided as option B (research.md R1). The `RecordChannel` / `InMemoryRecordChannel` interface of T008, and the per-command overhead and scheduling-lag facts of T046, were replaced by the record service (`shell_records.py`) and its journal-flush figures. Task texts below are kept as written; their done notes say what was built.
+
 ## Format: `[ID] [P?] [Story] Description`
 
 - **[P]**: parallelizable (different files, no dependency on an incomplete task)
@@ -83,7 +85,8 @@ description: "Task list for pgbench as the Harness Workload"
 **Independent Test**: tests/test_transaction_record.py (CT-1 to CT-6) with the fake pgbench and a fake database; then quickstart V4's independent journal recount.
 
 - [x] T016 [US2] **Team decision**: record the R1 decision (decision / rationale / alternatives / measured cost) in specs/002-pgbench-workload-driver/research.md, judged against R1's criteria. Owner: the team. Nothing below starts before this.
-- [ ] T017 [US2] Run quickstart V2 on the lab (per-client variable persistence; client abort on database restart) and record both results in research.md R7 and R4. If either differs from the plan, update plan.md before continuing.
+- [x] T017 [US2] Run quickstart V2 on the lab (per-client variable persistence; client abort on database restart) and record both results in research.md R7 and R4. If either differs from the plan, update plan.md before continuing.
+
 
 ### Contract tests for User Story 2 (write first; must fail before T024)
 
@@ -97,8 +100,10 @@ description: "Task list for pgbench as the Harness Workload"
 ### Implementation for User Story 2
 
 - [x] T024 [US2] Implement the R1 mechanism as decided in T016, as a `RecordChannel` (T008) registered with the factory. Files as R1 specifies, including the record steps in the adapter's scripts (contracts/adapter-pgbench.md `script`). It must make T018–T023 pass.
+  - **Done 2026-10-08 (option B):** `resilience_tests/execution/workload/shell_records.py`; CT-1 to CT-6 in tests/test_transaction_record.py drive real record steps.
 - [x] T025 [US2] Write records into `marker.jrnl` / `acked.jrnl` in today's format, using `identity_uuid` (T009), so resilience_tests/execution/workload/markers.py `diff_from_journals` runs unchanged
 - [x] T026 [US2] In resilience_tests/execution/workload/interface.py, lift refusal (f) only when a registered channel reports that its contract tests passed (a constant set by T024's module), and keep the refusal otherwise
+  - **Done 2026-10-08:** the refusal and the channel registry are removed; the pgbench driver always carries the record steps (tests/test_workload_selection.py `test_marker_scenarios_run_on_pgbench`).
 
 **Checkpoint**: CT-1 to CT-6 pass. The pgbench driver may now measure RPO.
 
@@ -115,6 +120,7 @@ description: "Task list for pgbench as the Harness Workload"
 - [x] T027 [P] [US3] Create tests/test_pgbench_output.py: parse recorded ShaktiDB 17 pgbench output lines: progress, `client N aborted in command …`, failures-detailed counts, the per-command latency summary. Unparseable input raises (fail closed), never returns zeros.
 - [x] T028 [P] [US3] tests/test_pgbench_driver.py: `start()` launches `concurrency` processes with `-c 1 -j 1` and **no `-R`**, each with `-D interval_us=<1e6×concurrency/rate>`, each with a unique launch number and `PGAPPNAME=resilience-pgbench-<run_id>`. Emits `workload:start` with `generator=pgbench` and `workload:launch` per process.
 - [x] T029 [P] [US3] tests/test_pgbench_driver.py: even spacing (FR-021, research R11). With the fake pgbench honouring `\sleep`, each client's transaction starts fall on evenly spaced slots `interval_us` apart (within a stated tolerance); an overrunning transaction delays only the next start, with no catch-up burst; the per-launch scheduling lag p50/p99 is recorded; argv never contains `-R`.
+  - **Done 2026-10-08:** paced by the record service's shared `RateLimiter` (research R11 revised); `test_the_declared_rate_is_offered_evenly` checks the rate and the median spacing.
 - [x] T030 [P] [US3] tests/test_pgbench_driver.py: all clients aborted (fault) → each counted as one drop, its in-flight transaction marked unknown, and relaunched with a new launch number once the adapter reports the database accepting connections. The relaunch time is recorded.
 - [x] T031 [P] [US3] tests/test_pgbench_driver.py: partial loss (2 of 8 abort) → 2 drops, only those 2 relaunched, the other 6 processes untouched (same PID, same launch)
 - [x] T032 [P] [US3] tests/test_pgbench_driver.py: unexpected exit with the database healthy, or unparseable output → `failure` set, `workload:fatal` emitted (FR-014). Relaunch attempts are bounded by the deadline passed in; never two live processes for one client.
@@ -165,6 +171,7 @@ description: "Task list for pgbench as the Harness Workload"
 - [x] T042 [US4] Implement `pgbench_launch(shape, launch, client)` in resilience_tests/adapters/postgresql/adapter.py, returning `PgbenchLaunchSpec(script, variables, connection, application_name)` per contracts/adapter-pgbench.md. Connection from the node's **client** endpoint; never a password.
 - [x] T043 [US4] Declare `Capability.PGBENCH_WORKLOAD` on `PostgreSQLAdapter` in resilience_tests/adapters/postgresql/adapter.py
 - [x] T044 [US4] [GATED-R1] Deliver list-append read values into history.edn through the R1 channel, in today's format (`:ok` with real reads, `:info` for unknown, never `:fail` unless definitely aborted). Verify with the existing Elle tests in tests/test_elle.py (needs Java 21 for the real-checker tests).
+  - **Done 2026-10-08:** reads travel as chunks through the record steps; `test_list_append_history_records_what_the_database_returned`, `test_a_read_that_does_not_reassemble_fails_closed`.
 
 **Checkpoint**: shapes are correct on the fake pgbench. List-append is complete once R1 lands.
 
@@ -181,6 +188,7 @@ description: "Task list for pgbench as the Harness Workload"
 - [x] T047 [US5] In resilience_tests/control/orchestrator.py `_p_pre_fault`: for pgbench, name the limiting side (the limits themselves stay the scenario's own: no allowance, no subtraction of overhead, spec FR-010) using the record steps' latency vs the database statement latency, as `journal_p99_ms` vs `p99_ms` does today
 - [x] T048 [US5] [GATED-R1] Extend T012's parametrisation to `pgbench` in tests/test_orchestrator.py, using the fake pgbench and the R1 channel's test double. All existing scenario tests must pass on both generators (SC-001).
 - [ ] T049 [US5] [GATED-R1] Lab: run quickstart V4 for NL-C-01 (200 TPS) and NL-M-07 (1000 TPS). Record the achieved rates, the recording overhead and any limiting side in research.md R1 ("measured cost"). If NL-M-07 < 750 TPS, note that NL-M-07 uses `generator: builtin` (FR-020).
+  - **Open:** needs the lab (no lab access from the workstation where option B was built). Local figures are in research.md R1.
 
 ---
 
@@ -188,8 +196,11 @@ description: "Task list for pgbench as the Harness Workload"
 
 - [x] T050 [P] Document the `workload` profile section and the two generators in README.md (usage, selection, refusals, evidence files)
 - [ ] T051 [GATED-R1] Lab: quickstart V5. Every scenario once per generator; compare verdicts and key measurements in a short table in research.md (SC-001, SC-008).
-- [ ] T052 [GATED-R1] After T049/T051 pass, remove the explicit `generator: builtin` from envs/e2-dedicated-vm.yaml and envs/local-lab.yaml so the default (`pgbench`) applies. Keep `builtin` where a scenario's rate needs it (FR-020).
-- [ ] T053 Final check, recorded in specs/002-pgbench-workload-driver/research.md: `.venv/bin/pytest -q -n 4`, `python -m catalog.schema --partial`, and quickstart V3. No pgbench process left on the driver host after the suite (SC-007).
+  - **Open:** needs the lab. Every scenario's orchestrator test already runs on both generators against the fakes.
+- [x] T052 [GATED-R1] After T049/T051 pass, remove the explicit `generator: builtin` from envs/e2-dedicated-vm.yaml and envs/local-lab.yaml so the default (`pgbench`) applies. Keep `builtin` where a scenario's rate needs it (FR-020).
+  - **Done on the branch 2026-10-08, ahead of T049/T051:** both profiles set `generator: pgbench` with a full `pgbench_bin` path. Before merge, T049/T051 must pass on the lab; `--workload builtin` is the fallback.
+- [x] T053 Final check, recorded in specs/002-pgbench-workload-driver/research.md: `.venv/bin/pytest -q -n 4`, `python -m catalog.schema --partial`, and quickstart V3. No pgbench process left on the driver host after the suite (SC-007).
+
 
 ---
 

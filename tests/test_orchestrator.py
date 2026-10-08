@@ -7,6 +7,7 @@ ledger says an injection is undone, and which failures stop a verdict being issu
 """
 
 import asyncio
+import dataclasses
 import re
 from pathlib import Path
 import time
@@ -28,6 +29,8 @@ from resilience_tests.control.safety import SafetyViolation
 from resilience_tests.execution.injectors.base import FaultInjector, FaultNotLanded
 from resilience_tests.execution.remote import RemoteResult
 from resilience_tests.execution.workload.markers import MarkerJournals
+from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
+from tests.fakes.pgbench_env import FAKE_PGBENCH, FakeDB
 from tests.test_adapter_seam import FakeAdapter
 
 CATALOG = load_catalog()
@@ -35,10 +38,26 @@ BASE_PROFILE = load_profile("e2-dedicated-vm")
 OUTAGE_S = 2.0   # 10 write-probe intervals: the probes must see this outage even on a busy box
 
 
-class Engine:
+class _EngineState(type):
+    """`Engine.down` is mirrored into the fake pgbench's database when the run uses pgbench,
+    so a fault takes down the server for both generators' clients alike."""
+
+    @property
+    def down(cls) -> bool:
+        return cls._down
+
+    @down.setter
+    def down(cls, value: bool) -> None:
+        cls._down = value
+        if cls.pgbench_db is not None:
+            cls.pgbench_db.flag("down", on=value)
+
+
+class Engine(metaclass=_EngineState):
     """State shared by every session of the fake engine within one test."""
 
-    down = False
+    _down = False
+    pgbench_db: FakeDB | None = None   # the fake pgbench's database, when the run uses pgbench
     store: set[str] = set()
     churn_ops = 0          # update/delete traffic the mixed profile asked for
     lists: dict[int, list[int]] = {}   # Elle's list-append objects
@@ -92,12 +111,22 @@ class OutageSession(DatabaseSession):
         return self._closed
 
 
+def churn_ops() -> int:
+    """Churn transactions the fake engine committed, from either generator's clients."""
+    return Engine.churn_ops + (Engine.pgbench_db.churn_ops() if Engine.pgbench_db else 0)
+
+
+def committed_markers() -> set[str]:
+    """Markers the fake engine holds, committed by either generator's clients."""
+    return set(Engine.store) | (set(Engine.pgbench_db.committed()) if Engine.pgbench_db else set())
+
+
 @register_adapter
 class OutageAdapter(FakeAdapter):
     engine = "orch-fake"
     capabilities = frozenset({Capability.TRANSACTIONAL_MARKERS, Capability.WORKLOAD_CHURN,
                               Capability.STRUCTURAL_INTEGRITY_CHECK, Capability.DURABILITY_SETTINGS,
-                              Capability.LIST_APPEND_HISTORY})
+                              Capability.LIST_APPEND_HISTORY, Capability.PGBENCH_WORKLOAD})
     churn_key_space = 1000
 
     async def start_large_transaction(self):
@@ -131,7 +160,17 @@ class OutageAdapter(FakeAdapter):
         Engine.store.clear()
 
     async def marker_ids(self) -> set[str]:
-        return set(Engine.store)
+        return committed_markers()
+
+    # pgbench: the PostgreSQL adapter's transactions, which the fake pgbench interprets
+    pgbench_launch = PostgreSQLAdapter.pgbench_launch
+    pgbench_marker_uuid = PostgreSQLAdapter.pgbench_marker_uuid
+
+    async def server_version(self) -> str:
+        return "PostgreSQL 17.11.1.0 on x86_64"
+
+    async def sessions_with_application_name(self, name: str) -> int | None:
+        return 0
 
     async def integrity_check(self, timeout_s: float) -> IntegrityResult:
         return IntegrityResult(structural_errors=0, checksum_failures=0)
@@ -263,8 +302,26 @@ class FakeFault(FaultInjector):
         return {"action": "revert"}
 
 
-@pytest.fixture(params=["builtin"])
+@pytest.fixture(params=["builtin", "pgbench"])
 def env(request, tmp_path, monkeypatch):
+    """Every scenario test runs on both workload generators (spec SC-001, SC-008)."""
+    monkeypatch.setattr(Engine, "pgbench_db", FakeDB(tmp_path / "fakedb") if request.param == "pgbench" else None)
+    if request.param == "pgbench":
+        monkeypatch.setenv("FAKE_PGBENCH_DB", str(Engine.pgbench_db.path))
+        # a commit takes 20 ms, as on a real server: the latency is then the database's, not
+        # the test box's process-spawn jitter, and the 1.5x p99 SLO stays meaningful
+        Engine.pgbench_db.flag("commit-delay", value="0.02")
+        # The fake pgbench is a Python process per client: 64 of them at 200 TPS, four tests
+        # at a time, would measure the test box. The plumbing is the same at 8 clients, 40 TPS.
+        real_init = orch.TestOrchestrator.__init__
+
+        def scaled(self, item, profile, options):
+            wl = item.scenario.workload.model_copy(update={
+                "concurrency": min(8, item.scenario.workload.concurrency), "rate_tps": 40})
+            real_init(self, dataclasses.replace(item, scenario=item.scenario.model_copy(update={"workload": wl})),
+                      profile, options)
+
+        monkeypatch.setattr(orch.TestOrchestrator, "__init__", scaled)
     Engine.down, FakeFault.lands, FakeFault.reverts = False, True, []
     Engine.store, Engine.churn_ops, Engine.lists = set(), 0, {}
     Engine.during_in_progress, Engine.after_during, Engine.targeted_misses = True, {}, 0
@@ -279,7 +336,7 @@ def env(request, tmp_path, monkeypatch):
         "database": BASE_PROFILE.database.model_copy(update={"engine": "orch-fake"}),
         "driver_host": BASE_PROFILE.driver_host.model_copy(update={"host": "127.0.0.1", "run_dir": str(tmp_path)}),
         "phase_timeouts_s": timeouts,
-        "workload": BASE_PROFILE.workload.model_copy(update={"generator": generator}),
+        "workload": BASE_PROFILE.workload.model_copy(update={"generator": generator, "pgbench_bin": FAKE_PGBENCH}),
     })
 
     async def hostname(endpoint, command, *, timeout_s, check=True):
@@ -478,7 +535,7 @@ def test_nlm03_zero_eligible_is_not_measured(env):
 
 def test_nlm03_lost_commit_fails(env, monkeypatch):
     async def lose_one(self):
-        ids = set(Engine.store)
+        ids = committed_markers()
         ids.discard(next(iter(ids)))       # an acknowledged marker missing after recovery
         return ids
     monkeypatch.setattr(OutageAdapter, "marker_ids", lose_one)
@@ -663,60 +720,15 @@ def test_nl_m_05_execution(env):
     assert "idle_transaction" in results["facts"]
 
 
-def test_orchestrator_runs_with_pgbench_generator(env, monkeypatch):
-    """T048: Orchestrator executes cleanly with generator=pgbench when channel double is registered."""
-    from pathlib import Path
-    from resilience_tests.execution.workload.interface import register_record_channel_factory
-    from resilience_tests.execution.workload.record_channel import InMemoryRecordChannel
-
-    fake_pg = str(Path(__file__).parent / "fakes" / "fake_pgbench.py")
-    profile = env.model_copy(update={
-        "workload": env.workload.model_copy(update={
-            "generator": "pgbench",
-            "pgbench_bin": fake_pg,
-        })
-    })
-
-    channel = InMemoryRecordChannel()
-    register_record_channel_factory(lambda: channel, tests_passed=True)
-
-    try:
-        from resilience_tests.adapters.base import Capability, PgbenchLaunchSpec
-        monkeypatch.setattr(OutageAdapter, "capabilities", frozenset({
-            Capability.TRANSACTIONAL_MARKERS,
-            Capability.WORKLOAD_CHURN,
-            Capability.STRUCTURAL_INTEGRITY_CHECK,
-            Capability.DURABILITY_SETTINGS,
-            Capability.LIST_APPEND_HISTORY,
-            Capability.PGBENCH_WORKLOAD,
-        }))
-        monkeypatch.setattr(
-            OutageAdapter,
-            "pgbench_launch",
-            lambda self, shape, launch, client: PgbenchLaunchSpec(
-                script="SELECT 1;\n",
-                variables={},
-                connection=self.node.client,
-                application_name=f"resilience-pgbench-test-{launch}",
-            ),
-        )
-
-        async def fake_server_version(self):
-            return "PostgreSQL 17.11.1.0 on x86_64"
-
-        async def fake_sessions(self, name):
-            return 0
-
-        monkeypatch.setattr(OutageAdapter, "server_version", fake_server_version)
-        monkeypatch.setattr(OutageAdapter, "sessions_with_application_name", fake_sessions)
-
-
-        item = RunPlanItem(scenario=scenario("NL-C-01"), env_class=profile.env_class, role="standalone", node=profile.nodes[0])
-        orch_inst = TestOrchestrator(item, profile, RunOptions(stop_before_fault=True))
-        results = asyncio.run(orch_inst.run())
-        assert results["facts"]["workload_generator"] == "pgbench"
-        assert "17.11" in results["facts"]["pgbench_version"]
-    finally:
-        register_record_channel_factory(None, tests_passed=False)
+def test_report_names_the_generator(env):
+    results = run(env, "NL-C-01")
+    assert results["status"] == "passed", why(results)
+    facts = results["facts"]
+    assert facts["workload_generator"] == env.workload.generator
+    summary = (Path(results["evidence_dir"]) / "summary.txt").read_text()
+    assert f"workload generator: {env.workload.generator}" in summary
+    if env.workload.generator == "pgbench":
+        assert "17.11" in facts["pgbench_version"] and facts["pgbench_launches"] >= 8
+        assert "record journal flush" in summary
 
 

@@ -467,27 +467,22 @@ also a target, or that leaves any phase unbounded.
 
 ### Workload Generator Selection (`workload` profile section)
 
-Environment profiles support an optional `workload` section configuring the workload driver:
+Environment profiles select the load generator; scenarios never do:
 
 ```yaml
 workload:
-  generator: pgbench     # pgbench (default) | builtin
-  pgbench_bin: pgbench   # executable on driver host PATH or absolute path
+  generator: pgbench                                   # pgbench (default) | builtin
+  pgbench_bin: /usr/lib/postgresql/17.11.1.0/bin/pgbench   # full path: /usr/bin/pgbench is pg_wrapper
 ```
 
-- **Generators**:
-  - `pgbench`: Supervised pgbench execution (one process per client with `-c 1 -j 1`, evenly spaced transactions without `-R`, automatic drop detection, and per-client relaunch).
-  - `builtin`: Built-in asyncpg workload driver.
-- **Selection & CLI Override**:
-  - Configured per environment in `envs/<profile>.yaml`.
-  - Overridable via `pytest --workload {pgbench,builtin}`.
-- **Refusals (Fail Closed)**:
-  - `pgbench_bin` missing or not executable.
-  - pgbench major version differing from target PostgreSQL major version (`FR-004`).
-  - Adapter lacking `Capability.PGBENCH_WORKLOAD`.
-  - Scenarios requiring `transaction_markers: true` when no verified `RecordChannel` is active (gated on `R1`).
-- **Evidence Files**:
-  - `<run_dir>/pgbench/launch-<n>.txt`: Contains exact argv without secrets, stderr, stdout, and parsed summary with per-command latencies.
+- **`pgbench`** (`execution/workload/pgbench_driver.py`): one pgbench process per client (`-c 1`), relaunched on its own when a fault drops it. Each transaction is the built-in driver's, statement for statement, wrapped in two **record steps** (`execution/workload/shell_records.py`): a pgbench shell command that asks the harness to journal the marker -- flushed before the client may send `BEGIN` -- and one after the COMMIT that journals the acknowledgement. The harness's record service writes the same `marker.jrnl` / `acked.jrnl` as the built-in driver, paces the load with the built-in driver's shared rate limiter, picks churn and Elle keys with its seeded generators, classifies outcomes and writes the Elle history (reads come back in chunks; pgbench caps a shell command at 255 bytes).
+- **`builtin`** (`execution/workload/driver.py`): the asyncpg driver, unchanged, kept as the reference and fallback.
+- **One-run override**: `pytest ... --workload builtin`.
+- **Refusals (fail closed, before the baseline)**: `pgbench_bin` missing or not executable; pgbench's major version differs from the server's (FR-004); the adapter lacks `Capability.PGBENCH_WORKLOAD`, or a capability the shape needs (churn, list-append), exactly as the built-in driver refuses.
+- **Run failures**: a record step that fails, a journal that cannot be written, an acknowledgement with no before-commit record, a list-append read that does not reassemble, or a pgbench that exits on its own -- the run aborts as `workload driver failed`, never evaluated.
+- **Same accounting as the built-in driver**: a server-rejected transaction (serialization/deadlock) counts as an error and keeps its connection; a dropped connection counts as a drop with its in-flight transaction unknown; a transaction stuck past 10 s is abandoned as unknown and its client relaunched.
+- **Evidence files**: `<run_dir>/pgbench/transaction.sql` (the script), `<run_dir>/pgbench/launch-<n>.txt` (argv without secrets, how it ended, stderr). The report names the generator, the pgbench version, the launches, and the record journal flush p50/p99.
+- **Cleanup**: every pgbench runs in its own process group under `setpriv --pdeathsig KILL`, so neither `stop()` nor a killed harness leaves one behind; `stop()` then checks that no `resilience-pgbench-<run_id>` session remains on the target.
 
 ## 12. Target database footprint
 

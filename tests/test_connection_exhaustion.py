@@ -147,9 +147,16 @@ def test_revert_fails_loudly_if_flood_sessions_remain():
             asyncio.run(driver.revert(node, {}))
 
 
-def test_nl_r_04_orchestrator_evaluation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("generator", ["builtin", "pgbench"])
+def test_nl_r_04_orchestrator_evaluation(tmp_path, monkeypatch, generator):
     """Verify NL-R-04 runs through orchestrator and evaluates rejections_explicit,
     superuser_slot_honoured, and existing_sessions_unaffected."""
+    from tests.fakes.pgbench_env import FAKE_PGBENCH, FakeDB
+
+    monkeypatch.setattr(Engine, "pgbench_db", FakeDB(tmp_path / "fakedb") if generator == "pgbench" else None)
+    if generator == "pgbench":
+        Engine.pgbench_db.flag("commit-delay", value="0.02")
+        monkeypatch.setenv("FAKE_PGBENCH_DB", str(Engine.pgbench_db.path))
     Engine.down = False
     Engine.store = set()
     catalog = load_catalog()
@@ -167,6 +174,7 @@ def test_nl_r_04_orchestrator_evaluation(tmp_path, monkeypatch):
         "database": base_profile.database.model_copy(update={"engine": "orch-fake"}),
         "driver_host": base_profile.driver_host.model_copy(update={"host": "127.0.0.1", "run_dir": str(tmp_path)}),
         "phase_timeouts_s": timeouts,
+        "workload": base_profile.workload.model_copy(update={"generator": generator, "pgbench_bin": FAKE_PGBENCH}),
     })
 
     async def fake_host_run(command, *args, timeout_s=30.0, check=True, **kwargs):

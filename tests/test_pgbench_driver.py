@@ -1,318 +1,355 @@
-"""Tests for pgbench supervisor, relaunch, samples, lifecycle and cleanup (spec US3, US5)."""
+"""The pgbench workload driver: supervision, relaunch, pacing, outcomes, history, cleanup
+(spec US3-US5). Runs the fake pgbench, whose record steps really run through /bin/sh."""
 
 import asyncio
 import os
-from pathlib import Path
-import time
+import re
+
 import pytest
 
-from catalog.schema import Workload
-from resilience_tests.adapters.base import (
-    BaseDatabaseAdapter,
-    Capability,
-    DatabaseSession,
-    IntegrityResult,
-    PgbenchLaunchSpec,
-    TransactionOutcome,
-)
-from resilience_tests.control.profile import load_profile
-from resilience_tests.execution.workload.markers import MarkerJournals
-from resilience_tests.execution.workload.pgbench_driver import PgbenchWorkloadDriver
-from resilience_tests.execution.workload.record_channel import InMemoryRecordChannel, TransactionRecord
-from resilience_tests.observability.event_stream import EventStream
-
-FAKE_PGBENCH = str(Path(__file__).parent / "fakes" / "fake_pgbench.py")
+from resilience_tests.execution.workload import pgbench_driver, shell_records
+from resilience_tests.execution.workload.markers import read_journal
+from tests.fakes.pgbench_env import close_evidence, history_ops, make_driver, until
 
 
-class MockSession(DatabaseSession):
-    def __init__(self, healthy: bool = True):
-        self._healthy = healthy
-        self._closed = False
-
-    async def commit_marker(self, seq: int, marker_id: str) -> TransactionOutcome:
-        return TransactionOutcome.COMMITTED if self._healthy else TransactionOutcome.UNKNOWN
-
-    async def try_write(self) -> bool:
-        return self._healthy
-
-    async def ping(self) -> bool:
-        if not self._healthy:
-            raise RuntimeError("database unavailable")
-        return True
-
-    async def close(self) -> None:
-        self._closed = True
-
-    @property
-    def is_closed(self) -> bool:
-        return self._closed
+def _events(driver, kind):
+    return [e for e in driver.stream.events() if e.kind == kind]
 
 
-class FakePgbenchAdapter(BaseDatabaseAdapter):
-    engine = "fake-pg"
-    capabilities = frozenset({Capability.TRANSACTIONAL_MARKERS, Capability.PGBENCH_WORKLOAD})
-
-    def __init__(self, node, healthy: bool = True):
-        super().__init__(node)
-        self.healthy = healthy
-        self.active_sessions = 0
-
-    async def session(self, endpoint=None, timeout_s=5.0) -> DatabaseSession:
-        if not self.healthy:
-            raise RuntimeError("database down")
-        return MockSession(self.healthy)
-
-    async def prepare_harness_state(self) -> None:
-        pass
-
-    async def marker_ids(self) -> set[str]:
-        return set()
-
-    async def sentinel(self, table: str, hostname: str):
-        return {}
-
-    async def durability_settings(self) -> dict[str, str]:
-        return {}
-
-    async def certification_blockers(self) -> list[str]:
-        return []
-
-    async def integrity_check(self, timeout_s: float) -> IntegrityResult:
-        return IntegrityResult(structural_errors=None, checksum_failures=None)
-
-    async def server_version(self) -> str:
-        return "PostgreSQL 17.11.1.0 on x86_64"
-
-    async def sessions_with_application_name(self, name: str) -> int | None:
-        return self.active_sessions
-
-    def pgbench_launch(self, shape: str, launch: int, client: int) -> PgbenchLaunchSpec:
-        return PgbenchLaunchSpec(
-            script="\\sleep :interval_us us\n\\set seq :seq + 1\nSELECT 1;\n",
-            variables={"interval_us": 10000},
-            connection=self.node.client,
-            application_name=f"resilience-pgbench-l{launch}-c{client}",
-        )
+def _ended(driver, how):
+    return sum(1 for e in _events(driver, "launch_end") if e.data["ended_as"] == how)
 
 
-def _driver(tmp_path, concurrency=2, rate_tps=200, healthy=True, channel=None, history=None):
-    profile = load_profile("e2-dedicated-vm")
-    node = profile.nodes[0]
-    adapter = FakePgbenchAdapter(node, healthy=healthy)
-    workload = Workload(
-        profile="oltp_write_heavy",
-        concurrency=concurrency,
-        rate_tps=rate_tps,
-        transaction_markers=True,
-    )
-    journals = MarkerJournals(tmp_path)
-    stream = EventStream(tmp_path / "events.jsonl")
-    driver = PgbenchWorkloadDriver(
-        adapter=adapter,
-        workload=workload,
-        journals=journals,
-        stream=stream,
-        pgbench_bin=FAKE_PGBENCH,
-        pgbench_version="pgbench (PostgreSQL) 17.11.1.0",
-        channel=channel,
-        history=history,
-    )
-    return driver, adapter, stream
+def _alive(driver):
+    return {n: st.process.pid for n, st in driver._launches.items()
+            if st.process is not None and st.process.returncode is None}
 
 
-def test_t028_start_launches_concurrency_processes_without_R(tmp_path):
-    """T028: start() launches concurrency processes with -c 1 -j 1 and no -R, PGAPPNAME set."""
-    driver, adapter, stream = _driver(tmp_path, concurrency=3, rate_tps=300)
-
+def test_one_pgbench_per_client_with_the_record_steps(tmp_path, monkeypatch):
     async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=3, rate_tps=30)
+        await driver.start()
+        await asyncio.wait_for(driver.wait_until_ready(), 10)
+        alive = _alive(driver)
+        await until(lambda: len(_events(driver, "sample")) >= 2, what="samples")
+        await driver.stop()
+        close_evidence(driver)
+        return driver, alive
+
+    driver, alive = asyncio.run(go())
+    assert driver.connected_workers == 3 and len(alive) == 3
+    argv = driver._launches[1].argv
+    assert argv[argv.index("-c") + 1] == "1" and "-n" in argv and "-R" not in argv
+    assert {"launch=1", "client=0", "reply=r/1"} <= set(argv)
+    assert driver.app_name == f"resilience-pgbench-{driver.run_id}"
+    script = (driver.pgbench_dir / pgbench_driver.SCRIPT_FILE).read_text()
+    assert script.startswith("\\setshell tok") and "BEGIN;" in script and "COMMIT;" in script
+    assert script.index("COMMIT;") < script.index(" ack ")
+    assert _ended(driver, "stopped") == 3
+    assert (driver.pgbench_dir / "launch-1.txt").exists()
+    assert not _alive(driver)
+
+
+def test_the_declared_rate_is_offered_evenly(tmp_path, monkeypatch):
+    async def go():
+        driver, _, _ = make_driver(tmp_path, monkeypatch, concurrency=4, rate_tps=40)
         await driver.start()
         await driver.wait_until_ready()
-        await asyncio.sleep(0.3)
-        await driver.stop()
-
-    asyncio.run(go())
-
-    # Verify events
-    events = stream.events()
-    start_evs = [e for e in events if e.kind == "start" and e.source == "workload"]
-    assert len(start_evs) == 1
-    assert start_evs[0].data["generator"] == "pgbench"
-    assert start_evs[0].data["concurrency"] == 3
-
-    launch_evs = [e for e in events if e.kind == "launch" and e.source == "workload"]
-    assert len(launch_evs) == 3
-
-    for lev in launch_evs:
-        cmd = lev.data["command"]
-        assert "-c" in cmd and "1" in cmd
-        assert "-j" in cmd and "1" in cmd
-        assert "-R" not in cmd  # No Poisson pacing!
-        assert any("interval_us=" in arg for arg in cmd)
-
-
-def test_t029_even_spacing_argv_has_no_R(tmp_path):
-    """T029: spacing pacing uses interval_us, argv never contains -R."""
-    driver, adapter, stream = _driver(tmp_path, concurrency=2, rate_tps=100)
-
-    async def go():
-        await driver.start()
-        await driver.wait_until_ready()
-        await asyncio.sleep(0.2)
-        await driver.stop()
-
-    asyncio.run(go())
-
-    for client_id, state in driver._clients.items():
-        assert "-R" not in state.argv
-        assert any("interval_us=20000" in arg for arg in state.argv)
-
-
-def test_t030_client_abort_counted_as_drop_and_relaunched(tmp_path, monkeypatch):
-    """T030: client abort counted as drop, in-flight marked unknown, and relaunched."""
-    driver, adapter, stream = _driver(tmp_path, concurrency=1, rate_tps=100)
-    # Simulate abort after 0.2s
-    monkeypatch.setenv("FAKE_PGBENCH_ABORT_AFTER_S", "0.2")
-
-    async def go():
-        await driver.start()
-        await driver.wait_until_ready()
-        # Wait long enough for abort and relaunch
-        await asyncio.sleep(0.8)
-        await driver.stop()
-
-    asyncio.run(go())
-
-    events = stream.events()
-    launch_ends = [e for e in events if e.kind == "launch_end"]
-    assert len(launch_ends) >= 1
-    aborted_ends = [e for e in launch_ends if e.data["ended_as"] == "client_aborted"]
-    assert len(aborted_ends) >= 1
-
-    launches = [e for e in events if e.kind == "launch"]
-    # Client should have been relaunched with a new launch number
-    assert len(launches) >= 2
-
-
-def test_t031_partial_loss_relaunches_only_aborted(tmp_path, monkeypatch):
-    """T031: 2 of 4 abort -> 2 drops, only those 2 relaunched, other processes untouched."""
-    driver, adapter, stream = _driver(tmp_path, concurrency=2, rate_tps=100)
-
-    async def go():
-        await driver.start()
-        await driver.wait_until_ready()
-        await asyncio.sleep(0.3)
-        await driver.stop()
-
-    asyncio.run(go())
-    assert driver.connected_workers == 2
-
-
-def test_t032_unexpected_exit_sets_failure_and_emits_fatal(tmp_path, monkeypatch):
-    """T032: unexpected exit with database healthy sets failure and emits workload:fatal."""
-    driver, adapter, stream = _driver(tmp_path, concurrency=1, rate_tps=100)
-    # Force unexpected exit code 99 without abort message
-    monkeypatch.setenv("FAKE_PGBENCH_EXIT_CODE", "99")
-
-    async def go():
-        await driver.start()
-        await asyncio.sleep(0.3)
-        await driver.stop()
-
-    asyncio.run(go())
-
-    assert driver.failure is not None
-    fatal_evs = [e for e in stream.events() if e.kind == "fatal"]
-    assert len(fatal_evs) >= 1
-    assert "99" in fatal_evs[0].data["error"]
-
-
-def test_t033_samples_built_from_channel_records(tmp_path):
-    """T033: samples computed from channel records: latencies, commits, None when absent."""
-    channel = InMemoryRecordChannel()
-    driver, adapter, stream = _driver(tmp_path, concurrency=1, rate_tps=100, channel=channel)
-
-    async def go():
+        await asyncio.sleep(0.5)
         driver.begin_window()
-        # Push before-commit and ack records
-        t0 = time.time()
-        channel.record("L0-C0-S1", "pre", t0)
-        channel.record("L0-C0-S1", "ack", t0 + 0.005)  # 5 ms latency
-        channel.record("L0-C0-S2", "pre", t0 + 0.010)
-        channel.record("L0-C0-S2", "ack", t0 + 0.020)  # 10 ms latency
-
-        driver._process_channel_records()
-        w = driver.end_window()
-        assert w.commits == 2
-        assert w.p50_ms is not None
-        assert 5.0 <= w.p50_ms <= 10.0
-
-    asyncio.run(go())
-
-
-def test_t034_cleanup_terminates_all_processes_and_verifies_sessions(tmp_path):
-    """T034: stop() terminates processes; active sessions > 0 makes cleanup fail."""
-    driver, adapter, stream = _driver(tmp_path, concurrency=1, rate_tps=50)
-
-    async def go_success():
-        await driver.start()
-        await driver.wait_until_ready()
+        await asyncio.sleep(3.0)
+        window = driver.end_window()
         await driver.stop()
+        close_evidence(driver)
+        return driver, window
 
-    asyncio.run(go_success())
+    driver, window = asyncio.run(go())
+    assert 32 <= window.tps <= 44, window          # the shared limiter, as the built-in driver's
+    assert window.p99_ms is not None and window.journal_p99_ms is not None
+    starts = sorted(r["t_pre"] for r in read_journal(driver.journals.run_dir / "marker.jrnl").records)[20:]
+    gaps = sorted(b - a for a, b in zip(starts, starts[1:]))
+    assert 0.020 <= gaps[len(gaps) // 2] <= 0.030, "transactions are not evenly spaced at 1/40 s"
 
-    # Now verify remaining sessions failure
-    adapter.active_sessions = 2
-    async def go_fail():
+
+def test_partial_loss_relaunches_only_the_dropped_clients(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=4, rate_tps=40)
         await driver.start()
         await driver.wait_until_ready()
-        with pytest.raises(RuntimeError, match="active pgbench session"):
-            await driver.stop()
+        before = _alive(driver)
+        db.flag("drop-1")
+        db.flag("drop-2")
+        await until(lambda: _ended(driver, "client_aborted") == 2, what="two drops")
+        await until(lambda: len(_alive(driver)) == 4, what="relaunch")
+        await until(lambda: driver.connected_workers == 4 and sum(
+            e.data["reconnects"] for e in _events(driver, "sample")) == 2, what="reconnects counted")
+        after = _alive(driver)
+        await driver.stop()
+        close_evidence(driver)
+        return driver, before, after
 
-    asyncio.run(go_fail())
+    driver, before, after = asyncio.run(go())
+    assert {3: before[3], 4: before[4]}.items() <= after.items(), "a healthy client was disturbed"
+    assert 1 not in after and 2 not in after
+    samples = _events(driver, "sample")
+    assert sum(e.data["drops"] for e in samples) == 2
+    assert sum(e.data["indeterminate"] for e in samples) <= 2
 
 
-def test_t045_recording_overhead(tmp_path):
-    """T045: states the record steps share of transaction latency; None when no summary."""
-    driver, adapter, stream = _driver(tmp_path, concurrency=1, rate_tps=50)
-    # Before run: no summary -> None
-    assert driver.recording_overhead_pct() is None
+def test_no_connection_at_start_is_retried_not_fatal(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=20)
+        db.flag("down")
+        await driver.start()
+        await until(lambda: _ended(driver, "not_connected") >= 2, what="refused launches")
+        await asyncio.sleep(0.5)
+        assert driver.failure is None and driver.connected_workers == 0
+        db.flag("down", on=False)
+        await asyncio.wait_for(driver.wait_until_ready(), 10)
+        await until(lambda: len(_events(driver, "sample")) >= 1, what="a sample")
+        await driver.stop()
+        close_evidence(driver)
+        return driver
+
+    driver = asyncio.run(go())
+    assert driver.failure is None
+    assert sum(e.data["connect_failures"] for e in _events(driver, "sample")) >= 2
+
+
+def test_a_serialization_failure_is_a_definite_abort(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=40)
+        db.flag("serialize-every", value="3")
+        await driver.start()
+        await driver.wait_until_ready()
+        driver.begin_window()
+        await asyncio.sleep(2.0)
+        window = driver.end_window()
+        await driver.stop()
+        close_evidence(driver)
+        return driver, window
+
+    driver, window = asyncio.run(go())
+    assert window.errors >= 5 and window.commits >= 2 * window.errors - 4
+    assert window.drops == 0 and window.indeterminate == 0
+    assert driver._launch_counter == 2, "a server-rejected transaction must not cost the connection"
+
+
+def test_a_stuck_transaction_is_abandoned_as_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(pgbench_driver, "TXN_TIMEOUT_S", 0.6)
 
     async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=1, rate_tps=20)
         await driver.start()
         await driver.wait_until_ready()
-        await asyncio.sleep(0.2)
+        db.flag("hang")
+        await until(lambda: _ended(driver, "transaction_timeout") >= 1, what="the timeout")
+        db.flag("hang", on=False)
+        await until(lambda: driver._launch_counter >= 2 and len(_alive(driver)) == 1, what="relaunch")
+        await until(lambda: len(_events(driver, "sample")) >= 2, what="samples")
         await driver.stop()
+        close_evidence(driver)
+        return driver
+
+    driver = asyncio.run(go())
+    samples = _events(driver, "sample")
+    assert sum(e.data["indeterminate"] for e in samples) >= 1
+    assert sum(e.data["drops"] for e in samples) >= 1
+    assert driver.failure is None
+
+
+def test_pgbench_exiting_on_its_own_fails_the_run(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=40)
+        db.flag("exit-after", value="3")
+        await driver.start()
+        await until(lambda: driver.failure is not None, what="the failure")
+        await driver.stop()
+        close_evidence(driver)
+        return driver
+
+    driver = asyncio.run(go())
+    assert "ended unexpectedly" in driver.failure
+    assert any(e.kind == "fatal" for e in driver.stream.events())
+
+
+def test_a_record_step_that_cannot_run_fails_the_run(tmp_path, monkeypatch):
+    """A meta-command abort is never the database's doing: the instrument is broken."""
+    async def go():
+        driver, _, _ = make_driver(tmp_path, monkeypatch, concurrency=1, rate_tps=20)
+        await driver.start()
+        await driver.wait_until_ready()
+        os.chmod(driver.pgbench_dir / shell_records.REQUEST_FIFO, 0)   # `1<>q` now fails
+        await until(lambda: driver.failure is not None, what="the failure")
+        await driver.stop()
+        close_evidence(driver)
+        return driver
+
+    driver = asyncio.run(go())
+    assert "ended unexpectedly" in driver.failure and "meta-command" in driver.failure
+
+
+def test_list_append_history_records_what_the_database_returned(tmp_path, monkeypatch):
+    # tiny chunks, so lists span several of them as they do on a long run
+    monkeypatch.setattr(pgbench_driver, "READ_CHUNK_CHARS", 6)
+    monkeypatch.setattr(shell_records, "READ_CHUNK_CHARS", 6)
+    monkeypatch.setattr(shell_records, "ELLE_KEYS", 2)
+    monkeypatch.setattr(shell_records, "ELLE_TOKEN_BASE", 4)
+
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, shape="list_append", concurrency=2, rate_tps=40)
+        db.flag("serialize-every", value="7")
+        await driver.start()
+        await until(lambda: sum(len(v) for v in db.lists().values()) >= 30, what="appends")
+        await driver.stop()
+        close_evidence(driver)
+        return driver, db
+
+    driver, db = asyncio.run(go())
+    ops = history_ops(driver)
+    kinds = [o["type"] for o in ops]
+    assert kinds.count("invoke") == kinds.count("ok") + kinds.count("fail") + kinds.count("info")
+    assert kinds.count("fail") >= 1
+    final = db.lists()
+    longest = 0
+    for o in ops:
+        if o["type"] != "ok":
+            continue
+        for key, val in re.findall(r"\[:r (\d+) (nil|\[[\d ]*\])\]", o["value"]):
+            if val == "nil":
+                continue
+            vals = [int(x) for x in val.strip("[]").split()]
+            longest = max(longest, len(vals))
+            assert final[int(key)][:len(vals)] == vals, "a read differs from what the database holds"
+    assert longest >= 4, "no read spanned several chunks"
+
+
+def test_a_read_that_does_not_reassemble_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(pgbench_driver, "READ_CHUNKS", 1)
+    monkeypatch.setattr(pgbench_driver, "READ_CHUNK_CHARS", 3)
+    monkeypatch.setattr(shell_records, "READ_CHUNKS", 1)
+    monkeypatch.setattr(shell_records, "READ_CHUNK_CHARS", 3)
+    monkeypatch.setattr(shell_records, "ELLE_KEYS", 1)
+    monkeypatch.setattr(shell_records, "ELLE_TOKEN_BASE", 1)
+
+    async def go():
+        driver, _, _ = make_driver(tmp_path, monkeypatch, shape="list_append", concurrency=1, rate_tps=40)
+        await driver.start()
+        await until(lambda: driver.failure is not None, what="the failure")
+        await driver.stop()
+        close_evidence(driver)
+        return driver
+
+    driver = asyncio.run(go())
+    assert "arrived as 3 of" in driver.failure
+    # the transaction whose read did not reassemble entered neither the history nor acked.jrnl
+    acked = len(read_journal(driver.journals.run_dir / "acked.jrnl").records)
+    assert sum(o["type"] == "ok" for o in history_ops(driver)) == acked
+
+
+def test_churn_offers_the_built_in_drivers_key_sequence(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, shape="churn", concurrency=2, rate_tps=40)
+        await driver.start()
+        await until(lambda: db.churn_ops() >= 20, what="churn")
+        await driver.stop()
+        close_evidence(driver)
+        return driver, db
+
+    driver, db = asyncio.run(go())
+    acked = len(read_journal(driver.journals.run_dir / "acked.jrnl").records)
+    # committed churn is acknowledged churn, plus at most one unknown outcome per client at stop
+    assert 0 <= db.churn_ops() - acked <= 2
+    script = (driver.pgbench_dir / pgbench_driver.SCRIPT_FILE).read_text()
+    assert f"\\set seq :tok / {2 * 50}" in script and "\\if :creplace" in script
+
+
+def test_cleanup_fails_while_target_sessions_remain(tmp_path, monkeypatch):
+    async def go():
+        driver, adapter, _ = make_driver(tmp_path, monkeypatch, concurrency=1, rate_tps=20)
+        await driver.start()
+        await driver.wait_until_ready()
+        adapter.open_sessions = 1
+        with pytest.raises(RuntimeError, match="still open on the target"):
+            await driver.stop()
+        close_evidence(driver)
+        return driver
+
+    driver = asyncio.run(go())
+    assert not _alive(driver)
+
+
+def test_stop_leaves_no_process_behind_even_mid_transaction(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=20)
+        await driver.start()
+        await driver.wait_until_ready()
+        db.flag("hang")                       # both clients stuck inside COMMIT
+        await asyncio.sleep(0.4)
+        pids = list(_alive(driver).values())
+        await driver.stop()
+        close_evidence(driver)
+        return pids
+
+    for pid in asyncio.run(go()):
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+
+def test_malformed_record_requests_fail_the_run(tmp_path, monkeypatch):
+    async def go():
+        driver, _, _ = make_driver(tmp_path, monkeypatch, concurrency=1, rate_tps=20)
+        await driver.start()
+        await driver.wait_until_ready()
+        fd = os.open(driver.pgbench_dir / shell_records.REQUEST_FIFO, os.O_WRONLY)
+        os.write(fd, b"ack 99 1\n")   # no such launch, no before-commit record
+        os.close(fd)
+        await until(lambda: driver.failure is not None, what="the failure")
+        await driver.stop()
+        close_evidence(driver)
+        return driver
+
+    driver = asyncio.run(go())
+    assert "unknown launch 99" in driver.failure
+
+
+def test_whitespace_in_the_run_directory_is_refused(tmp_path, monkeypatch):
+    async def go():
+        driver, _, _ = make_driver(tmp_path / "with space", monkeypatch)
+        with pytest.raises(pgbench_driver.UnsupportedWorkload, match="whitespace"):
+            await driver.start()
+        close_evidence(driver)
 
     asyncio.run(go())
-    overhead = driver.recording_overhead_pct()
-
-    # If summary was parsed, overhead is a float
-    if driver.recorded_summaries:
-        assert isinstance(overhead, float)
 
 
-def test_t044_list_append_delivered_to_history(tmp_path):
-    """T044: deliver list-append read values into history.edn through the channel."""
-    from resilience_tests.execution.workload.history_writer import HistoryWriter
+def test_report_facts_state_the_record_cost(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=40)
+        await driver.start()
+        await until(lambda: len(db.committed()) >= 10, what="commits")
+        await driver.stop()
+        close_evidence(driver)
+        return driver
 
-    history_file = tmp_path / "history.edn"
-    writer = HistoryWriter(history_file)
-    channel = InMemoryRecordChannel()
-    driver, adapter, stream = _driver(tmp_path, concurrency=1, rate_tps=50, channel=channel, history=writer)
+    facts = asyncio.run(go()).report_facts()
+    assert facts["pgbench_launches"] == 2
+    assert facts["pgbench_record_journal_p99_ms"] is not None
+    assert "before COMMIT" in facts["pgbench_record_mechanism"]
 
-    invoked_ops = [("r", 1, None), ("append", 1, 42), ("r", 1, None)]
-    executed_ops = [("r", 1, []), ("append", 1, 42), ("r", 1, [42])]
 
-    # Push pre record with invoke
-    channel.record("L0-C0-S1", "pre", time.time(), value={"process": 0, "invoked": invoked_ops})
-    # Push ack record with ok and executed
-    channel.record("L0-C0-S1", "ack", time.time() + 0.005, value={"process": 0, "status": "ok", "executed": executed_ops})
+def test_sigterm_reaches_shell_steps_too(tmp_path, monkeypatch):
+    """pgbench and its record steps share a process group, which stop() signals."""
+    async def go():
+        driver, _, _ = make_driver(tmp_path, monkeypatch, concurrency=1, rate_tps=20)
+        await driver.start()
+        await driver.wait_until_ready()
+        st = driver._launches[1]
+        pgid = os.getpgid(st.process.pid)
+        await driver.stop()
+        close_evidence(driver)
+        return pgid
 
-    driver._process_channel_records()
-    writer.close()
-
-    lines = history_file.read_text().splitlines()
-    assert len(lines) == 2
-    assert ":type :invoke" in lines[0] and "[:r 1 nil]" in lines[0]
-    assert ":type :ok" in lines[1] and "[:r 1 [42]]" in lines[1]
-
+    pgid = asyncio.run(go())
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, 0)

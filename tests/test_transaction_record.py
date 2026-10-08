@@ -1,211 +1,149 @@
-"""Contract tests for transaction record channel and RPO invariants (CT-1 to CT-6).
-
-Validates contracts/transaction-record.md against fake workloads and databases:
-- CT-1: pre-record precedes commit-send time observed by database.
-- CT-2: database killed mid-load -> acknowledged ⊆ pre, rpo_txn == 0 for honest DB.
-- CT-3: lying database -> rpo_txn >= 1 (fail-closed negative case, Constitution III).
-- CT-4: pre record failure -> transaction never commits, never acknowledged without pre.
-- CT-5: ack record failure -> channel marked incomplete, run aborts and issues no RPO figure.
-- CT-6: repeated relaunches -> identities never repeat, 0 torn lines and 0 unjournalled.
-"""
-
-from __future__ import annotations
+"""Contract tests CT-1 to CT-6 (contracts/transaction-record.md) for the pgbench record steps
+(research R1, option B): every record is made by a pgbench transaction's own shell step,
+through the harness's journal service, and checked against what the fake database holds."""
 
 import asyncio
-import time
-from pathlib import Path
-import pytest
 
-from resilience_tests.execution.workload.identity import identity_text, identity_uuid
-from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals
-from resilience_tests.execution.workload.record_channel import (
-    JournalRecordChannel,
-    TransactionRecord,
-)
+from resilience_tests.execution.workload.markers import diff_from_journals, read_journal
+from tests.fakes.pgbench_env import close_evidence, make_driver, until
 
 
-def test_ct1_pre_record_precedes_commit_send(tmp_path: Path):
-    """CT-1: every acknowledged identity's pre record precedes commit-send observed by DB."""
-    journals = MarkerJournals(tmp_path)
-    channel = JournalRecordChannel(journals)
-
-    observed_commit_sends: dict[str, float] = {}
-
-    async def run_workload():
-        for i in range(1, 10):
-            ident = identity_text(launch=1, client=0, seq=i)
-            t_pre = time.time()
-            await channel.record_pre(ident, t_pre, seq=i)
-
-            # Database observes commit send strictly after pre-record is durable
-            time.sleep(0.001)
-            t_commit_send = time.time()
-            observed_commit_sends[ident] = t_commit_send
-
-            # Database acknowledges
-            time.sleep(0.001)
-            t_ack = time.time()
-            await channel.record_ack(ident, t_ack)
-
-    asyncio.run(run_workload())
-    journals.close()
-
-    pre_records = {r.identity: r for r in channel.all_records if r.kind == "pre"}
-    ack_records = {r.identity: r for r in channel.all_records if r.kind == "ack"}
-
-    assert len(ack_records) == 9
-    for ident, ack_rec in ack_records.items():
-        assert ident in pre_records
-        pre_rec = pre_records[ident]
-        t_commit_send = observed_commit_sends[ident]
-        # TR-1: Pre record timestamp precedes database commit-send
-        assert pre_rec.t_wall < t_commit_send
-        # TR-2: Ack record timestamp follows database commit-send
-        assert t_commit_send < ack_rec.t_wall
+def _journal(driver, name):
+    return read_journal(driver.journals.run_dir / name).records
 
 
-def test_ct2_kill_mid_load_honest_database(tmp_path: Path):
-    """CT-2: database killed mid-load. Acknowledged ⊆ pre; rpo_txn == 0 for honest DB."""
-    journals = MarkerJournals(tmp_path)
-    channel = JournalRecordChannel(journals)
-    db_committed_uuids: set[str] = set()
+def test_ct1_pre_record_is_durable_before_the_commit(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=3, rate_tps=60)
+        await driver.start()
+        await until(lambda: len(db.committed()) >= 40, what="40 commits")
+        await driver.stop()
+        close_evidence(driver)
+        return driver, db
 
-    async def run_workload():
-        for i in range(1, 20):
-            ident = identity_text(launch=1, client=0, seq=i)
-            t_pre = time.time()
-            await channel.record_pre(ident, t_pre, seq=i)
-
-            if i <= 10:
-                # Committed before kill
-                db_committed_uuids.add(identity_uuid(ident))
-                await channel.record_ack(ident, time.time())
-            elif i <= 15:
-                # Committed in DB but kill severed connection before ack received
-                db_committed_uuids.add(identity_uuid(ident))
-                # in-flight / indeterminate, no ack
-            else:
-                # In-flight and lost/aborted in DB before commit
-                pass
-
-    asyncio.run(run_workload())
-    journals.close()
-
-    pre_ids = {r.identity for r in channel.all_records if r.kind == "pre"}
-    ack_ids = {r.identity for r in channel.all_records if r.kind == "ack"}
-
-    # Acknowledged subset of pre
-    assert ack_ids.issubset(pre_ids)
-    assert len(ack_ids) == 10
-    assert len(pre_ids) == 19
-
-    # Diff from journals against honest DB
-    diff, torn = diff_from_journals(tmp_path, db_committed_uuids)
-    assert torn == 0
-    assert diff.rpo_txn == 0  # 0 lost
-    assert len(diff.lost) == 0
-    assert diff.unjournalled_ack == frozenset()
-    # Indeterminate transactions (written but unacked) reported
-    assert len(diff.indeterminate) == 9
-    assert len(diff.indeterminate_committed) == 5
+    driver, db = asyncio.run(go())
+    pre = {r["uuid"]: r["t_pre"] for r in _journal(driver, "marker.jrnl")}
+    acked = {r["uuid"] for r in _journal(driver, "acked.jrnl")}
+    committed = db.committed()
+    assert acked and acked <= set(committed)
+    for uuid, t_commit in committed.items():
+        assert uuid in pre, "a committed transaction has no before-commit record"
+        assert pre[uuid] < t_commit, "the before-commit record was made after the commit"
 
 
-def test_ct3_lying_database_detects_data_loss(tmp_path: Path):
-    """CT-3: a fake database that acknowledges and then loses a commit -> rpo_txn >= 1."""
-    journals = MarkerJournals(tmp_path)
-    channel = JournalRecordChannel(journals)
-    db_committed_uuids: set[str] = set()
+def test_ct2_database_killed_mid_load(tmp_path, monkeypatch):
+    async def go():
+        driver, adapter, db = make_driver(tmp_path, monkeypatch, concurrency=4, rate_tps=80)
+        await driver.start()
+        await driver.wait_until_ready()
+        await until(lambda: len(db.committed()) >= 20, what="load before the kill")
+        db.flag("down")
+        await until(lambda: _ended(driver, "client_aborted") >= 4, what="every client dropped")
+        await asyncio.sleep(0.5)
+        db.flag("down", on=False)
+        await until(lambda: len(db.committed()) >= 60, what="load after recovery")
+        await driver.stop()
+        close_evidence(driver)
+        return driver, adapter
 
-    async def run_workload():
-        for i in range(1, 10):
-            ident = identity_text(launch=1, client=0, seq=i)
-            await channel.record_pre(ident, time.time(), seq=i)
-            await channel.record_ack(ident, time.time())
-            if i != 5:
-                # DB drops transaction 5 after acknowledging it!
-                db_committed_uuids.add(identity_uuid(ident))
-
-    asyncio.run(run_workload())
-    journals.close()
-
-    diff, torn = diff_from_journals(tmp_path, db_committed_uuids)
-    # Constitution III: fail-closed negative test detecting data loss
-    assert diff.rpo_txn == 1
-    lost_ident = identity_text(1, 0, 5)
-    assert identity_uuid(lost_ident) in diff.lost
-
-
-def test_ct4_pre_record_failure_aborts_transaction(tmp_path: Path):
-    """CT-4: the pre record fails -> transaction never commits, never acked-without-pre."""
-    class FailingMarkerJournals(MarkerJournals):
-        async def written(self, seq: int, uuid: str, t_pre: float) -> None:
-            raise OSError("Disk full: cannot write pre-commit marker")
-
-    journals = FailingMarkerJournals(tmp_path)
-    channel = JournalRecordChannel(journals)
-
-    async def run_attempt():
-        ident = identity_text(launch=1, client=0, seq=1)
-        with pytest.raises(OSError, match="Disk full"):
-            await channel.record_pre(ident, time.time(), seq=1)
-
-        # Invariant TR-3: Pre failed, so transaction must never be acknowledged
-        with pytest.raises(RuntimeError, match="ack without pre record"):
-            await channel.record_ack(ident, time.time())
-
-    asyncio.run(run_attempt())
-    assert channel.complete is False
-    reason = channel.incomplete_reason or ""
-    assert "failed writing pre-commit record" in reason or "ack without pre record" in reason
-
-
-
-def test_ct5_ack_record_failure_marks_incomplete(tmp_path: Path):
-    """CT-5: ack record fails after commit -> run detects incomplete channel, issues no RPO."""
-    class FailingAckJournals(MarkerJournals):
-        async def acknowledged(self, uuid: str, t_ack: float) -> None:
-            raise OSError("Disk I/O error writing acked journal")
-
-    journals = FailingAckJournals(tmp_path)
-    channel = JournalRecordChannel(journals)
-
-    async def run_attempt():
-        ident = identity_text(launch=1, client=0, seq=1)
-        await channel.record_pre(ident, time.time(), seq=1)
-        with pytest.raises(OSError, match="Disk I/O error"):
-            await channel.record_ack(ident, time.time())
-
-    asyncio.run(run_attempt())
-    journals.close()
-
-    assert channel.complete is False
-    assert "failed writing ack record" in (channel.incomplete_reason or "")
-
-
-def test_ct6_repeated_relaunches_unique_identities(tmp_path: Path):
-    """CT-6: repeated relaunches -> no identity repeats; diff_from_journals 0 torn, 0 unjournalled."""
-    journals = MarkerJournals(tmp_path)
-    channel = JournalRecordChannel(journals)
-    all_seen_idents: set[str] = set()
-    db_uuids: set[str] = set()
-
-    async def simulate_launches():
-        for launch_id in range(1, 5):
-            for seq in range(1, 6):
-                ident = identity_text(launch=launch_id, client=0, seq=seq)
-                assert ident not in all_seen_idents, f"Duplicate identity {ident}"
-                all_seen_idents.add(ident)
-
-                await channel.record_pre(ident, time.time(), seq=seq)
-                await channel.record_ack(ident, time.time())
-                db_uuids.add(identity_uuid(ident))
-
-    asyncio.run(simulate_launches())
-    journals.close()
-
-    assert len(all_seen_idents) == 20
-    diff, torn = diff_from_journals(tmp_path, db_uuids)
+    driver, adapter = asyncio.run(go())
+    diff, torn = diff_from_journals(driver.journals.run_dir, asyncio.run(adapter.marker_ids()))
     assert torn == 0
     assert diff.rpo_txn == 0
-    assert diff.unjournalled_ack == frozenset()
-    assert diff.phantom == frozenset()
+    assert not diff.unjournalled_ack and not diff.phantom
+    assert diff.acked <= diff.written
+
+
+def test_ct3_a_database_that_loses_acknowledged_commits_is_caught(tmp_path, monkeypatch):
+    async def go():
+        driver, adapter, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=50)
+        db.flag("lose")   # COMMIT acknowledged, nothing persists
+        await driver.start()
+        await until(lambda: len(_journal_now(driver)) >= 10, what="acknowledged commits")
+        await driver.stop()
+        close_evidence(driver)
+        return driver, adapter
+
+    driver, adapter = asyncio.run(go())
+    diff, _ = diff_from_journals(driver.journals.run_dir, asyncio.run(adapter.marker_ids()))
+    assert diff.rpo_txn >= 10, "acknowledged commits the database lost must count as lost"
+
+
+def _ended(driver, how):
+    return sum(1 for e in driver.stream.events() if e.kind == "launch_end" and e.data["ended_as"] == how)
+
+
+def _journal_now(driver):
+    p = driver.journals.run_dir / "acked.jrnl"
+    return p.read_text().splitlines() if p.exists() else []
+
+
+def test_ct4_a_failed_before_commit_record_stops_the_transaction(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=50)
+        real = driver.journals.written
+        calls = {"n": 0}
+
+        async def failing(seq, uuid, t_pre):
+            calls["n"] += 1
+            if calls["n"] > 5:
+                raise OSError(28, "No space left on device")
+            await real(seq, uuid, t_pre)
+
+        monkeypatch.setattr(driver.journals, "written", failing)
+        await driver.start()
+        await until(lambda: driver.failure is not None, what="the run to fail")
+        await driver.stop()
+        close_evidence(driver)
+        return driver, db
+
+    driver, db = asyncio.run(go())
+    assert "marker journal write failed" in driver.failure
+    written = {r["uuid"] for r in _journal(driver, "marker.jrnl")}
+    assert set(db.committed()) <= written, "a transaction committed without its before-commit record"
+
+
+def test_ct5_a_failed_acknowledgement_record_fails_the_run(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=50)
+
+        async def failing(uuid, t_ack):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(driver.journals, "acknowledged", failing)
+        await driver.start()
+        await until(lambda: driver.failure is not None, what="the run to fail")
+        await driver.stop()
+        close_evidence(driver)
+        return driver, db
+
+    driver, db = asyncio.run(go())
+    assert "acknowledgement journal write failed" in driver.failure
+    # the commit happened, and no acknowledgement claims it: the run has no RPO to issue
+    assert db.committed() and not _journal(driver, "acked.jrnl")
+
+
+def test_ct6_relaunches_never_reuse_an_identity(tmp_path, monkeypatch):
+    async def go():
+        driver, adapter, db = make_driver(tmp_path, monkeypatch, concurrency=3, rate_tps=60)
+        await driver.start()
+        for _ in range(2):
+            await until(lambda: len(db.committed()) >= 10, what="load")
+            launches = driver._launch_counter
+            db.flag("down")
+            await asyncio.sleep(0.4)
+            db.flag("down", on=False)
+            await until(lambda: driver._launch_counter >= launches + 3, what="relaunch")
+        n = len(db.committed())
+        await until(lambda: len(db.committed()) >= n + 10, what="load after the relaunches")
+        await driver.stop()
+        close_evidence(driver)
+        return driver, adapter
+
+    driver, adapter = asyncio.run(go())
+    records = _journal(driver, "marker.jrnl")
+    assert len({r["uuid"] for r in records}) == len(records)
+    assert len({r["seq"] for r in records}) == len(records)
+    diff, torn = diff_from_journals(driver.journals.run_dir, asyncio.run(adapter.marker_ids()))
+    assert torn == 0 and not diff.unjournalled_ack and diff.rpo_txn == 0
+    assert driver._launch_counter >= 9

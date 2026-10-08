@@ -395,9 +395,18 @@ class BaseDatabaseAdapter(ABC):
         kill switch has no other). Default: returns empty dict."""
         return {}
 
-    def pgbench_launch(self, shape: str, launch: int, client: int) -> PgbenchLaunchSpec:
-        """Return the launch specification for a pgbench worker process."""
+    def pgbench_launch(self, shape: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec:
+        """The pgbench transaction for `shape` (marker, churn, list_append) and where to connect
+        (contracts/adapter-pgbench.md). The script is the transaction only: the driver adds the
+        record steps around it and sets `seq` (all shapes), `ckey` / `creplace` (churn) and
+        `rk` / `ak` / `vbase` (list_append). A list-append transaction leaves each read, as
+        offsets from `vbase` joined by '.', or 'nil', in `r1len` / `r1c1..r1c<read_chunks>`
+        and `r2len` / `r2c1..`, `chunk_chars` characters per chunk."""
         raise NotImplementedError(f"{type(self).__name__} does not implement pgbench_launch")
+
+    def pgbench_marker_uuid(self, seq: int) -> str:
+        """The marker uuid the pgbench transaction with `seq` inserts, computed the same way."""
+        raise NotImplementedError(f"{type(self).__name__} does not implement pgbench_marker_uuid")
 
     async def sessions_with_application_name(self, name: str) -> int | None:
         """Count active sessions with the given application_name.

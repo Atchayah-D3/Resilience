@@ -27,6 +27,7 @@ from resilience_tests.adapters.base import (
 )
 from resilience_tests.control.profile import DbEndpoint, Node
 from resilience_tests.execution.remote import RemoteHost, as_user
+from resilience_tests.execution.workload.identity import identity_uuid
 
 HARNESS_DDL = """
 CREATE SCHEMA IF NOT EXISTS resilience;
@@ -99,6 +100,9 @@ CHURN_UPDATE = "UPDATE resilience.churn SET v = v + 1, ts = clock_timestamp(), p
 CHURN_DELETE = "DELETE FROM resilience.churn WHERE id = $1"
 CHURN_REINSERT = "INSERT INTO resilience.churn (id, payload) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING"
 CHURN_PAYLOAD = "y" * 180
+# pgbench workload: marker uuids are md5(<prefix><seq>), so the harness derives the same uuid
+PGBENCH_MARKER_PREFIX = "resilience-pgbench-"
+PGBENCH_APPLICATION_NAME = "resilience-pgbench"
 INSERT_MARKER = "INSERT INTO resilience.markers(uuid, seq, ts) VALUES ($1, $2, clock_timestamp())"
 SELECT_MARKERS = "SELECT uuid::text FROM resilience.markers"
 PROBE_WRITE = "INSERT INTO resilience.probe_writes DEFAULT VALUES"
@@ -1834,52 +1838,53 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         finally:
             await conn.close()
 
-    def pgbench_launch(self, shape: str, launch: int, client: int) -> PgbenchLaunchSpec:
-        app_name = f"resilience-pgbench-l{launch}-c{client}"
-        variables: dict[str, Any] = {
-            "launch": launch,
-            "client": client,
-            "seq": 0,
-        }
+    def pgbench_marker_uuid(self, seq: int) -> str:
+        return identity_uuid(f"{PGBENCH_MARKER_PREFIX}{seq}")
+
+    def pgbench_launch(self, shape: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec:
+        """The built-in driver's transactions (`commit_marker`, `commit_marker_with_churn`,
+        `commit_marker_list_append`), statement for statement, as one pgbench transaction."""
+        marker = (f"INSERT INTO resilience.markers(uuid, seq, ts) "
+                  f"VALUES (md5('{PGBENCH_MARKER_PREFIX}' || :seq)::uuid, :seq, clock_timestamp());\n")
         if shape == "marker":
-            script = (
-                "\\set seq :seq + 1\n"
-                "INSERT INTO resilience.markers (uuid, seq) "
-                "VALUES (md5('L'||:launch||'-C'||:client||'-S'||:seq)::uuid, :seq);\n"
-            )
+            script = "BEGIN;\n" + marker + "COMMIT;\n"
         elif shape == "churn":
-            variables["churn_keys"] = self.churn_key_space
-            variables["replace_every"] = 10
+            payload = f"repeat('{CHURN_PAYLOAD[0]}', {len(CHURN_PAYLOAD)})"
             script = (
-                "\\set seq :seq + 1\n"
-                "\\set churn_id random(1, :churn_keys)\n"
-                "\\set r :seq % :replace_every\n"
-                "\\if :r == 0\n"
-                "DELETE FROM resilience.churn WHERE id = :churn_id;\n"
-                "INSERT INTO resilience.churn (id, v, payload) VALUES (:churn_id, :seq, repeat('x', 256));\n"
+                "BEGIN;\n" + marker
+                + "\\if :creplace\n"
+                "DELETE FROM resilience.churn WHERE id = :ckey;\n"
+                f"INSERT INTO resilience.churn (id, payload) VALUES (:ckey, {payload}) ON CONFLICT (id) DO NOTHING;\n"
                 "\\else\n"
-                "UPDATE resilience.churn SET v = :seq WHERE id = :churn_id;\n"
+                f"UPDATE resilience.churn SET v = v + 1, ts = clock_timestamp(), payload = {payload} WHERE id = :ckey;\n"
                 "\\endif\n"
-                "INSERT INTO resilience.markers (uuid, seq) "
-                "VALUES (md5('L'||:launch||'-C'||:client||'-S'||:seq)::uuid, :seq);\n"
+                "COMMIT;\n"
             )
         elif shape == "list_append":
-            variables["read_key"] = 1
-            variables["append_key"] = 1
+            if read_chunks < 1 or chunk_chars < 1:
+                raise ValueError("a list-append pgbench transaction needs read_chunks and chunk_chars")
+
+            def read(var: str, key: str) -> str:
+                # the list as offsets from the key window's base, in array order; 'nil' for no row
+                chunks = ", ".join(f"substr(x, {1 + i * chunk_chars}, {chunk_chars}) AS {var}c{i + 1}"
+                                   for i in range(read_chunks))
+                return (f"SELECT length(x) AS {var}len, {chunks} FROM (SELECT coalesce(("
+                        f"SELECT array_to_string(ARRAY(SELECT e - :vbase FROM unnest(v) WITH ORDINALITY "
+                        f"AS u(e, i) ORDER BY i), '.') FROM resilience.elle_lists WHERE k = {key}), 'nil') AS x) AS s \\gset\n")
+
             script = (
-                "\\set seq :seq + 1\n"
-                "SELECT v AS read_v FROM resilience.lists WHERE k = :read_key \\gset\n"
-                "INSERT INTO resilience.lists AS l (k, v) VALUES (:append_key, ARRAY[:seq::bigint]) "
-                "ON CONFLICT (k) DO UPDATE SET v = l.v || :seq RETURNING v AS append_v \\gset\n"
-                "INSERT INTO resilience.markers (uuid, seq) "
-                "VALUES (md5('L'||:launch||'-C'||:client||'-S'||:seq)::uuid, :seq);\n"
+                f"BEGIN ISOLATION LEVEL {ELLE_ISOLATION.upper()};\n" + marker
+                + read("r1", ":rk")
+                + "INSERT INTO resilience.elle_lists AS l (k, v) VALUES (:ak, ARRAY[:seq::bigint]) "
+                  "ON CONFLICT (k) DO UPDATE SET v = l.v || :seq::bigint;\n"
+                + read("r2", ":ak")
+                + "COMMIT;\n"
             )
         else:
             raise ValueError(f"unknown shape {shape!r} for pgbench_launch")
-
         return PgbenchLaunchSpec(
             script=script,
-            variables=variables,
+            variables={},
             connection=self.node.client,
-            application_name=app_name,
+            application_name=PGBENCH_APPLICATION_NAME,   # the driver appends the run id (research R9)
         )

@@ -46,13 +46,13 @@ def render_summary(r: dict[str, Any]) -> str:
             launches = facts.get("pgbench_launches")
             if launches is not None:
                 gen_line += f", launches: {launches}"
-            overhead = facts.get("pgbench_recording_overhead")
-            if overhead is not None:
-                gen_line += f"\n  recording overhead: {overhead:.1f}%"
-            lag_p50 = facts.get("pgbench_scheduling_lag_p50_us")
-            lag_p99 = facts.get("pgbench_scheduling_lag_p99_us")
-            if lag_p50 is not None and lag_p99 is not None:
-                gen_line += f"\n  scheduling lag: p50 {lag_p50:.1f} us, p99 {lag_p99:.1f} us"
+            j50 = facts.get("pgbench_record_journal_p50_ms")
+            j99 = facts.get("pgbench_record_journal_p99_ms")
+            if j50 is not None and j99 is not None:
+                gen_line += f"\n  record journal flush: p50 {j50:.1f} ms, p99 {j99:.1f} ms"
+            mechanism = facts.get("pgbench_record_mechanism")
+            if mechanism:
+                gen_line += f"\n  record steps: {mechanism}"
         lines.append(gen_line)
     lines.append("")
     if r.get("error"):

@@ -1,27 +1,31 @@
 # Contract: Before-Commit and Acknowledgement Records (research R1)
 
-**Status**: the mechanism is a **team-owned decision**, not yet made. This contract is normative: whatever mechanism is chosen must pass every test below before the pgbench driver may measure RPO. Until then, the factory refuses `generator: pgbench` for any scenario with `workload.transaction_markers: true`, which is every current scenario. The built-in driver remains available (FR-020).
+**Status**: decided, research R1 option B. Implemented by `resilience_tests/execution/workload/shell_records.py`. Every pgbench transaction calls the harness's journal service through two pgbench shell steps; the service writes the same `marker.jrnl` / `acked.jrnl`, with the same `DurableJournal`, as the built-in driver.
 
-## Requirements
+## Requirements and how they are met
 
-| # | Requirement | Source |
-|---|---|---|
-| TR-1 | For every transaction, a record with its identity is durable on the driver host **before its COMMIT is sent** | Arch §6.2, constitution VII, FR-005 |
-| TR-2 | A second durable record is made **only after** the database acknowledges the COMMIT | FR-005 |
-| TR-3 | If TR-1 fails, the transaction does not commit, or the run aborts | spec US2-2 |
-| TR-4 | If TR-2 fails after a successful commit, the run detects it and issues no RPO figure | spec US2-3 |
-| TR-5 | Records land in, or convert losslessly into, `marker.jrnl` / `acked.jrnl` (format: data-model.md) | FR-007 |
-| TR-6 | Identities are unique across the run, including relaunches | FR-006 |
-| TR-7 | Each record carries a driver-host timestamp, used for latency and samples | FR-009, research R3 |
-| TR-8 | The added per-transaction time is measurable from pgbench's per-command report | FR-011, research R8 |
-| TR-9 | For list-append scripts, the values read are recorded to the operation history through the same guarantees | FR-016, research R6 |
+| # | Requirement | Source | Met by |
+|---|---|---|---|
+| TR-1 | For every transaction, a record with its identity is durable on the driver host **before its COMMIT is sent** | Arch §6.2, constitution VII, FR-005 | the script's first step (`\setshell`) blocks until the service has fdatasync'd the marker and replied; `BEGIN` comes after it |
+| TR-2 | A second durable record is made **only after** the database acknowledges the COMMIT | FR-005 | the `ack` step follows `COMMIT` in the script; pgbench runs it only if the COMMIT succeeded |
+| TR-3 | If TR-1 fails, the transaction does not commit, or the run aborts | spec US2-2 | the service replies `err`, `\setshell` gets no integer, pgbench aborts the client before `BEGIN`; the run fails |
+| TR-4 | If TR-2 fails after a successful commit, the run detects it and issues no RPO figure | spec US2-3 | the service fails the run (`workload driver failed`), which aborts it without a verdict |
+| TR-5 | Records land in `marker.jrnl` / `acked.jrnl` (format: data-model.md) | FR-007 | the same `MarkerJournals` object as the built-in driver |
+| TR-6 | Identities are unique across the run, including relaunches | FR-006 | `seq` is assigned by the one service for the whole run |
+| TR-7 | Each record carries a driver-host timestamp, used for latency and samples | FR-009, research R3 | `t_pre` / `t_ack`; latency is measured by the service, from release to acknowledgement |
+| TR-8 | The added per-transaction time is measurable | FR-011, research R8 | journal flush time per transaction (`journal_p99_ms`, `pgbench_record_journal_*`); the ack step's shell run is inside the latency, disclosed |
+| TR-9 | For list-append scripts, the values read are recorded to the operation history through the same guarantees | FR-016, research R6 | reads travel as chunks before the `ack`; a read that does not reassemble to its stated length fails the run |
 
-## Contract tests (must pass, with the fake pgbench and on the lab)
+## Contract tests
 
-- **CT-1, order.** For a run's records, every acknowledged identity's before-commit record has `t_pre <` the commit-send time observed by the fake database, and the database-side insert time.
-- **CT-2, kill mid-load.** Kill the database during load. Acknowledged ⊆ before-commit records, unknown outcomes are reported, and the RPO arithmetic gives 0 lost for an honest database.
-- **CT-3, a lying database.** A fake database that acknowledges and then drops a commit: the run reports `rpo_txn ≥ 1`. This is the negative test proving the criterion can fail (constitution III).
-- **CT-4, record failure before commit.** Make the before-commit record fail: that transaction never commits, or the run aborts. Never "acknowledged without a record".
-- **CT-5, acknowledgement failure.** Make the acknowledgement record fail after a commit: the run issues no RPO figure.
-- **CT-6, relaunch.** Relaunch clients repeatedly: no identity repeats, and the journals stay consistent.
-- **CT-7, throughput.** On the lab driver host, report the sustained rate at NL-C-01's 200 TPS and NL-M-07's 1000 TPS offered, with the added per-transaction time (spec US5).
+With the fake pgbench, whose record steps run through `/bin/sh` for real (`tests/test_transaction_record.py`):
+
+- **CT-1, order.** Every committed marker has a before-commit record with `t_pre` earlier than the fake database's commit time.
+- **CT-2, kill mid-load.** The database goes down during load and returns: acknowledged ⊆ written, `rpo_txn == 0`, no torn line, no unjournalled acknowledgement, no phantom.
+- **CT-3, a lying database.** Commits acknowledged and not kept: `rpo_txn` counts them (the negative test, constitution III).
+- **CT-4, record failure before commit.** The marker journal fails: the run fails, and no transaction commits without a before-commit record.
+- **CT-5, acknowledgement failure.** The acknowledgement journal fails after a commit: the run fails; no acknowledgement claims it.
+- **CT-6, relaunch.** Two outages and relaunches: no `uuid` or `seq` repeats, journals consistent.
+- **CT-7, throughput.** On the lab: NL-C-01 at 200 TPS and NL-M-07 at 1000 TPS offered (tasks T049).
+
+Race and ordering cases are covered in `tests/test_shell_records.py` (an acknowledgement left in the pipe by a client that died; a client stopped while its marker was being flushed).

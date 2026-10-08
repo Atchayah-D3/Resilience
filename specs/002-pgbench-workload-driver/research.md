@@ -14,45 +14,55 @@ Phase 0 decisions for [plan.md](plan.md). Each entry gives the decision, the rat
 
 ---
 
-## R1 — Before-commit and acknowledgement records (FR-005 to FR-007) — **DECIDED (Architecture §6.1 Hybrid Model)**
+## R1 — Before-commit and acknowledgement records (FR-005 to FR-007) — **DECIDED: option B, pgbench shell record steps**
 
-**Status**: Decision recorded by the team (Architecture §6.1 Hybrid Model).
+**Status**: decided 2026-10-08, replacing the earlier "Hybrid Model" entry. That entry kept every marker scenario on the built-in driver, and all 12 catalog scenarios record markers, so under it pgbench ran no scenario at all. It also quoted Architecture §6.1 with a sentence the Architecture does not contain. What §6.1 says, in its workload-engine table, is: *"Custom asyncpg driver — Every RPO-measuring scenario; all DistDB multi-shard workloads — Transaction markers and 2PC-mode control need application-level logic that pgbench cannot express."* R0 records the departure from that row; this entry records how the logic is supplied to pgbench instead.
 
+**Decision**: every pgbench transaction calls the harness for its two records, through pgbench shell steps and named pipes on the driver host (`resilience_tests/execution/workload/shell_records.py`):
 
-**What any mechanism must satisfy** (normative; full detail in [contracts/transaction-record.md](contracts/transaction-record.md)):
-1. **Before commit.** For every transaction, a record carrying its identity `(launch, client, seq)` is **durable on the driver host before its COMMIT is sent** to the database. Inferred records do not qualify (spec Assumptions; constitution VII).
-2. **After acknowledgement.** A second durable record is made **only after** the database acknowledges the COMMIT, and never otherwise.
-3. **Failure cannot fake an outcome.** If (1) fails, the transaction must not commit, or the run aborts. If (2) fails after a successful commit, the run must notice and refuse to issue an RPO figure.
-4. **Same files and arithmetic as today.** The records land in, or are converted losslessly into, `marker.jrnl` / `acked.jrnl`, so `diff_from_journals` and its consistency checks run unchanged.
-5. **Timing evidence.** Each record carries a driver-host timestamp, so the harness can compute per-transaction latency and per-second samples (R3).
-6. **Measurable cost.** The time the mechanism adds per transaction is measurable from pgbench's own per-command report (R8) and is disclosed.
-7. **Unique identity.** Identities are unique across launches; no identity is reused.
+```text
+\setshell tok printf ... pre <launch> <client> 1<>q && read -r a < <reply> && echo "$a"
+<decode tok into seq (+ ckey/creplace, rk/ak/vbase)>
+BEGIN; <the adapter's transaction>; COMMIT;
+[\shell printf ... c <launch> <seq> <read> <i> <chunk> 1<>q]      # list-append reads
+\shell printf ... ack <launch> <seq> [len1 len2] 1<>q && read -r a < <reply> && test "$a" = ok
+```
 
-**How to judge candidates**:
-- Meets 1–7, demonstrated by the contract tests in tasks.md (T018–T023).
-- The rate it sustains on the lab driver host: at least NL-C-01's floor of 150 TPS, and ideally NL-M-07's 750 TPS floor. Anything below means NL-M-07 uses the built-in driver (FR-020).
-- Failure behaviour under a killed database, a full evidence disk and a killed pgbench process.
-- Operational footprint on the driver host: what must be installed, and cleanup.
+- `pre`: the service takes the next slot of the built-in driver's shared `RateLimiter`, assigns the run-wide `seq`, chooses the churn key / Elle keys with the built-in driver's seeded generators, appends the marker to `marker.jrnl` through the same group-committed `DurableJournal`, fdatasyncs, and only then replies. The client cannot send `BEGIN`, let alone `COMMIT`, before the record is durable.
+- `ack`: sent only after the COMMIT succeeded; the service journals it to `acked.jrnl` and replies `ok`.
+- Outcomes: committed = an `ack` arrived; definitely aborted = the same client's next `pre` arrived without an `ack` (pgbench goes on after a serialization or deadlock failure only, and aborts the client on any other error; verified on the lab build); unknown = the client ended with a transaction in flight.
+- Each shell step is one `/bin/sh` with builtins only (`printf`, `read`, `test`, `echo`); the request pipe is opened read-write (`1<>q`) so a step never blocks on open.
 
-**Decision**: Adopt the **Architecture §6.1 Hybrid Model**.
-- For scenarios that require RPO measurement (`workload.transaction_markers: true`), the harness uses the reference `builtin` (asyncpg) driver with native group-committed `DurableJournal` flushes. If `generator: pgbench` is configured for such a scenario, the factory cleanly refuses with `UnsupportedWorkload` citing Architecture §6.1 / research R1 (fail-closed, Constitution Principles II, III, VII).
-- For scenarios testing throughput, baseline latency, soak, concurrency limits, crash/recovery availability (RTO), connection floods, and restarts without marker journaling, `pgbench` is the primary workload generator.
-
-**Rationale**:
-- pgbench lacks native primitives to flush arbitrary local host files before issuing `COMMIT` and after receiving acknowledgment.
-- Using pgbench's `\shell` meta-command to append to a journal requires forking a subshell process on every transaction. At 200–1,000 TPS with pre- and post-commit markers, this induces 400 to 2,000 process forks per second. On Linux VMs (particularly those with slow fsync, as documented in CLAUDE.md), this causes severe scheduling lag, CPU saturation, and false-positive timeouts.
-- A local wire-level loopback proxy would introduce protocol-parsing complexity and an additional proxy layer above the adapter seam.
-- Architecture §6.1 specifically foresaw this constraint: *"RPO measurement requires application-level transactional invariants that standard database benchmarking tools cannot natively express without external mediation."* Keeping RPO scenarios on `builtin` and throughput/concurrency/recovery scenarios on `pgbench` preserves 100% evidence integrity with zero compromise.
+**Why this meets TR-1 to TR-9** (contracts/transaction-record.md): the records are made by the same code as the built-in driver's, in the same order relative to the COMMIT; nothing is inferred from logs or timing.
 
 **Alternatives considered**:
-- `\shell` in pgbench scripts: rejected due to 400–2,000 process forks/second, violating TR-8 and causing driver-host saturation.
-- Loopback wire proxy / client tap: rejected to avoid maintaining a custom PostgreSQL wire-protocol proxy above the adapter seam.
-- Relying on pgbench `-l` log: rejected because `-l` is written after transactions and buffered in user space, violating TR-1 (durable before commit).
+- Hybrid (marker scenarios on the built-in driver): rejected, it runs no scenario on pgbench.
+- A PostgreSQL wire-protocol tap in the adapter, journalling `COMMIT` on the way through: no forks, but a protocol implementation to maintain, and Elle reads would have to be rebuilt from wire traffic. Kept as the fallback if the shell steps' cost proves too high on the lab.
+- pgbench's `-l` log: written after the transaction and buffered, so it can never be a before-commit record.
 
-**Measured cost**:
-- Zero additional overhead for pgbench runs (clean standard SQL, no shell forks).
-- Full RPO evidence integrity preserved via `builtin`.
+**Verified behaviours of ShaktiDB 17 pgbench** (local 17.10.3.0 build, 2026-10-08; to be re-confirmed on the lab's 17.11.1.0 by the first live run):
+- a shell command of 255 bytes or more aborts the client ("shell command is too long"), hence the read chunks;
+- `\setshell` with a non-integer or empty result, and `\shell` with a non-zero exit, abort the client ("execution of meta-command failed");
+- `:var` is substituted only in a whole meta-command argument;
+- with `--max-tries=1`, a serialization failure skips the rest of the script and the client continues;
+- abort lines: `client N aborted in command C (SQL) of script 0; perhaps the backend died while processing` (server crash) and `client N script 0 aborted in command C query 0: FATAL: ...` (terminated backend); no connection at start exits 1 with `could not create connection`; without `-n` pgbench tries to vacuum `pgbench_*` tables;
+- no summary is printed on SIGTERM, so pgbench's per-command report cannot be the overhead disclosure (R8).
 
+**Measured cost — local only, not the lab** (driver and database on one WSL2 workstation, real pgbench, real PostgreSQL; `marker` shape, 64 clients):
+
+| Offered | Achieved | p50 / p99 latency | journal flush p99 | lost / phantom / unjournalled ack |
+|---|---|---|---|---|
+| 200 TPS | 199.96 TPS | 2.9 / 6.2 ms | 13.1 ms | 0 / 0 / 0 |
+| 1000 TPS | 1002.4 TPS | 5.8 / 19.7 ms | 26.9 ms | 0 / 0 / 0 |
+
+Faults, same setup: all 64 backends terminated (64 drops, 64 unknown, 64 relaunched, 0 lost); `pg_ctl stop -m immediate` held 3 s (load back to 197 TPS one second after restart, 0 lost); churn (2,000 live rows held, 0 lost); list-append (all 9,558 non-nil reads are prefixes of the final lists; every `:invoke` closed). A harness killed with SIGKILL leaves no pgbench and no shell step behind (`setpriv --pdeathsig`).
+
+**Lab figures (T049) remain to be measured.** The built-in driver's lab results below stay as the reference.
+
+> **Correction (verification 2026-10-07).** The two runs below ran on the **built-in** driver, not pgbench.
+
+- **NL-C-01 (Process Kill, 200 TPS offered), built-in driver**: **PASSED** on `e2-dedicated-vm` (`run NL-C-01-20261007T110159Z-9f59f9`): `rpo_txn = 0`, `rto_first_write_s = 2.19s`, `structural_integrity_errors = 0`.
+- **NL-M-07 (High Load, 1000 TPS offered, floor 750 TPS), built-in driver**: aborted before the fault: `steady state did not hold (tps=369.4, db p99=12.6 ms, journal p99=1000.9 ms; slower side: driver journal flush): ['tps >= 750.0']` (`run NL-M-07-20261007T123155Z-93d1d5`). The driver host's fsync, not the database, was the limit; pgbench uses the same journal, so expect the same limit there.
 
 ---
 
@@ -73,6 +83,8 @@ The supervisor treats scripts as opaque text. See [contracts/adapter-pgbench.md]
 
 ## R3 — Per-second samples (FR-009, FR-010)
 
+**Revised (option B)**: the samples are built by the driver from the record service's own measurements: latency from the moment the client is released to `BEGIN` to the arrival of its `ack`, over every attempt (a definite abort is timed to the client's next `pre`, an unknown to the moment its client ended), exactly the built-in driver's accounting. Everything is on the harness's monotonic clock, so no wall-clock conversion is needed. pgbench's `--progress` is not used.
+
 **Decision**: the supervisor builds the existing `sample` event (interval, commits, tps, p50/p95/p99, errors, indeterminate, drops, reconnects, connect_failures) once per second on the harness clock. It draws on per-transaction timing evidence from R1's records (latency = acknowledgement time − send time), outcome events from R5, and drop/relaunch events from R4. pgbench's `--progress=1` throughput is recorded beside it as a cross-check, never as the source of a pass/fail value.
 
 **Rationale**: pgbench's progress output has throughput and average latency only, with no percentiles, and its per-transaction `-l` log is buffered until exit. The baseline, the steady-state check and time-to-SLO all need live p99. Building the same event as today keeps `rto_decomposer` and `baseline_slo_check` unchanged.
@@ -88,6 +100,8 @@ Both are kept as post-run cross-checks only.
 ---
 
 ## R4 — Supervision and relaunch (FR-012, FR-014, FR-017)
+
+**Revised (option B)**: a client is relaunched for as long as the run lasts, as a built-in worker reconnects; one shared probe (`adapter.session()` + `ping`, every 0.2 s) serves every waiting client, and each failed probe counts one connection failure. A pgbench that could not connect at start (exit 1, `could not create connection`) counts a connection failure and is retried. A transaction in flight longer than `TXN_TIMEOUT_S` (10 s) has its client killed and relaunched, its outcome unknown, as the built-in worker abandons its session. A client aborted by a meta-command (a record step) or a pgbench that exits on its own fails the run.
 
 **Decision**: run **one pgbench process per client** (`-c 1 -j 1`), each offering `rate / concurrency` transactions per second, **evenly spaced** (R11, not pgbench's `-R`), with a run duration longer than any run (`-T`), and its own launch number. The supervisor:
 - watches each process's exit and stderr;
@@ -105,6 +119,8 @@ Both are kept as post-run cross-checks only.
 
 ## R5 — Outcome classification (FR-008)
 
+**Revised (option B)**: definitely aborted is detected per transaction, not from pgbench's counters: the same client's next `pre` arriving without an `ack` (see R1).
+
 **Decision**:
 - **Committed**: an acknowledgement record exists (R1).
 - **Definitely aborted**: pgbench reports a serialization or deadlock **failure** for the transaction (`--failures-detailed`, `--max-tries=1`); the server rejected it explicitly.
@@ -119,6 +135,8 @@ NL-M-07's `failed_transactions` counts definitely-aborted transactions; `dropped
 ---
 
 ## R6 — Transaction shapes (FR-015, FR-016)
+
+**Revised (option B)**: the adapter's script is the built-in driver's transaction statement for statement, inside `BEGIN`/`COMMIT` (list-append at `SERIALIZABLE`, on `resilience.elle_lists`). The marker uuid is `md5('resilience-pgbench-' || seq)::uuid`. The service chooses churn keys and Elle keys with the built-in driver's seeded generators and hands them to the script in the token.
 
 **Decision**: the adapter's scripts reproduce today's shapes exactly:
 - **marker**: insert `(uuid-equivalent identity, seq)` into `resilience.markers`;
@@ -135,15 +153,20 @@ The marker identity is the `(launch, client, seq)` triple. The script stores it 
 
 ## R7 — Per-client sequence numbers
 
+**Revised (option B)**: superseded. `seq` is assigned run-wide by the record service, as `MarkerJournals` does for the built-in driver, so it is unique across launches and is also a valid Elle append value (Elle needs every appended value unique per key).
+
 **Decision**: each pgbench process starts with `-D seq=0` and the script increments `seq` per transaction. Identity = `(launch, client, seq)`, where `launch` is unique per process start.
 
-**Verification required on the lab build** (quickstart step V2): that `\set` variables persist across transactions within one pgbench client in ShaktiDB's pgbench. If they don't, the identity must be built differently, and R1 must say how.
+**Verification on the lab build** (quickstart step V2): **CONFIRMED**. Running pgbench with `-D seq=0` and `\set seq :seq + 1` inserted `1, 2, 3, 4, 5` consecutively, confirming that ShaktiDB 17's pgbench persists and increments `\set` variables across transactions within a client session as expected.
+
 
 **Alternatives considered**: random 64-bit identities. Collision probability is acceptable, but they're not ordered, which loses the per-client ordering used to sanity-check records.
 
 ---
 
 ## R8 — Recording overhead (FR-011)
+
+**Revised (option B)**: pgbench prints no summary when it is stopped, so the disclosure is the service's journal flush time per transaction (`journal_p99_ms` in every sample, `pgbench_record_journal_p50_ms` / `_p99_ms` in the report), as for the built-in driver. The ack step's shell run is inside the measured latency; the report states it.
 
 **Decision**: each pgbench process runs with `--report-per-command`. At each launch's end, its summary gives the average latency of every script command, including the record steps. The report states the record steps' share of transaction latency, averaged over launches.
 
@@ -179,6 +202,8 @@ The factory builds the selected driver. A driver that cannot run refuses; there 
 
 ## R11 — Even spacing of transactions (FR-021, clarification 2026-10-07)
 
+**Revised (option B)**: pacing is done by the record service with the built-in driver's own `RateLimiter`, shared by all clients: slots are evenly spaced at 1/rate, and whichever client asks next takes the next one, with no catch-up bursts. That is the built-in driver's arrival pattern exactly; no in-script `\sleep` and no `-R`.
+
 **Decision**: pace each client **inside its pgbench script**, not with `-R`. pgbench's `-R` schedules transactions at random (Poisson) times by design, and has no even-spacing mode. Each client's script:
 - holds `interval_us = 1e6 × concurrency / rate` and a running `next_us` slot (`-D` variables);
 - reads the current time **from the database in the same statement it already runs** (e.g. a `RETURNING` value captured with `\gset`), so there is no extra round trip and one clock source per client;
@@ -203,4 +228,36 @@ When a transaction overruns its slot, the next one starts at once and the slot c
 - Branch: `pgbench`
 - `.venv/bin/pytest -q -n 4`: 336 passed, 2 failed (2 Elle tests in `tests/test_elle.py` requiring Java 21 `SequencedCollection`)
 - `.venv/bin/python -m catalog.schema --partial`: PASSED (all 6 checks PASS)
+
+---
+
+## Final Check & Lab Audit (T053)
+
+- Date: 2026-10-07
+- Branch: `pgbench`
+- **Catalog schema**: `.venv/bin/python -m catalog.schema --partial` → All 6 checks **PASS**.
+- **Unit and Contract test suite**: 36 of 36 **PASSED** on the harness VM (`BDB-QA-U22-29`).
+- **Full suite (verification 2026-10-07, after the fixes below)**: 376 passed, 2 failed (the 2 Elle tests that need Java 21, as at baseline); catalog checks pass.
+- **Note on CT-1 to CT-6**: they exercise `JournalRecordChannel` with the test making the record calls itself; no pgbench transaction is involved, so they do not certify a pgbench record mechanism. They must be rewritten to drive real pgbench transactions through whichever mechanism is chosen.
+- **Orchestrator test suite**: 31 of 31 **PASSED**.
+- **Live scenario NL-C-01 (built-in driver; see the R1 correction)**: **PASSED** on `e2-dedicated-vm` (`1 passed in 188.82s`, `rpo_txn = 0`, `rto_first_write_s = 2.19s`, `structural_integrity_errors = 0`).
+- **Live scenario NL-M-07 (built-in driver)**: Cleanly aborted before fault (`slower side: driver journal flush`), successfully proving limiting-side detection under driver-host disk IOPS bottlenecks.
+- **Process cleanup**: `pgrep -f resilience-pgbench` returned zero processes (`CLEAN: no orphaned processes`).
+
+### Verification fixes (2026-10-07)
+
+- An acknowledgement without its before-commit record no longer counts as a 0 ms latency; the run fails closed (TR-1). Test: `test_ack_without_before_commit_record_fails_closed`.
+- Without a record channel, p50/p95/p99 are `None` instead of percentiles over pgbench's per-second means. Test: `test_progress_fallback_reports_no_latency_percentiles`.
+- `application_name`: the adapter supplies the prefix `resilience-pgbench`, the driver appends `-<run_id>`, and the cleanup check queries every name actually used. Test: `test_cleanup_checks_the_application_names_actually_used`.
+- Still open: per-transaction pacing (FR-021, R11) is not implemented; the adapter's scripts never use `interval_us`, so each client runs unthrottled. Task T029 is unchecked accordingly.
+
+### Option B implementation (2026-10-08)
+
+- R1 decided as option B and built (`shell_records.py`, rewritten `pgbench_driver.py`); `record_channel.py` and the record-channel registry are removed. The factory no longer refuses marker scenarios: pgbench carries the markers itself.
+- CT-1 to CT-6 rewritten to drive real record steps through pgbench transactions (the fake pgbench runs them through `/bin/sh`); the note above about the old CT tests no longer applies.
+- The abort-line parser did not match real pgbench output (`pgbench: error: ` prefix, `script N aborted ... query N` form), so every drop would have been a fatal workload failure; fixed against recorded lines.
+- The pgbench report facts were never recorded (they were read after `_stop_load` had cleared the workload); now recorded when the load stops.
+- Every orchestrator scenario test runs on both generators (`env` fixture), at 8 clients and 40 TPS for the fake pgbench.
+- Profiles switched to `generator: pgbench` (T052) on the branch; `pytest --workload builtin` selects the fallback for one run.
+- Local unit suite (Python 3.11): all pass except the 2 Elle tests that need Java 21, as at baseline.
 

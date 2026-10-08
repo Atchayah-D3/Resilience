@@ -1,41 +1,74 @@
-"""pgbench workload driver and process supervisor (Arch §6.1, contracts/workload-driver.md)."""
+"""pgbench workload driver (Arch §6.1, contracts/workload-driver.md; research R1 option B).
+
+The harness's load is offered by pgbench, started and supervised here on the driver host:
+one pgbench process per client (`-c 1`), so a client a fault disconnects is relaunched on its
+own without touching the healthy ones (research R4).
+
+The evidence is the built-in driver's, recorded by the same code: every transaction's marker
+is journalled and flushed on the driver host before its COMMIT can be sent, and its
+acknowledgement after the server confirmed it (Arch §6.2). pgbench cannot write files, so its
+script calls the harness for both records -- see `shell_records.ShellRecordService`, which
+also paces the load (the built-in driver's shared rate limiter), classifies outcomes and
+writes the Elle history.
+
+Behaviour shared with the built-in driver, so the orchestrator cannot tell them apart:
+- a `sample` event every second (commits, tps, p50/p95/p99 over every attempt, errors,
+  indeterminate, drops, reconnects, connect_failures), on the harness clock;
+- a transaction in flight for more than TXN_TIMEOUT_S is abandoned as unknown (its client is
+  killed and relaunched, as the built-in worker discards its session);
+- a client that loses its connection is relaunched once the database accepts one again,
+  retrying every RECONNECT_PAUSE_S for as long as the run lasts;
+- `failure` is set, and the load stops, when the evidence cannot be kept: a record step that
+  failed, a journal that could not be written, a pgbench that exited on its own.
+"""
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
 import os
-from pathlib import Path
 import re
 import shutil
 import signal
 import subprocess
 import time
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from catalog.schema import Workload
-from resilience_tests.adapters.base import BaseDatabaseAdapter, Capability, DbEndpoint
+from resilience_tests.adapters.base import BaseDatabaseAdapter, Capability
 from resilience_tests.execution.workload.driver import (
+    CONNECT_TIMEOUT_S,
+    RECONNECT_PAUSE_S,
+    SAMPLE_INTERVAL_S,
+    TXN_TIMEOUT_S,
     MeasuredWindow,
     UnsupportedWorkload,
+    _Window,
     p99,
     percentile,
 )
 from resilience_tests.execution.workload.history_writer import HistoryWriter
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.execution.workload.pgbench_output import (
-    PgbenchAbortLine,
     PgbenchParseError,
-    PgbenchSummary,
     is_abort_line,
+    is_connect_failure,
     parse_abort_line,
-    parse_progress_line,
-    parse_summary,
+)
+from resilience_tests.execution.workload.shell_records import (
+    READ_CHUNK_CHARS,
+    READ_CHUNKS,
+    ShellRecordService,
+    ack_steps,
+    pre_steps,
 )
 from resilience_tests.observability.event_stream import EventStream
 
-if TYPE_CHECKING:
-    from resilience_tests.execution.workload.record_channel import RecordChannel
+SCRIPT_FILE = "transaction.sql"
+# A run is bounded by the orchestrator's phase timeouts; pgbench's own clock must never end it.
+PGBENCH_DURATION_S = 7 * 24 * 3600
+STOP_GRACE_S = 2.0
 
 
 def extract_major_version(ver_str: str | int) -> str:
@@ -48,12 +81,16 @@ def extract_major_version(ver_str: str | int) -> str:
     return m.group(1)
 
 
+def _resolve(path: str) -> str | None:
+    return shutil.which(path) if not os.path.isabs(path) and not path.startswith(".") else path
+
+
 def probe_pgbench(path: str, server_major: str | int) -> str:
     """Probe pgbench binary availability and verify its major version matches the target server.
 
     Raises UnsupportedWorkload naming the path and/or versions if unsupported (FR-004).
     """
-    resolved = shutil.which(path) if not os.path.isabs(path) and not path.startswith(".") else path
+    resolved = _resolve(path)
     if not resolved or not os.path.exists(resolved) or not os.access(resolved, os.X_OK):
         raise UnsupportedWorkload(
             f"pgbench binary {path!r} is not found or not executable (check profile workload.pgbench_bin)"
@@ -76,30 +113,41 @@ def probe_pgbench(path: str, server_major: str | int) -> str:
     return output
 
 
+def derive_shape(workload: Workload, adapter: BaseDatabaseAdapter, history: HistoryWriter | None) -> str:
+    """The transaction shape, with exactly the built-in driver's refusals."""
+    if workload.profile not in ("oltp_write_heavy", "mixed") or not workload.transaction_markers:
+        raise UnsupportedWorkload(
+            f"workload profile {workload.profile!r} (markers={workload.transaction_markers}) is not built yet"
+        )
+    if not adapter.has(Capability.TRANSACTIONAL_MARKERS):
+        raise UnsupportedWorkload(
+            f"engine {adapter.engine!r} cannot record transaction markers, so RPO cannot be measured")
+    churn = workload.profile == "mixed"
+    list_append = workload.history == "list_append"
+    if churn and not adapter.has(Capability.WORKLOAD_CHURN):
+        raise UnsupportedWorkload(
+            f"engine {adapter.engine!r} cannot run the churn workload, so cumulative bloat cannot be measured")
+    if list_append and not adapter.has(Capability.LIST_APPEND_HISTORY):
+        raise UnsupportedWorkload(
+            f"engine {adapter.engine!r} cannot run list-append transactions, so no history can be checked")
+    if churn and list_append:
+        raise UnsupportedWorkload("list-append history and the churn workload are not combined")
+    if list_append and history is None:
+        raise UnsupportedWorkload("list-append workload needs a history writer")
+    if churn and adapter.churn_key_space < 1:
+        raise UnsupportedWorkload(f"engine {adapter.engine!r} declares the churn capability but no key space")
+    return "list_append" if list_append else "churn" if churn else "marker"
+
+
 @dataclass
-class _ClientState:
-    client_id: int
-    current_launch: int
+class _Launch:
+    launch: int
+    client: int
+    argv: list[str]
     process: asyncio.subprocess.Process | None = None
-    started_mono_ns: int = 0
-    ended_mono_ns: int = 0
-    argv: list[str] = field(default_factory=list)
-    stdout_lines: list[str] = field(default_factory=list)
-    stderr_lines: list[str] = field(default_factory=list)
+    stderr: list[str] = field(default_factory=list)
+    timed_out: bool = False
     ended_as: str = "running"
-    abort_message: str | None = None
-    summary: PgbenchSummary | None = None
-
-
-@dataclass
-class _WindowAccumulator:
-    commits: int = 0
-    latencies_ms: list[float] = field(default_factory=list)
-    errors: int = 0
-    indeterminate: int = 0
-    drops: int = 0
-    reconnects: int = 0
-    connect_failures: int = 0
 
 
 class PgbenchWorkloadDriver:
@@ -115,458 +163,304 @@ class PgbenchWorkloadDriver:
         stream: EventStream,
         pgbench_bin: str = "pgbench",
         pgbench_version: str = "",
-        channel: RecordChannel | None = None,
         history: HistoryWriter | None = None,
     ) -> None:
+        self.shape = derive_shape(workload, adapter, history)
         self.adapter = adapter
         self.workload = workload
         self.journals = journals
         self.stream = stream
+        self.history = history
         self.pgbench_bin = pgbench_bin
         self.pgbench_version = pgbench_version
-        self.channel = channel
-        self.history = history
-
-        self.run_id = self.journals.run_dir.name
-        self.pgbench_dir = self.journals.run_dir / "pgbench"
-        self.app_name = f"resilience-pgbench-{self.run_id}"
-
-        self.connected_workers: int = 0
+        self.run_id = journals.run_dir.name
+        self.pgbench_dir = journals.run_dir / "pgbench"
+        self.app_name = ""
         self.failure: str | None = None
-        self.window_t0_ns: int = 0
-        self._measure_t0: float = 0.0
-
-        self._launch_counter: int = 0
-        self._clients: dict[int, _ClientState] = {}
-        self._client_tasks: dict[int, asyncio.Task[None]] = {}
+        self.connected_workers = 0
+        self.window_t0_ns = 0
+        self._window = _Window()
+        self._measure: _Window | None = None
+        self._measure_t0 = 0.0
+        self._launch_counter = 0
+        self._launches: dict[int, _Launch] = {}
         self._stop = asyncio.Event()
-        self._sampler_task: asyncio.Task[None] | None = None
+        self._tasks: list[asyncio.Task[None]] = []
+        self._gate = asyncio.Lock()
+        self._gate_ok_at = float("-inf")
+        self._setpriv = shutil.which("setpriv")
+        self.records = ShellRecordService(
+            self.pgbench_dir, journals, self.shape, workload.rate_tps, workload.concurrency,
+            marker_uuid=adapter.pgbench_marker_uuid, count=self._count,
+            on_connected=self._on_connected, on_fatal=self._fail, history=history,
+            churn_keys=adapter.churn_key_space if self.shape == "churn" else 0,
+        )
 
-        # Sample and window tracking
-        self._sample_acc = _WindowAccumulator()
-        self._measure_acc: _WindowAccumulator | None = None
-        self._pending_pres: dict[str, float] = {}
+    # --- the interface the orchestrator uses (same as WorkloadDriver) -------------------
 
-        # Scheduling lag & overhead tracking
-        self.scheduling_lags_us: list[float] = []
-        self.recorded_summaries: list[PgbenchSummary] = []
-
-    def _next_launch(self) -> int:
-        n = self._launch_counter
-        self._launch_counter += 1
-        return n
-
-    async def wait_until_ready(self, poll_s: float = 0.05) -> None:
+    async def wait_until_ready(self, poll_s: float = 0.1) -> None:
         while self.connected_workers < self.workload.concurrency and self.failure is None:
             await asyncio.sleep(poll_s)
 
     def begin_window(self) -> None:
-        self._measure_acc = _WindowAccumulator()
+        self._measure = _Window()
         self._measure_t0 = time.monotonic()
         self.window_t0_ns = time.monotonic_ns()
 
     def end_window(self) -> MeasuredWindow:
-        if self._measure_acc is None:
-            raise RuntimeError("end_window() called without begin_window()")
-        duration = max(0.001, time.monotonic() - self._measure_t0)
-        acc = self._measure_acc
-        self._measure_acc = None
-
-        lats = acc.latencies_ms
+        if self._measure is None:
+            raise RuntimeError("end_window() without begin_window()")
+        w, self._measure = self._measure, None
+        duration = time.monotonic() - self._measure_t0
         return MeasuredWindow(
-            duration_s=duration,
-            commits=acc.commits,
-            tps=acc.commits / duration if duration > 0 else 0.0,
-            p99_ms=p99(lats) if lats else None,
-            journal_p99_ms=p99(lats) if lats else None,
-            errors=acc.errors,
-            indeterminate=acc.indeterminate,
-            drops=acc.drops,
-            reconnects=acc.reconnects,
-            connect_failures=acc.connect_failures,
-            p50_ms=percentile(lats, 0.50) if lats else None,
-            p95_ms=percentile(lats, 0.95) if lats else None,
+            duration_s=duration, commits=w.commits, tps=w.commits / duration if duration > 0 else 0.0,
+            p99_ms=p99(w.latencies_ms or []), journal_p99_ms=p99(w.journal_ms or []),
+            errors=w.errors, indeterminate=w.indeterminate, drops=w.drops,
+            reconnects=w.reconnects, connect_failures=w.connect_failures,
+            p50_ms=percentile(w.latencies_ms or [], 0.50), p95_ms=percentile(w.latencies_ms or [], 0.95),
         )
-
-    def _derive_shape(self) -> str:
-        if self.workload.profile not in ("oltp_write_heavy", "mixed") or not self.workload.transaction_markers:
-            raise UnsupportedWorkload(
-                f"workload profile {self.workload.profile!r} is not built yet"
-            )
-        churn = self.workload.profile == "mixed"
-        list_append = self.workload.history == "list_append"
-        if churn and list_append:
-            raise UnsupportedWorkload("list-append history and the churn workload are not combined")
-        if list_append:
-            return "list_append"
-        if churn:
-            return "churn"
-        return "marker"
 
     async def start(self) -> None:
         self.pgbench_dir.mkdir(parents=True, exist_ok=True)
-        shape = self._derive_shape()
-
-        self.stream.emit(
-            "workload",
-            "start",
-            generator=self.generator,
-            profile=self.workload.profile,
-            concurrency=self.workload.concurrency,
-            rate_tps=self.workload.rate_tps,
-        )
-
-        if self.channel is not None:
-            await self.channel.open()
-
-        # Launch one process per client
-        concurrency = self.workload.concurrency
-        rate_tps = self.workload.rate_tps
-        # interval_us = 1e6 * concurrency / rate
-        interval_us = (1e6 * concurrency) / rate_tps if rate_tps > 0 else 1000000.0
-
-        for client_id in range(concurrency):
-            task = asyncio.create_task(
-                self._run_client_lifecycle(client_id, shape, interval_us),
-                name=f"pgbench-client-{client_id}",
-            )
-            self._client_tasks[client_id] = task
-
-        self._sampler_task = asyncio.create_task(self._sampler_loop(), name="pgbench-sampler")
-
-    async def _run_client_lifecycle(self, client_id: int, shape: str, interval_us: float) -> None:
-        """Manage process execution and automatic relaunch for a single client."""
-        while not self._stop.is_set():
-            launch_id = self._next_launch()
-            spec = self.adapter.pgbench_launch(shape, launch=launch_id, client=client_id)
-
-            script_file = self.pgbench_dir / f"script-c{client_id}-l{launch_id}.sql"
-            script_file.write_text(spec.script)
-
-            state = _ClientState(
-                client_id=client_id,
-                current_launch=launch_id,
-                started_mono_ns=time.monotonic_ns(),
-            )
-            self._clients[client_id] = state
-
-            # Assemble argv
-            resolved_bin = (
-                shutil.which(self.pgbench_bin)
-                if not os.path.isabs(self.pgbench_bin) and not self.pgbench_bin.startswith(".")
-                else self.pgbench_bin
-            )
-            argv = [
-                resolved_bin,
-                "-c", "1",
-                "-j", "1",
-                "-T", "86400",
-                "-P", "1",
-                "--report-per-command",
-                "--failures-detailed",
-                "--max-tries", "1",
-                "-f", str(script_file),
-                "-D", f"interval_us={int(interval_us)}",
-            ]
-            for k, v in spec.variables.items():
-                argv.extend(["-D", f"{k}={v}"])
-
-            # Connection parameters
-            conn = spec.connection
-            argv.extend(["-h", conn.host, "-p", str(conn.port), "-U", conn.user, "-d", conn.dbname])
-
-            state.argv = argv
-
-            self.stream.emit("workload", "launch", launch=launch_id, client=client_id, command=argv)
-
-            env = os.environ.copy()
-            env["PGAPPNAME"] = self.app_name
-
-            # Spawn process in its own process group
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                start_new_session=True,
-            )
-            state.process = proc
-
-            if self.connected_workers < self.workload.concurrency:
-                self.connected_workers += 1
-
-            # Monitor process stdout and stderr concurrently
-            stdout_task = asyncio.create_task(self._read_stdout(proc, state))
-            stderr_task = asyncio.create_task(self._read_stderr(proc, state))
-
-            await proc.wait()
-            state.ended_mono_ns = time.monotonic_ns()
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-
-            # Classify exit
-            aborted = False
-            abort_msg = None
-            for line in state.stderr_lines:
-                if is_abort_line(line):
-                    aborted = True
-                    try:
-                        abort_info = parse_abort_line(line)
-                        abort_msg = abort_info.message
-                    except PgbenchParseError:
-                        abort_msg = line
-                    break
-
-            if self._stop.is_set():
-                state.ended_as = "stopped"
-            elif aborted:
-                state.ended_as = "client_aborted"
-                state.abort_message = abort_msg
-                self._record_drop()
-            elif proc.returncode == 0:
-                state.ended_as = "stopped"
-            else:
-                # Unexpected failure (FR-014)
-                state.ended_as = "failed"
-                err_text = "".join(state.stderr_lines).strip()
-                self.failure = f"client {client_id} exited unexpectedly with code {proc.returncode}: {err_text}"
-                self.stream.emit("workload", "fatal", error=self.failure)
-                self._write_launch_evidence(state)
-                self.stream.emit(
-                    "workload",
-                    "launch_end",
-                    launch=launch_id,
-                    client=client_id,
-                    ended_as=state.ended_as,
-                    abort_message=state.abort_message,
-                )
-                break
-
-            # Parse final summary if present
-            full_stdout = "".join(state.stdout_lines)
-            try:
-                state.summary = parse_summary(full_stdout)
-                self.recorded_summaries.append(state.summary)
-            except PgbenchParseError:
-                if not self._stop.is_set() and not aborted:
-                    self.failure = f"client {client_id} produced unparseable summary"
-                    self.stream.emit("workload", "fatal", error=self.failure)
-
-            self._write_launch_evidence(state)
-            self.stream.emit(
-                "workload",
-                "launch_end",
-                launch=launch_id,
-                client=client_id,
-                ended_as=state.ended_as,
-                abort_message=state.abort_message,
-            )
-
-            if state.ended_as == "client_aborted" and not self._stop.is_set():
-                # Await target recovery before relaunching
-                reconnected = await self._wait_for_database_recovery()
-                if not reconnected or self._stop.is_set():
-                    break
-                self._record_reconnect()
-            else:
-                break
-
-    async def _read_stdout(self, proc: asyncio.subprocess.Process, state: _ClientState) -> None:
-        assert proc.stdout is not None
-        while True:
-            line_bytes = await proc.stdout.readline()
-            if not line_bytes:
-                break
-            line = line_bytes.decode("utf-8", errors="replace")
-            state.stdout_lines.append(line)
-            if line.startswith("progress:"):
-                try:
-                    prog = parse_progress_line(line)
-                    self._record_progress(prog)
-                except PgbenchParseError:
-                    pass
-
-    async def _read_stderr(self, proc: asyncio.subprocess.Process, state: _ClientState) -> None:
-        assert proc.stderr is not None
-        while True:
-            line_bytes = await proc.stderr.readline()
-            if not line_bytes:
-                break
-            line = line_bytes.decode("utf-8", errors="replace")
-            state.stderr_lines.append(line)
-
-    def _record_drop(self) -> None:
-        self._sample_acc.drops += 1
-        self._sample_acc.indeterminate += 1
-        if self._measure_acc is not None:
-            self._measure_acc.drops += 1
-            self._measure_acc.indeterminate += 1
-
-    def _record_reconnect(self) -> None:
-        self._sample_acc.reconnects += 1
-        if self._measure_acc is not None:
-            self._measure_acc.reconnects += 1
-
-    def _record_connect_failure(self) -> None:
-        self._sample_acc.connect_failures += 1
-        if self._measure_acc is not None:
-            self._measure_acc.connect_failures += 1
-
-    def _record_progress(self, prog: Any) -> None:
-        # Fallback when RecordChannel is not processing individual records
-        if self.channel is None:
-            commits = int(round(prog.tps * prog.interval_s))
-            self._sample_acc.commits += commits
-            self._sample_acc.latencies_ms.append(prog.lat_ms)
-            if self._measure_acc is not None:
-                self._measure_acc.commits += commits
-                self._measure_acc.latencies_ms.append(prog.lat_ms)
-
-    def _process_channel_records(self) -> None:
-        if self.channel is None:
-            return
-        records = self.channel.drain()
-        for rec in records:
-            if rec.kind == "pre":
-                self._pending_pres[rec.identity] = rec.t_wall
-                if self.history is not None and isinstance(rec.value, dict):
-                    proc = rec.value.get("process", 0)
-                    invoked = rec.value.get("invoked")
-                    if invoked:
-                        self.history.record("invoke", proc, invoked)
-            elif rec.kind == "ack":
-                t_pre = self._pending_pres.pop(rec.identity, None)
-                lat_ms = (rec.t_wall - t_pre) * 1000.0 if t_pre is not None else 0.0
-                self._sample_acc.commits += 1
-                self._sample_acc.latencies_ms.append(lat_ms)
-                if self._measure_acc is not None:
-                    self._measure_acc.commits += 1
-                    self._measure_acc.latencies_ms.append(lat_ms)
-                if self.history is not None and isinstance(rec.value, dict):
-                    proc = rec.value.get("process", 0)
-                    status = rec.value.get("status", "ok")
-                    if status == "ok":
-                        self.history.record("ok", proc, rec.value.get("executed", []))
-                    elif status == "info":
-                        self.history.record("info", proc, rec.value.get("invoked", []), rec.value.get("error", "indeterminate"))
-                    elif status == "fail":
-                        self.history.record("fail", proc, rec.value.get("invoked", []), rec.value.get("error", "aborted"))
-
-
-    async def _wait_for_database_recovery(self, timeout_s: float = 60.0, retry_interval_s: float = 0.2) -> bool:
-        t0 = time.monotonic()
-        while not self._stop.is_set() and time.monotonic() - t0 < timeout_s:
-            try:
-                # Probe connection through adapter
-                session = await self.adapter.session(timeout_s=1.0)
-                try:
-                    await session.ping()
-                    return True
-                finally:
-                    await session.close()
-            except Exception:
-                self._record_connect_failure()
-                await asyncio.sleep(retry_interval_s)
-        return False
-
-    def _write_launch_evidence(self, state: _ClientState) -> None:
-        launch_file = self.pgbench_dir / f"launch-{state.current_launch}.txt"
-        content = [
-            f"client: {state.client_id}",
-            f"launch: {state.current_launch}",
-            f"ended_as: {state.ended_as}",
-            f"command: {' '.join(state.argv)}",
-            "",
-            "--- stderr ---",
-            "".join(state.stderr_lines),
-            "--- stdout ---",
-            "".join(state.stdout_lines),
-        ]
-        launch_file.write_text("\n".join(content))
-
-    async def _sampler_loop(self) -> None:
-        last = time.monotonic()
-        while not self._stop.is_set():
-            await asyncio.sleep(1.0)
-            now = time.monotonic()
-            elapsed, last = now - last, now
-
-            self._process_channel_records()
-
-            acc = self._sample_acc
-            self._sample_acc = _WindowAccumulator()
-
-            lats = acc.latencies_ms
-            p50 = percentile(lats, 0.50) if lats else None
-            p95 = percentile(lats, 0.95) if lats else None
-            p99_val = p99(lats) if lats else None
-
-            self.stream.emit(
-                "workload",
-                "sample",
-                interval_s=elapsed,
-                commits=acc.commits,
-                tps=acc.commits / elapsed if elapsed > 0 else 0.0,
-                p99_ms=p99_val,
-                journal_p99_ms=p99_val,
-                p50_ms=p50,
-                p95_ms=p95,
-                errors=acc.errors,
-                indeterminate=acc.indeterminate,
-                drops=acc.drops,
-                reconnects=acc.reconnects,
-                connect_failures=acc.connect_failures,
-            )
+        if re.search(r"\s", str(self.pgbench_dir)):
+            raise UnsupportedWorkload(f"the run directory {self.pgbench_dir} contains whitespace, which "
+                                      "pgbench's shell commands cannot carry")
+        spec = self.adapter.pgbench_launch(self.shape, read_chunks=READ_CHUNKS, chunk_chars=READ_CHUNK_CHARS)
+        self.app_name = f"{spec.application_name}-{self.run_id}"
+        self._spec = spec
+        script = pre_steps(self.shape, self.records.token_base) + spec.script + ack_steps(self.shape)
+        (self.pgbench_dir / SCRIPT_FILE).write_text(script)
+        await self.records.open()
+        self.stream.emit("workload", "start", generator=self.generator, profile=self.workload.profile,
+                         concurrency=self.workload.concurrency, rate_tps=self.workload.rate_tps,
+                         pgbench_version=self.pgbench_version, shape=self.shape)
+        self._tasks = [asyncio.create_task(self._client(i), name=f"pgbench-client-{i}")
+                       for i in range(self.workload.concurrency)]
+        self._tasks.append(asyncio.create_task(self._sampler(), name="pgbench-sampler"))
+        self._tasks.append(asyncio.create_task(self._watchdog(), name="pgbench-watchdog"))
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._sampler_task and not self._sampler_task.done():
-            self._sampler_task.cancel()
+        for st in list(self._launches.values()):
+            self._signal(st, signal.SIGTERM)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + STOP_GRACE_S
+        while any(st.process is not None and st.process.returncode is None for st in self._launches.values()):
+            if loop.time() >= deadline:
+                for st in self._launches.values():
+                    self._signal(st, signal.SIGKILL)
+                break
+            await asyncio.sleep(0.05)
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self.records.close()
+        # No pgbench may outlive the run (FR-017), here or on the target (Arch §15).
+        alive = [st.process.pid for st in self._launches.values()
+                 if st.process is not None and st.process.returncode is None]
+        if alive:
+            raise RuntimeError(f"cleanup check failed: pgbench process(es) {alive} still running")
+        if self.app_name:
+            remaining = await self.adapter.sessions_with_application_name(self.app_name)
+            if remaining:
+                raise RuntimeError(f"cleanup check failed: {remaining} pgbench session(s) "
+                                   f"({self.app_name}) still open on the target")
+        self.stream.emit("workload", "stop", launches=self._launch_counter)
 
-        # Terminate all active pgbench process groups
-        for client_id, state in self._clients.items():
-            if state.process and state.process.returncode is None:
+    def report_facts(self) -> dict[str, Any]:
+        """What the report states about this generator (FR-011, FR-018, SC-006)."""
+        jm = self.records.journal_ms
+        return {
+            "pgbench_launches": self._launch_counter,
+            "pgbench_exit_with_harness": self._setpriv is not None,
+            "pgbench_record_journal_p50_ms": percentile(jm, 0.50),
+            "pgbench_record_journal_p99_ms": p99(jm),
+            "pgbench_record_mechanism": (
+                "pgbench shell record steps to the harness journal service (research R1, option B): "
+                "marker flushed before COMMIT, acknowledgement after; each step is one /bin/sh on the "
+                "driver host, and the acknowledgement step's run time is inside the measured latency"),
+        }
+
+    # --- clients -----------------------------------------------------------------------
+
+    def _next_launch(self) -> int:
+        self._launch_counter += 1
+        return self._launch_counter
+
+    async def _client(self, client: int) -> None:
+        try:
+            while not self._stop.is_set() and self.failure is None:
+                relaunch = await self._run_launch(client)
+                if not relaunch or self._stop.is_set() or self.failure is not None:
+                    return
+                await self._database_accepting()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- recorded as fatal; the orchestrator aborts
+            self._fail(f"client {client}: {type(exc).__name__}: {exc}")
+
+    async def _run_launch(self, client: int) -> bool:
+        """One pgbench process. Returns True if the client must be relaunched."""
+        launch = self._next_launch()
+        reply = self.records.new_launch(launch, client)
+        conn = self._spec.connection
+        argv = [_resolve(self.pgbench_bin) or self.pgbench_bin, "-n", "-c", "1", "-j", "1",
+                "-T", str(PGBENCH_DURATION_S), "--max-tries=1", "-f", SCRIPT_FILE,
+                "-D", f"launch={launch}", "-D", f"client={client}", "-D", f"reply={reply}",
+                "-h", conn.host, "-p", str(conn.port), "-U", conn.user, conn.dbname]
+        if self._setpriv:
+            # a harness that dies takes its pgbench processes with it (FR-017)
+            argv = [self._setpriv, "--pdeathsig", "KILL", "--"] + argv
+        st = _Launch(launch, client, argv)
+        self._launches[launch] = st
+        env = dict(os.environ, PGAPPNAME=self.app_name, PGCONNECT_TIMEOUT=str(int(CONNECT_TIMEOUT_S)))
+        self.stream.emit("workload", "launch", launch=launch, client=client)
+        st.process = await asyncio.create_subprocess_exec(
+            *argv, cwd=self.pgbench_dir, env=env, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, start_new_session=True)
+        assert st.process.stderr is not None
+        async for raw in st.process.stderr:
+            st.stderr.append(raw.decode("utf-8", errors="replace"))
+        await st.process.wait()
+        relaunch = self._classify_exit(st)
+        self._write_evidence(st)
+        self.stream.emit("workload", "launch_end", launch=launch, client=client, ended_as=st.ended_as,
+                         returncode=st.process.returncode)
+        return relaunch
+
+    def _classify_exit(self, st: _Launch) -> bool:
+        if self._stop.is_set() or self.failure is not None:
+            st.ended_as = "stopped"
+            self.records.launch_ended(st.launch, "stopped")
+            return False
+        if st.timed_out:
+            st.ended_as = "transaction_timeout"
+            self.records.launch_ended(st.launch, "aborted")
+            return True
+        text = "".join(st.stderr)
+        aborts = []
+        for line in st.stderr:
+            if is_abort_line(line):
                 try:
-                    pgid = os.getpgid(state.process.pid)
-                    os.killpg(pgid, signal.SIGTERM)
-                except ProcessLookupError:
+                    aborts.append(parse_abort_line(line))
+                except PgbenchParseError:
                     pass
+        if aborts and all(a.kind == "sql" for a in aborts):
+            # the database, or the way to it, ended the client: unknown outcome, dropped
+            st.ended_as = "client_aborted"
+            self.records.launch_ended(st.launch, "aborted")
+            return True
+        if not aborts and st.process is not None and st.process.returncode == 1 and is_connect_failure(text):
+            st.ended_as = "not_connected"
+            self.records.launch_ended(st.launch, "not_connected")
+            self._count(connect_failures=1)
+            return True
+        # a record step failed, or pgbench ended on its own: the instrument is broken
+        st.ended_as = "failed"
+        self.records.launch_ended(st.launch, "aborted")
+        rc = st.process.returncode if st.process is not None else None
+        self._fail(f"pgbench client {st.client} (launch {st.launch}) ended unexpectedly "
+                   f"(exit {rc}): {text.strip()[-500:] or 'no output'}")
+        return False
 
-        # Await task completions
-        if self._client_tasks:
-            await asyncio.gather(*self._client_tasks.values(), return_exceptions=True)
-
-        # Force kill any lingering processes
-        for client_id, state in self._clients.items():
-            if state.process and state.process.returncode is None:
+    async def _database_accepting(self) -> None:
+        """Wait until the database accepts a connection. One probe serves every waiting client;
+        a failed attempt counts as one connection failure, as a worker's attempt does."""
+        async with self._gate:
+            if time.monotonic() - self._gate_ok_at < 2 * RECONNECT_PAUSE_S:
+                return
+            while not self._stop.is_set() and self.failure is None:
                 try:
-                    pgid = os.getpgid(state.process.pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                    session = await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S)
+                except Exception:  # noqa: BLE001 -- engine-specific; the adapter owns the taxonomy
+                    self._count(connect_failures=1)
+                    await asyncio.sleep(RECONNECT_PAUSE_S)
+                    continue
+                try:
+                    if await session.ping():
+                        self._gate_ok_at = time.monotonic()
+                        return
+                finally:
+                    try:
+                        await session.close()
+                    except Exception:  # noqa: BLE001 -- best effort on a probe session
+                        pass
+                await asyncio.sleep(RECONNECT_PAUSE_S)
 
-        if self.channel is not None:
-            await self.channel.close()
+    async def _watchdog(self) -> None:
+        """Abandon a transaction in flight longer than TXN_TIMEOUT_S, as the built-in driver
+        does: its outcome is unknown, and the client starts over on a new connection."""
+        while not self._stop.is_set():
+            await asyncio.sleep(0.5)
+            now = time.monotonic()
+            for st in list(self._launches.values()):
+                if st.process is None or st.process.returncode is not None or st.timed_out:
+                    continue
+                since = self.records.in_flight_since(st.launch)
+                if since is not None and now - since > TXN_TIMEOUT_S:
+                    st.timed_out = True
+                    self._signal(st, signal.SIGKILL)
 
-        # Confirm no target sessions remain (Arch §15, Constitution VI)
-        active_sessions = await self.adapter.sessions_with_application_name(self.app_name)
-        if active_sessions is not None and active_sessions > 0:
-            raise RuntimeError(
-                f"cleanup check failed: {active_sessions} active pgbench session(s) matching {self.app_name} remain"
+    def _signal(self, st: _Launch, sig: int) -> None:
+        if st.process is None or st.process.returncode is not None:
+            return
+        try:
+            os.killpg(st.process.pid, sig)   # its own session: pgbench and its shell steps
+        except ProcessLookupError:
+            pass
+
+    def _write_evidence(self, st: _Launch) -> None:
+        (self.pgbench_dir / f"launch-{st.launch}.txt").write_text(
+            f"client: {st.client}\nlaunch: {st.launch}\nended_as: {st.ended_as}\n"
+            f"returncode: {st.process.returncode if st.process else None}\n"
+            f"command: {' '.join(st.argv)}\n\n--- stderr ---\n{''.join(st.stderr)}")
+
+    # --- accounting (identical to WorkloadDriver) --------------------------------------
+
+    def _on_connected(self, client: int, reconnect: bool) -> None:
+        if reconnect:
+            self._count(reconnects=1)
+        else:
+            self.connected_workers += 1
+
+    def _fail(self, message: str) -> None:
+        if self.failure is None:
+            self.failure = message
+            self.stream.emit("workload", "fatal", error=message)
+        self._stop.set()
+        for st in list(self._launches.values()):
+            self._signal(st, signal.SIGTERM)
+
+    def _count(self, *, commits: int = 0, errors: int = 0, indeterminate: int = 0, drops: int = 0,
+               reconnects: int = 0, connect_failures: int = 0,
+               latency_ms: float | None = None, journal_ms: float | None = None) -> None:
+        for w in (self._window, self._measure):
+            if w is None:
+                continue
+            w.commits += commits
+            w.errors += errors
+            w.indeterminate += indeterminate
+            w.drops += drops
+            w.reconnects += reconnects
+            w.connect_failures += connect_failures
+            assert w.latencies_ms is not None and w.journal_ms is not None
+            if latency_ms is not None:
+                w.latencies_ms.append(latency_ms)
+            if journal_ms is not None:
+                w.journal_ms.append(journal_ms)
+
+    async def _sampler(self) -> None:
+        last = time.monotonic()
+        while not self._stop.is_set():
+            await asyncio.sleep(SAMPLE_INTERVAL_S)
+            now = time.monotonic()
+            elapsed, last = now - last, now
+            w, self._window = self._window, _Window()
+            self.stream.emit(
+                "workload", "sample", interval_s=elapsed, commits=w.commits,
+                tps=w.commits / elapsed if elapsed > 0 else 0.0,
+                p99_ms=p99(w.latencies_ms or []), journal_p99_ms=p99(w.journal_ms or []),
+                p50_ms=percentile(w.latencies_ms or [], 0.50), p95_ms=percentile(w.latencies_ms or [], 0.95),
+                errors=w.errors, indeterminate=w.indeterminate, drops=w.drops,
+                reconnects=w.reconnects, connect_failures=w.connect_failures,
             )
-
-        self.stream.emit("workload", "stop")
-
-    def recording_overhead_pct(self) -> float | None:
-        """Calculate percentage of transaction latency contributed by record steps (R8, FR-011)."""
-        if not self.recorded_summaries:
-            return None
-        total_cmd_lat = 0.0
-        record_cmd_lat = 0.0
-        for s in self.recorded_summaries:
-            for cmd in s.command_latencies:
-                total_cmd_lat += cmd.latency_ms
-                if "seq" in cmd.command or "record" in cmd.command:
-                    record_cmd_lat += cmd.latency_ms
-        if total_cmd_lat <= 0:
-            return None
-        return (record_cmd_lat / total_cmd_lat) * 100.0

@@ -50,11 +50,13 @@ Approach:
 | IV. Framework Is the Source of Truth | No acceptance criterion changes. Architecture §6.1's assignment of RPO scenarios to a custom driver is departed from, and recorded in research R0 with the reason. | PASS (deviation recorded) |
 | V. The Adapter Seam | The supervisor never sees SQL. The adapter supplies scripts and connection settings, behind a new capability. No scenario-ID branch. | PASS |
 | VI. Leave the Target as Found | No new objects on the target beyond today's harness tables. Every pgbench process is tracked and confirmed gone at cleanup and by the kill switch's process check. | PASS |
-| VII. Evidence Integrity | Depends on R1 meeting [contracts/transaction-record.md](contracts/transaction-record.md). Until R1 is decided and its contract tests pass, the pgbench driver must refuse to measure RPO. | **GATED on R1** |
+| VII. Evidence Integrity | R1 decided (option B, 2026-10-08): the record steps write the built-in driver's journals with its `DurableJournal`, before COMMIT and after the acknowledgement; CT-1 to CT-6 drive them through pgbench transactions. Lab confirmation (T049, T051) still open. | PASS (lab runs pending) |
 
 **Gate result**: proceed with design. Tasks touching RPO evidence are blocked until R1 is decided and recorded. Everything else (selection, supervisor, samples from timing evidence, relaunch, shapes, cleanup, reporting) can be built and tested first.
 
 **Build-out rule**: every current scenario measures RPO, so until R1 is implemented the pgbench driver refuses all of them. To keep the branch usable meanwhile, the repository's environment profiles set `workload.generator: builtin` **explicitly**. The schema default stays `pgbench` (FR-020), and the profiles switch to it in the final task, once R1's contract tests pass.
+
+**Re-check after R1 (2026-10-08)**: VII passes on the unit and contract tests; the profiles now select pgbench. The lab runs (T049, T051) remain the merge gate.
 
 **Post-design re-check (Phase 1)**: unchanged. I–VI pass on the design artifacts; VII remains gated on R1. The contracts make the gate mechanical: the factory refuses pgbench for `transaction_markers: true` until the transaction-record contract tests (CT-1 to CT-6) pass.
 
