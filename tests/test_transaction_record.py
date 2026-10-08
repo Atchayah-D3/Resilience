@@ -127,11 +127,18 @@ def test_ct6_relaunches_never_reuse_an_identity(tmp_path, monkeypatch):
     async def go():
         driver, adapter, db = make_driver(tmp_path, monkeypatch, concurrency=3, rate_tps=60)
         await driver.start()
-        for _ in range(2):
-            await until(lambda: len(db.committed()) >= 10, what="load")
+        for cycle in range(1, 3):
+            n = len(db.committed())
+            await until(lambda: len(db.committed()) >= n + 10, what="load from every relaunched client")
+            # every live client connected: it has sent its first record request
+            await until(lambda: all(driver.records._launches[n].connected
+                                    for n in range(driver._launch_counter - 2, driver._launch_counter + 1)),
+                        what="every client connected")
             launches = driver._launch_counter
             db.flag("down")
-            await asyncio.sleep(0.4)
+            # down until every client has met the outage: a client held up in its marker flush
+            # (the lab driver host stalls for over a second) touches no database meanwhile
+            await until(lambda: _ended(driver, "client_aborted") >= 3 * cycle, what="every client dropped")
             db.flag("down", on=False)
             await until(lambda: driver._launch_counter >= launches + 3, what="relaunch")
         n = len(db.committed())
