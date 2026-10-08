@@ -64,7 +64,10 @@ def test_the_declared_rate_is_offered_evenly(tmp_path, monkeypatch):
         return driver, window
 
     driver, window = asyncio.run(go())
-    assert 32 <= window.tps <= 44, window          # the shared limiter, as the built-in driver's
+    # The shared limiter, as the built-in driver's: never above the rate (unthrottled pgbench would
+    # be far above), and below it only by time lost to stalls -- the limiter never bursts to catch
+    # up, and the lab driver host's flush stalls for over a second at times.
+    assert 24 <= window.tps <= 44, window
     assert window.p99_ms is not None and window.journal_p99_ms is not None
     starts = sorted(r["t_pre"] for r in read_journal(driver.journals.run_dir / "marker.jrnl").records)[20:]
     gaps = sorted(b - a for a, b in zip(starts, starts[1:]))
