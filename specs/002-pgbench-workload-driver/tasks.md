@@ -187,8 +187,8 @@ description: "Task list for pgbench as the Harness Workload"
 - [x] T046 [US5] Compute and record `facts["pgbench_recording_overhead"]` in resilience_tests/execution/workload/pgbench_driver.py, and render it, together with the scheduling lag p50/p99 (FR-021), in resilience_tests/analysis/report.py (FR-011, SC-006)
 - [x] T047 [US5] In resilience_tests/control/orchestrator.py `_p_pre_fault`: for pgbench, name the limiting side (the limits themselves stay the scenario's own: no allowance, no subtraction of overhead, spec FR-010) using the record steps' latency vs the database statement latency, as `journal_p99_ms` vs `p99_ms` does today
 - [x] T048 [US5] [GATED-R1] Extend T012's parametrisation to `pgbench` in tests/test_orchestrator.py, using the fake pgbench and the R1 channel's test double. All existing scenario tests must pass on both generators (SC-001).
-- [ ] T049 [US5] [GATED-R1] Lab: run quickstart V4 for NL-C-01 (200 TPS) and NL-M-07 (1000 TPS). Record the achieved rates, the recording overhead and any limiting side in research.md R1 ("measured cost"). If NL-M-07 < 750 TPS, note that NL-M-07 uses `generator: builtin` (FR-020).
-  - **Open:** needs the lab (no lab access from the workstation where option B was built). Local figures are in research.md R1.
+- [x] T049 [US5] [GATED-R1] Lab: run quickstart V4 for NL-C-01 (200 TPS) and NL-M-07 (1000 TPS). Record the achieved rates, the recording overhead and any limiting side in research.md R1 ("measured cost"). If NL-M-07 < 750 TPS, note that NL-M-07 uses `generator: builtin` (FR-020).
+  - **Done 2026-10-08:** NL-C-01 passed at 199.99 TPS; NL-M-07 passed at 1000 TPS (research.md R1, lab).
 
 ---
 
@@ -196,7 +196,7 @@ description: "Task list for pgbench as the Harness Workload"
 
 - [x] T050 [P] Document the `workload` profile section and the two generators in README.md (usage, selection, refusals, evidence files)
 - [ ] T051 [GATED-R1] Lab: quickstart V5. Every scenario once per generator; compare verdicts and key measurements in a short table in research.md (SC-001, SC-008).
-  - **Open:** needs the lab. Every scenario's orchestrator test already runs on both generators against the fakes.
+  - **Partly done 2026-10-08:** every runnable scenario run on pgbench (research.md R1, lab); NL-M-05 also on builtin (same verdict). The other scenarios' builtin runs for the side-by-side table remain.
 - [x] T052 [GATED-R1] After T049/T051 pass, remove the explicit `generator: builtin` from envs/e2-dedicated-vm.yaml and envs/local-lab.yaml so the default (`pgbench`) applies. Keep `builtin` where a scenario's rate needs it (FR-020).
   - **Done on the branch 2026-10-08, ahead of T049/T051:** both profiles set `generator: pgbench` with a full `pgbench_bin` path. Before merge, T049/T051 must pass on the lab; `--workload builtin` is the fallback.
 - [x] T053 Final check, recorded in specs/002-pgbench-workload-driver/research.md: `.venv/bin/pytest -q -n 4`, `python -m catalog.schema --partial`, and quickstart V3. No pgbench process left on the driver host after the suite (SC-007).

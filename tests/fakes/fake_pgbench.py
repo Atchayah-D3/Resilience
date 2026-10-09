@@ -17,6 +17,8 @@ The fake database, in the directory $FAKE_PGBENCH_DB:
   down             present: the server is down (abort on the next statement; refuse new clients)
   lose             present: COMMIT is acknowledged but nothing persists (a lying database)
   hang             present: COMMIT never returns
+  auth-fail        present: new clients are refused for their password
+  stmt-error       present: the next statement fails with ERROR (the connection stays up)
   commit-delay     contains S: every COMMIT takes S seconds
   drop-<launch>    present: that launch's connection is terminated at its next statement
   serialize-every  contains N: every Nth COMMIT of each client fails with a serialization error
@@ -71,6 +73,10 @@ def main():
         die("pgbench: error: fake pgbench needs FAKE_PGBENCH_DB and -f", 1)
     if os.path.exists(os.path.join(db, "down")):
         die('pgbench: error: connection to server at "127.0.0.1", port 5433 failed: Connection refused\n'
+            "pgbench: error: could not create connection for setup", 1)
+    if os.path.exists(os.path.join(db, "auth-fail")):
+        die('pgbench: error: connection to server at "127.0.0.1", port 5433 failed: FATAL:  '
+            'password authentication failed for user "harness"\n'
             "pgbench: error: could not create connection for setup", 1)
     commands = parse(open(script).read())
     exit_after = read_int(db, "exit-after")
@@ -171,6 +177,9 @@ def connection_check(db, variables, idx):
     if os.path.exists(os.path.join(db, "down")):
         die(f"pgbench: error: client 0 aborted in command {idx} (SQL) of script 0; "
             "perhaps the backend died while processing", 2)
+    if os.path.exists(os.path.join(db, "stmt-error")):
+        die(f"pgbench: error: client 0 script 0 aborted in command {idx} query 0: ERROR:  "
+            'column "ts" of relation "markers" does not exist', 2)
     drop = os.path.join(db, f"drop-{variables.get('launch')}")
     if os.path.exists(drop):
         os.unlink(drop)

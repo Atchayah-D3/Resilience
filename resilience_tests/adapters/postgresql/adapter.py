@@ -102,6 +102,15 @@ CHURN_REINSERT = "INSERT INTO resilience.churn (id, payload) VALUES ($1, $2) ON 
 CHURN_PAYLOAD = "y" * 180
 # pgbench workload: marker uuids are md5(<prefix><seq>), so the harness derives the same uuid
 PGBENCH_MARKER_PREFIX = "resilience-pgbench-"
+
+
+def _pgbench_marker_prefix(run_id: str) -> str:
+    """`resilience-pgbench-<run_id>-`: the run id goes into the script as a SQL literal, so only
+    the characters run ids are made of are accepted."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
+        raise ValueError(f"run id {run_id!r} cannot be placed in a pgbench marker id")
+    return f"{PGBENCH_MARKER_PREFIX}{run_id}-"
+
 PGBENCH_APPLICATION_NAME = "resilience-pgbench"
 INSERT_MARKER = "INSERT INTO resilience.markers(uuid, seq, ts) VALUES ($1, $2, clock_timestamp())"
 SELECT_MARKERS = "SELECT uuid::text FROM resilience.markers"
@@ -1838,14 +1847,14 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         finally:
             await conn.close()
 
-    def pgbench_marker_uuid(self, seq: int) -> str:
-        return identity_uuid(f"{PGBENCH_MARKER_PREFIX}{seq}")
+    def pgbench_marker_uuid(self, seq: int, run_id: str) -> str:
+        return identity_uuid(f"{_pgbench_marker_prefix(run_id)}{seq}")
 
-    def pgbench_launch(self, shape: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec:
+    def pgbench_launch(self, shape: str, run_id: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec:
         """The built-in driver's transactions (`commit_marker`, `commit_marker_with_churn`,
         `commit_marker_list_append`), statement for statement, as one pgbench transaction."""
         marker = (f"INSERT INTO resilience.markers(uuid, seq, ts) "
-                  f"VALUES (md5('{PGBENCH_MARKER_PREFIX}' || :seq)::uuid, :seq, clock_timestamp());\n")
+                  f"VALUES (md5('{_pgbench_marker_prefix(run_id)}' || :seq)::uuid, :seq, clock_timestamp());\n")
         if shape == "marker":
             script = "BEGIN;\n" + marker + "COMMIT;\n"
         elif shape == "churn":

@@ -395,17 +395,20 @@ class BaseDatabaseAdapter(ABC):
         kill switch has no other). Default: returns empty dict."""
         return {}
 
-    def pgbench_launch(self, shape: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec:
+    def pgbench_launch(self, shape: str, run_id: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec:
         """The pgbench transaction for `shape` (marker, churn, list_append) and where to connect
-        (contracts/adapter-pgbench.md). The script is the transaction only: the driver adds the
+        (contracts/adapter-pgbench.md). Its marker ids carry `run_id`, as `pgbench_marker_uuid`
+        computes them. The script is the transaction only: the driver adds the
         record steps around it and sets `seq` (all shapes), `ckey` / `creplace` (churn) and
         `rk` / `ak` / `vbase` (list_append). A list-append transaction leaves each read, as
         offsets from `vbase` joined by '.', or 'nil', in `r1len` / `r1c1..r1c<read_chunks>`
         and `r2len` / `r2c1..`, `chunk_chars` characters per chunk."""
         raise NotImplementedError(f"{type(self).__name__} does not implement pgbench_launch")
 
-    def pgbench_marker_uuid(self, seq: int) -> str:
-        """The marker uuid the pgbench transaction with `seq` inserts, computed the same way."""
+    def pgbench_marker_uuid(self, seq: int, run_id: str) -> str:
+        """The marker uuid the pgbench transaction `seq` of run `run_id` inserts, computed the same
+        way. The run id is part of it: `seq` restarts at 1 every run, and a marker left by an
+        earlier run must never stand in for one this run lost."""
         raise NotImplementedError(f"{type(self).__name__} does not implement pgbench_marker_uuid")
 
     async def sessions_with_application_name(self, name: str) -> int | None:

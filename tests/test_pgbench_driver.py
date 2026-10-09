@@ -356,3 +356,60 @@ def test_sigterm_reaches_shell_steps_too(tmp_path, monkeypatch):
     pgid = asyncio.run(go())
     with pytest.raises(ProcessLookupError):
         os.killpg(pgid, 0)
+
+
+def test_a_credentials_refusal_stops_the_run_instead_of_retrying(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=20)
+        db.flag("auth-fail")
+        await driver.start()
+        await until(lambda: driver.failure is not None, what="the failure")
+        await driver.stop()
+        close_evidence(driver)
+        return driver
+
+    driver = asyncio.run(go())
+    assert "refused by the server for its credentials" in driver.failure
+    assert "password authentication failed" in driver.failure
+    assert driver._launch_counter <= 2, "a refused client must not be relaunched"
+
+
+def test_a_statement_that_never_works_stops_the_run_naming_the_error(tmp_path, monkeypatch):
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=20)
+        db.flag("stmt-error")
+        await driver.start()
+        await until(lambda: driver.failure is not None, what="the failure")
+        await driver.stop()
+        close_evidence(driver)
+        return driver
+
+    driver = asyncio.run(go())
+    assert "statement error before any has committed" in driver.failure
+    assert 'column "ts" of relation "markers" does not exist' in driver.failure
+    assert not read_journal(driver.journals.run_dir / "acked.jrnl").records
+
+
+def test_statement_errors_after_commits_are_counted_apart_and_ridden_through(tmp_path, monkeypatch):
+    """Once commits have worked, an ERROR can be the fault's doing (a full WAL disk): the load
+    carries on, counted as the built-in driver counts it, and the report lists the message."""
+    async def go():
+        driver, _, db = make_driver(tmp_path, monkeypatch, concurrency=2, rate_tps=40)
+        await driver.start()
+        await until(lambda: len(db.committed()) >= 10, what="commits")
+        driver.begin_window()
+        db.flag("stmt-error")
+        await until(lambda: _ended(driver, "statement_error") >= 4, what="statement errors")
+        db.flag("stmt-error", on=False)
+        n = len(db.committed())
+        await until(lambda: len(db.committed()) >= n + 10, what="load after the errors")
+        window = driver.end_window()
+        await driver.stop()
+        close_evidence(driver)
+        return driver, window
+
+    driver, window = asyncio.run(go())
+    assert driver.failure is None
+    facts = driver.report_facts()["pgbench_statement_errors"]
+    assert sum(facts.values()) >= 4 and any("does not exist" in m for m in facts)
+    assert window.drops >= 4    # counted as the built-in driver counts an unclassified server error

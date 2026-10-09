@@ -57,7 +57,15 @@ BEGIN; <the adapter's transaction>; COMMIT;
 
 Faults, same setup: all 64 backends terminated (64 drops, 64 unknown, 64 relaunched, 0 lost); `pg_ctl stop -m immediate` held 3 s (load back to 197 TPS one second after restart, 0 lost); churn (2,000 live rows held, 0 lost); list-append (all 9,558 non-nil reads are prefixes of the final lists; every `:invoke` closed). A harness killed with SIGKILL leaves no pgbench and no shell step behind (`setpriv --pdeathsig`).
 
-**Lab figures (T049) remain to be measured.** The built-in driver's lab results below stay as the reference.
+**Lab, pgbench (T049, in progress)** -- `e2-dedicated-vm`, pgbench (ShaktiDB) 17.11.1.0 at `/usr/lib/postgresql/17.11.1.0/bin/pgbench` on the driver host:
+
+- **NL-C-01, 200 TPS offered, 64 clients: PASSED** (`run NL-C-01-20261008T092214Z-bbe290`, after dry run `NL-C-01-20261008T091922Z-3b42ff`): `rpo_txn = 0`, `rto_first_write_s = 0.67`, `structural_integrity_errors = 0`; 128 launches (64 + 64 relaunched after the kill), `dropped_connections = 64`, `indeterminate_txn = 70`, `failed_transactions = 0`, `connect_failures = 4`; baseline 199.99 TPS, p50 1.9 ms / p99 3.6 ms, 0 errors, 0 drops; record journal flush p50 2.6 ms / p99 10.5 ms; no pgbench left on the driver host. Baseline SLO held 114 of 119 s, so `rto_to_slo_s` is not measured (as often on this lab).
+- **2026-10-08, every runnable scenario on pgbench:** PASSED NL-C-02, NL-C-03 (Elle check on the pgbench history), NL-C-05, NL-C-06, NL-I-01, NL-M-03, NL-M-07 (**1000 TPS sustained, 0 dropped connections, 0 failed transactions**; journal flush p99 7.9 ms; the built-in driver aborted at 369 TPS on 2026-10-07), NL-M-06, NL-R-04. No pgbench left after any run.
+- NL-M-06 and NL-R-04 first aborted before the fault, `slower side: driver journal flush` (journal p99 1.5 s and 3.5 s while the database p99 was 5-9 ms; NL-M-07 two minutes later flushed at p99 7.9 ms at 5x the rate). Rerun with an fdatasync probe on the run directory every 10 s (worst p99 54 ms): both passed. The driver host's intermittent flush stall (CLAUDE.md) is the likely cause; the probe was not running during the first attempt.
+- NL-M-05 FAILED on both generators (pgbench, and `--workload builtin`): the target's `idle_in_transaction_session_timeout` is 0 (observed, not changed) and no bloat-alert source is connected, so neither acceptance path holds. The workload's part held: churn built the dead tuples (ratio 0.75), vacuum blocked, `rpo_txn = 0`.
+- NL-C-04: not runnable here (needs a dedicated `pg_wal` volume).
+
+The built-in driver's lab results below stay as the reference.
 
 > **Correction (verification 2026-10-07).** The two runs below ran on the **built-in** driver, not pgbench.
 
@@ -200,24 +208,18 @@ The factory builds the selected driver. A driver that cannot run refuses; there 
 
 ---
 
-## R11 — Even spacing of transactions (FR-021, clarification 2026-10-07)
+## R11 — Even spacing of transactions (FR-021, clarification 2026-10-07) — **revised for option B (2026-10-08)**
 
-**Revised (option B)**: pacing is done by the record service with the built-in driver's own `RateLimiter`, shared by all clients: slots are evenly spaced at 1/rate, and whichever client asks next takes the next one, with no catch-up bursts. That is the built-in driver's arrival pattern exactly; no in-script `\sleep` and no `-R`.
+**Decision**: the record service paces the load, not the pgbench script and not `-R`. Each `pre` request waits for the next slot of the built-in driver's own `RateLimiter`, shared by all clients: slots are evenly spaced at 1/rate, whichever client asks next takes the next slot, and a slot missed is never made up with a burst. That is the built-in driver's arrival pattern exactly.
 
-**Decision**: pace each client **inside its pgbench script**, not with `-R`. pgbench's `-R` schedules transactions at random (Poisson) times by design, and has no even-spacing mode. Each client's script:
-- holds `interval_us = 1e6 × concurrency / rate` and a running `next_us` slot (`-D` variables);
-- reads the current time **from the database in the same statement it already runs** (e.g. a `RETURNING` value captured with `\gset`), so there is no extra round trip and one clock source per client;
-- sleeps the remainder until `next_us` with `\sleep`, then advances `next_us` by `interval_us`.
+**Rationale**: the user chose even spacing so pgbench and built-in runs compare like for like (clarification 2026-10-07). With option B every transaction already asks the harness before it starts (R1), so pacing there costs nothing extra and reuses the reference implementation instead of re-creating it inside pgbench. A shared limiter also lets a healthy client take a slot a stalled client cannot use, as the built-in workers do; per-client pacing would lose those slots.
 
-When a transaction overruns its slot, the next one starts at once and the slot catches up. That is the same behaviour as the built-in generator's rate limiter, which never bursts to make up lost time.
-
-**Evidence**: per transaction, `actual start − scheduled slot` is the scheduling lag. Each report states its p50/p99 (FR-021); a lag that grows steadily means the client cannot keep the rate, which feeds User Story 5's "limiting side".
-
-**Rationale**: the user chose even spacing so pgbench and built-in runs compare like for like (clarification 2026-10-07); random spacing raises p99 through bursts.
+**Evidence**: the per-second samples show the achieved rate against the declared one (lab: 199.99 TPS for 200 offered, 981 for 1000). There is no separate scheduling-lag figure: a run that cannot keep its rate shows it in the steady-state check, which names the limiting side.
 
 **Alternatives considered**:
-- `-R` (Poisson): rejected by the clarification.
-- A fixed `\sleep interval` per transaction: simpler, but the achieved rate falls below the declared one by the transaction time, so the offered load would silently differ from the scenario's.
+- `-R` (Poisson): rejected by the clarification; random spacing raises p99 through bursts.
+- In-script pacing (the decision before option B): each client sleeps with `\sleep` until its next slot, timing itself from a database clock read. Superseded: per-client slots cannot be shared, and it duplicates the limiter the record service already has.
+- A fixed `\sleep interval` per transaction: the achieved rate falls below the declared one by the transaction time, so the offered load would silently differ from the scenario's.
 - The harness starting each transaction itself: one process per transaction; far too heavy.
 
 ---

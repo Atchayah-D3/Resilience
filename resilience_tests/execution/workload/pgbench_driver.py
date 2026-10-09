@@ -25,6 +25,7 @@ Behaviour shared with the built-in driver, so the orchestrator cannot tell them 
 from __future__ import annotations
 
 import asyncio
+import collections
 import os
 import re
 import shutil
@@ -53,7 +54,9 @@ from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.execution.workload.pgbench_output import (
     PgbenchParseError,
     is_abort_line,
+    is_auth_failure,
     is_connect_failure,
+    is_statement_error,
     parse_abort_line,
 )
 from resilience_tests.execution.workload.shell_records import (
@@ -68,6 +71,9 @@ from resilience_tests.observability.event_stream import EventStream
 SCRIPT_FILE = "transaction.sql"
 # A run is bounded by the orchestrator's phase timeouts; pgbench's own clock must never end it.
 PGBENCH_DURATION_S = 7 * 24 * 3600
+# Launches ended by a statement ERROR before the run's first commit: the script cannot work at
+# all (a broken statement, a missing privilege), so the run stops and names the error.
+STATEMENT_ERRORS_BEFORE_FIRST_COMMIT = 3
 STOP_GRACE_S = 2.0
 
 
@@ -189,9 +195,10 @@ class PgbenchWorkloadDriver:
         self._gate = asyncio.Lock()
         self._gate_ok_at = float("-inf")
         self._setpriv = shutil.which("setpriv")
+        self.statement_errors: collections.Counter[str] = collections.Counter()
         self.records = ShellRecordService(
             self.pgbench_dir, journals, self.shape, workload.rate_tps, workload.concurrency,
-            marker_uuid=adapter.pgbench_marker_uuid, count=self._count,
+            marker_uuid=lambda seq: adapter.pgbench_marker_uuid(seq, self.run_id), count=self._count,
             on_connected=self._on_connected, on_fatal=self._fail, history=history,
             churn_keys=adapter.churn_key_space if self.shape == "churn" else 0,
         )
@@ -225,7 +232,7 @@ class PgbenchWorkloadDriver:
         if re.search(r"\s", str(self.pgbench_dir)):
             raise UnsupportedWorkload(f"the run directory {self.pgbench_dir} contains whitespace, which "
                                       "pgbench's shell commands cannot carry")
-        spec = self.adapter.pgbench_launch(self.shape, read_chunks=READ_CHUNKS, chunk_chars=READ_CHUNK_CHARS)
+        spec = self.adapter.pgbench_launch(self.shape, self.run_id, read_chunks=READ_CHUNKS, chunk_chars=READ_CHUNK_CHARS)
         self.app_name = f"{spec.application_name}-{self.run_id}"
         self._spec = spec
         script = pre_steps(self.shape, self.records.token_base) + spec.script + ack_steps(self.shape)
@@ -273,6 +280,7 @@ class PgbenchWorkloadDriver:
         return {
             "pgbench_launches": self._launch_counter,
             "pgbench_exit_with_harness": self._setpriv is not None,
+            "pgbench_statement_errors": dict(self.statement_errors),
             "pgbench_record_journal_p50_ms": percentile(jm, 0.50),
             "pgbench_record_journal_p99_ms": p99(jm),
             "pgbench_record_mechanism": (
@@ -345,10 +353,32 @@ class PgbenchWorkloadDriver:
                     aborts.append(parse_abort_line(line))
                 except PgbenchParseError:
                     pass
-        if aborts and all(a.kind == "sql" for a in aborts):
-            # the database, or the way to it, ended the client: unknown outcome, dropped
-            st.ended_as = "client_aborted"
+        # only the server's words: a record step's shell error ("cannot open q: Permission
+        # denied") is the instrument failing, never the database refusing us
+        server_text = "".join(line for line in st.stderr
+                              if "FATAL" in line or "ERROR" in line or "connection to server" in line)
+        if is_auth_failure(server_text):
+            # credentials or privileges: no relaunch can fix it
+            st.ended_as = "refused"
             self.records.launch_ended(st.launch, "aborted")
+            self._fail(f"pgbench was refused by the server for its credentials or privileges "
+                       f"(check ~/.pgpass, its 0600 mode, the role and pg_hba.conf): {server_text.strip()[-300:]}")
+            return False
+        if aborts and all(a.kind == "sql" for a in aborts):
+            st.ended_as = "client_aborted"
+            errors = [a for a in aborts if is_statement_error(a)]
+            if errors:
+                # The server answered ERROR on a live connection. Counted as the built-in driver
+                # counts an unclassified server error (unknown outcome + the session discarded),
+                # so both generators give the same verdicts; reported apart from connection loss.
+                st.ended_as = "statement_error"
+                self.statement_errors[errors[0].message.split("\n")[0][:200]] += 1
+            self.records.launch_ended(st.launch, "aborted")
+            if errors and not self.records.journal_ms and \
+                    sum(self.statement_errors.values()) >= STATEMENT_ERRORS_BEFORE_FIRST_COMMIT:
+                self._fail(f"pgbench transactions fail with a statement error before any has committed, "
+                           f"so the load cannot run: {errors[0].message}")
+                return False
             return True
         if not aborts and st.process is not None and st.process.returncode == 1 and is_connect_failure(text):
             st.ended_as = "not_connected"

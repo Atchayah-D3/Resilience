@@ -55,7 +55,7 @@ class MockAdapter(BaseDatabaseAdapter):
     async def server_version(self) -> str:
         return self._server_version_str
 
-    def pgbench_launch(self, shape: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec:
+    def pgbench_launch(self, shape: str, run_id: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec:
         return PgbenchLaunchSpec(
             script="SELECT 1;\n",
             variables={},

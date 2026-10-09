@@ -50,6 +50,8 @@ def render_summary(r: dict[str, Any]) -> str:
             j99 = facts.get("pgbench_record_journal_p99_ms")
             if j50 is not None and j99 is not None:
                 gen_line += f"\n  record journal flush: p50 {j50:.1f} ms, p99 {j99:.1f} ms"
+            for message, n in (facts.get("pgbench_statement_errors") or {}).items():
+                gen_line += f"\n  statement error x{n}: {message}"
             mechanism = facts.get("pgbench_record_mechanism")
             if mechanism:
                 gen_line += f"\n  record steps: {mechanism}"

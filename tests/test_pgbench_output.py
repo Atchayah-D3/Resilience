@@ -5,7 +5,9 @@ import pytest
 from resilience_tests.execution.workload.pgbench_output import (
     PgbenchParseError,
     is_abort_line,
+    is_auth_failure,
     is_connect_failure,
+    is_statement_error,
     parse_abort_line,
     parse_progress_line,
     parse_summary,
@@ -69,6 +71,31 @@ def test_connect_failure_is_recognised():
     assert is_connect_failure('pgbench: error: connection to server at "127.0.0.1", port 55433 failed: '
                               "Connection refused\npgbench: error: could not create connection for setup")
     assert not is_connect_failure("pgbench: error: client 0 aborted in command 3 (SQL) of script 0")
+
+
+def test_auth_failures_are_told_apart_from_fault_conditions():
+    assert is_auth_failure('connection to server at "10.11.21.112", port 5433 failed: FATAL:  '
+                           'password authentication failed for user "harness"')
+    assert is_auth_failure('FATAL:  no pg_hba.conf entry for host "10.11.21.111", user "harness"')
+    assert is_auth_failure('FATAL:  role "harness" does not exist')
+    # what a fault looks like at connect time is retried, never fatal
+    assert not is_auth_failure("FATAL:  sorry, too many clients already")
+    assert not is_auth_failure("FATAL:  the database system is starting up")
+    assert not is_auth_failure("FATAL:  remaining connection slots are reserved for roles with the SUPERUSER attribute")
+    assert not is_auth_failure("Connection refused")
+
+
+def test_statement_errors_are_told_apart_from_connection_loss():
+    error = parse_abort_line('pgbench: error: client 0 script 0 aborted in command 11 query 0: ERROR:  '
+                             'column "ts" of relation "churn" does not exist')
+    assert is_statement_error(error)
+    for lost in ("pgbench: error: client 0 script 0 aborted in command 3 query 0: FATAL:  "
+                 "terminating connection due to administrator command",
+                 "pgbench: error: client 0 aborted in command 3 (SQL) of script 0; "
+                 "perhaps the backend died while processing",
+                 "pgbench: error: client 0 aborted in command 0 (shell) of script 0; "
+                 "execution of meta-command failed"):
+        assert not is_statement_error(parse_abort_line(lost))
 
 
 def test_parse_abort_line_unparseable_raises():

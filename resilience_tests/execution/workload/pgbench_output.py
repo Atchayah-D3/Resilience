@@ -121,6 +121,26 @@ def is_connect_failure(stderr_text: str) -> bool:
     return bool(_CONNECT_FAILURE_RE.search(stderr_text))
 
 
+# The server refused who we are or what we may touch: no retry will change that, and retrying
+# would only spin until the phase bound. ("too many clients", "starting up" and "connection
+# refused" are not here: those are fault conditions the run must ride through.)
+_AUTH_FAILURE_RE = re.compile(
+    r"authentication failed|no password supplied|pg_hba\.conf|"
+    r"role \"[^\"]*\" does not exist|database \"[^\"]*\" does not exist|permission denied",
+    re.IGNORECASE)
+
+
+def is_auth_failure(stderr_text: str) -> bool:
+    """pgbench was refused for its credentials or privileges."""
+    return bool(_AUTH_FAILURE_RE.search(stderr_text))
+
+
+def is_statement_error(abort: PgbenchAbortLine) -> bool:
+    """The server answered a statement with ERROR on a live connection (a FATAL, or a connection
+    that died, is the connection being lost instead)."""
+    return abort.kind == "sql" and abort.message.upper().startswith("ERROR")
+
+
 def parse_summary(text: str) -> PgbenchSummary:
     lines = [ln.rstrip() for ln in text.splitlines()]
     if not lines:

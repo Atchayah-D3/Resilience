@@ -9,12 +9,12 @@ Constitution V: only the adapter knows the database. The pgbench driver adds the
 ## Hooks
 
 ```text
-adapter.pgbench_launch(shape: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec
-adapter.pgbench_marker_uuid(seq: int) -> str
+adapter.pgbench_launch(shape: str, run_id: str, read_chunks: int = 0, chunk_chars: int = 0) -> PgbenchLaunchSpec
+adapter.pgbench_marker_uuid(seq: int, run_id: str) -> str
 ```
 
 - `shape`: `marker` | `churn` | `list_append`, derived exactly as the built-in driver derives it.
-- `pgbench_marker_uuid(seq)`: the uuid the transaction with `seq` inserts. PostgreSQL: `md5('resilience-pgbench-' || seq)::uuid`. The record service journals this uuid, so `marker_ids()` and the journals compare as today.
+- `pgbench_marker_uuid(seq, run_id)`: the uuid the transaction with `seq` inserts. PostgreSQL: `md5('resilience-pgbench-<run_id>-' || seq)::uuid`. The record service journals this uuid, so `marker_ids()` and the journals compare as today. The run id is part of it because `seq` restarts at 1 every run: a marker an earlier run left behind must never carry the id of one this run lost (the built-in driver's random uuids have the same property). A run id that is not a safe SQL literal (`[A-Za-z0-9_.-]+`) is refused.
 
 `PgbenchLaunchSpec`:
 

@@ -9,6 +9,9 @@ from resilience_tests.execution.workload.driver import UnsupportedWorkload
 from resilience_tests.execution.workload.interface import derive_shape
 
 
+RUN = "NL-C-01-20261008T092214Z-bbe290"
+
+
 @pytest.fixture
 def adapter():
     profile = load_profile("e2-dedicated-vm")
@@ -21,11 +24,11 @@ def _clean(script, adapter):
 
 
 def test_marker_script_is_the_built_in_marker_transaction(adapter):
-    spec = adapter.pgbench_launch("marker")
+    spec = adapter.pgbench_launch("marker", RUN)
     assert spec.script.splitlines() == [
         "BEGIN;",
         "INSERT INTO resilience.markers(uuid, seq, ts) "
-        "VALUES (md5('resilience-pgbench-' || :seq)::uuid, :seq, clock_timestamp());",
+        f"VALUES (md5('resilience-pgbench-{RUN}-' || :seq)::uuid, :seq, clock_timestamp());",
         "COMMIT;",
     ]
     assert spec.connection == adapter.node.client and spec.application_name == "resilience-pgbench"
@@ -35,12 +38,28 @@ def test_marker_script_is_the_built_in_marker_transaction(adapter):
 def test_marker_uuid_is_derived_as_the_script_derives_it(adapter):
     import hashlib
     import uuid
-    expected = str(uuid.UUID(hashlib.md5(b"resilience-pgbench-42").hexdigest()))
-    assert adapter.pgbench_marker_uuid(42) == expected
+    expected = str(uuid.UUID(hashlib.md5(f"resilience-pgbench-{RUN}-42".encode()).hexdigest()))
+    assert adapter.pgbench_marker_uuid(42, RUN) == expected
+
+
+def test_marker_uuids_differ_between_runs(adapter):
+    """seq restarts at 1 every run: without the run id, a marker an earlier run left behind would
+    carry the same id as this run's, and a commit this run lost would look present."""
+    other = "NL-C-01-20261009T000000Z-000000"
+    assert adapter.pgbench_marker_uuid(1, RUN) != adapter.pgbench_marker_uuid(1, other)
+    assert other not in adapter.pgbench_launch("marker", RUN).script
+
+
+def test_a_run_id_that_is_not_a_safe_literal_is_refused(adapter):
+    for bad in ("x'); DROP TABLE resilience.markers; --", "with space", ""):
+        with pytest.raises(ValueError):
+            adapter.pgbench_launch("marker", bad)
+        with pytest.raises(ValueError):
+            adapter.pgbench_marker_uuid(1, bad)
 
 
 def test_churn_script_is_one_transaction_with_the_built_in_statements(adapter):
-    lines = adapter.pgbench_launch("churn").script.splitlines()
+    lines = adapter.pgbench_launch("churn", RUN).script.splitlines()
     assert lines[0] == "BEGIN;" and lines[-1] == "COMMIT;"
     assert lines[1].startswith("INSERT INTO resilience.markers")      # the marker first, as built-in
     assert lines[2:] == [
@@ -55,7 +74,7 @@ def test_churn_script_is_one_transaction_with_the_built_in_statements(adapter):
 
 
 def test_list_append_script_reads_append_and_reads_at_serializable(adapter):
-    script = adapter.pgbench_launch("list_append", read_chunks=3, chunk_chars=10).script
+    script = adapter.pgbench_launch("list_append", RUN, read_chunks=3, chunk_chars=10).script
     lines = script.splitlines()
     assert lines[0] == "BEGIN ISOLATION LEVEL SERIALIZABLE;" and lines[-1] == "COMMIT;"
     assert lines[1].startswith("INSERT INTO resilience.markers")
@@ -68,7 +87,7 @@ def test_list_append_script_reads_append_and_reads_at_serializable(adapter):
     assert "ORDER BY i" in script and "e - :vbase" in script and "'nil'" in script
     _clean(script, adapter)
     with pytest.raises(ValueError):
-        adapter.pgbench_launch("list_append")
+        adapter.pgbench_launch("list_append", RUN)
 
 
 def test_shape_derivation():
