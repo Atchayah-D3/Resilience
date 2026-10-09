@@ -93,12 +93,19 @@ class FaultInjector(ABC):
         die between journalling the intent and applying the fault."""
 
 
-_REGISTRY: dict[tuple[str, str], type[FaultInjector]] = {}
+# Several drivers may serve one profile section (the OS/SSH section serves process faults and
+# data-file corruption); the fault type picks among them.
+_REGISTRY: dict[tuple[str, str], list[type[FaultInjector]]] = {}
 
 
 def register(section: str, cls: type[FaultInjector]) -> type[FaultInjector]:
-    _REGISTRY[(section, cls.driver_name)] = cls
+    _REGISTRY.setdefault((section, cls.driver_name), []).append(cls)
     return cls
+
+
+def _driver_class(section: str, driver: str, fault_type: str) -> type[FaultInjector] | None:
+    classes = _REGISTRY.get((section, driver), [])
+    return next((c for c in classes if fault_type in c.fault_types), None)
 
 
 def driver_for(fault_type: str, profile: EnvProfile) -> tuple[str, str]:
@@ -113,8 +120,8 @@ def driver_for(fault_type: str, profile: EnvProfile) -> tuple[str, str]:
 
 def resolve(fault: Fault, profile: EnvProfile) -> FaultInjector:
     section, driver = driver_for(fault.type, profile)
-    cls = _REGISTRY.get((section, driver))
-    if cls is None or fault.type not in cls.fault_types:
+    cls = _driver_class(section, driver, fault.type)
+    if cls is None:
         raise DriverNotAvailable(
             f"{section}.driver={driver!r} is not built for fault type {fault.type!r} "
             "(Arch §16: Phase 1 builds one power driver per environment class as needed)"
@@ -124,7 +131,8 @@ def resolve(fault: Fault, profile: EnvProfile) -> FaultInjector:
 
 def resolve_by_name(section: str, driver: str, profile: EnvProfile, fault_type: str = "") -> FaultInjector:
     """Used by the kill switch, which works from ledger entries rather than scenarios."""
-    cls = _REGISTRY.get((section, driver))
+    classes = _REGISTRY.get((section, driver), [])
+    cls = _driver_class(section, driver, fault_type) or (classes[0] if classes and not fault_type else None)
     if cls is None:
-        raise DriverNotAvailable(f"no driver {section}/{driver}")
+        raise DriverNotAvailable(f"no driver {section}/{driver} for fault type {fault_type!r}")
     return cls(profile, fault_type)
