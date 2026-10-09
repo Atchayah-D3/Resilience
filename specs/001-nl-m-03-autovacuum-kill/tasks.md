@@ -99,7 +99,7 @@ quickstart.md §3 reports `kills_landed=5`, `autovacuum_worker_respawned=true`,
 ## Phase 6: Polish & Cross-Cutting
 
 - [X] T025 [P] Update tests/test_safety_ledger_profile.py so the fault-type loop also exercises `process_kill` with a `kill_target` (targeted path) and asserts no `systemctl kill` is sent for it
-- [X] T026 [P] Update CLAUDE.md: add NL-M-03 to the owners table (Gowri) and gotchas (two clusters on the target -> ppid-bound kill; `avac_target` table kept between runs; run length ~15-20 min)
+- [X] T026 [P] Update CLAUDE.md: add NL-M-03 to the owners table and gotchas (two clusters on the target -> ppid-bound kill; `avac_target` table kept between runs; run length ~15-20 min)
 - [X] T027 (2026-10-06: unit 290 pass + 4 VM-env-file-only failures; catalog 6/6; dry run ok; live run NL-M-03-20261006T075615Z-5bd741 PASSED -- 5/5 kills landed, 0 unvacuumed of 2, RPO 0, amcheck 0; second cluster untouched) Run the full gate on the harness VM: `pytest tests -q`, `python -m catalog.schema --partial`, dry run (`--stop-before-fault`), then the live NL-M-03 run per quickstart.md §2-§4; confirm the second cluster's processes were untouched and the target is clean
 - [X] T028 (2026-10-06: NL-C-01, NL-C-05, NL-C-06 PASSED; NL-C-03 PASSED on re-run (first attempt aborted pre-fault on harness storage stall); NL-C-02 aborted twice without a verdict -- once 'checkpoint completed before the kill' (its own fail-closed check; timing race in that scenario), once pre-fault steady state (target p99 935 ms) -- neither touches NL-M-03 code; reported to the owner) Re-run the live scenarios that share the changed code (NL-C-01, NL-C-02, NL-C-03, NL-C-05, NL-C-06) on the VM, per the constitution's merge gate
 

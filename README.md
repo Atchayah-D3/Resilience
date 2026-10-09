@@ -398,6 +398,40 @@ d=$(ls -td <run_dir>/NL-C-01-* | head -1); cat "$d/summary.txt"
 .venv/bin/python -m resilience_tests.control.killswitch --env e2-dedicated-vm
 ```
 
+### Reports (Arch §10.4)
+
+Every scenario run writes its own **`report.html`** into its run directory: verdict, every
+acceptance rule with measured value, margin and reason, an annotated timeline (fault, outage,
+first write, recovery, every cycle), throughput/latency charts, disclosures and links to the
+evidence. One self-contained file; it opens offline. It shows the run's recorded status and
+never re-decides it; NOT_MEASURED is always a labelled reason, never a number or a pass.
+
+```bash
+# scenario runs: JUnit XML for the CI gate + an index page + the P0 gate decision
+.venv/bin/pytest resilience_tests/test_scenarios.py --env e2-dedicated-vm --report-dir reports
+.venv/bin/python -m resilience_tests.reporting.gate reports/scenarios-junit.xml   # exit 1 = a P0 did not pass
+
+# unit tests: JUnit XML (pytest's own) + an HTML summary
+.venv/bin/python -m pytest tests --report-dir reports --junitxml=reports/unit-junit.xml
+
+# regenerate pages from existing evidence (e.g. an older run)
+.venv/bin/python -m resilience_tests.reporting.html <run_dir> [<run_dir> ...] --index reports/index.html
+```
+
+In `scenarios-junit.xml` a verdict failure is `<failure>` (listing every rule that did not
+pass), a run without a verdict (aborted, error, no result) is `<error>`, and dry runs and
+plan skips are `<skipped>`; each case carries `scenario_id`, `priority`, `status`, `run_id`,
+`evidence_dir` and `report`. **Only P0 non-passes fail the build** (Arch §10.4); P1/P2
+non-passes are reported. Jenkins marks a build UNSTABLE on any JUnit failure, so publish with
+`skipMarkingBuildUnstable` and let the gate's exit code decide:
+
+```groovy
+sh '.venv/bin/pytest resilience_tests/test_scenarios.py --env e2-dedicated-vm --report-dir reports || true'
+junit testResults: 'reports/scenarios-junit.xml', skipMarkingBuildUnstable: true
+archiveArtifacts artifacts: 'reports/**'
+sh '.venv/bin/python -m resilience_tests.reporting.gate reports/scenarios-junit.xml'
+```
+
 `--scenario` is repeatable; omit it to run the whole catalog. `--reference-class` (default `E2`)
 picks the environment class used for tests whose behaviour does not depend on the environment.
 

@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>{{ title }}</title>
+{% include "_style.html.j2" %}</head><body>
+<h1>{{ title }}</h1>
+<div class="muted">{% for status, n in counts %}<span class="badge s-{{ status }}">{{ status | replace("_", " ") }}: {{ n }}</span> {% endfor %}</div>
+{% if gate_text %}<pre>{{ gate_text }}</pre>{% endif %}
+<table><tr><th>Scenario</th><th>Priority</th><th>Status</th><th>Run</th><th>Details</th></tr>
+{% for r in rows %}{% set c = r.c %}
+<tr><td><b>{{ c.scenario_id }}</b> <span class="muted">{{ c.name }}</span><div class="muted mono">{{ c.case_id }}</div></td>
+  <td>{{ c.priority }}</td>
+  <td><span class="badge s-{{ c.status }}">{{ c.status | replace("_", " ") }}</span></td>
+  <td>{% if r.link %}<a href="{{ r.link }}">{{ c.run_id or "report" }}</a>{% else %}<span class="mono">{{ c.run_id or "" }}</span>{% endif %}
+      {% if c.report_error %}<div class="muted">report not rendered: {{ c.report_error }}</div>{% endif %}</td>
+  <td>{{ c.message }}{% if c.detail %}<ul>{% for d in c.detail %}<li class="mono">{{ d }}</li>{% endfor %}</ul>{% endif %}</td></tr>
+{% endfor %}</table>
+<footer>Generated {{ generated_at }}.</footer>
+</body></html>

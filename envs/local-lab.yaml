@@ -30,7 +30,7 @@ sla_tier_target: platinum
 
 driver_host:                     # separate from the target (Arch §6.2)
   host: 172.19.159.252
-  run_dir: /home/gowrihangarar/resilience-runs
+  run_dir: /var/tmp/resilience-runs
 
 nodes:
   - name: shakti-target-01

@@ -17,6 +17,7 @@ from catalog.schema import load_catalog
 from resilience_tests.control.matrix import RunPlanItem, expand
 from resilience_tests.control.orchestrator import RunOptions, run_item
 from resilience_tests.control.profile import load_profile
+from resilience_tests.reporting.html import render_run
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
@@ -45,7 +46,17 @@ def test_scenario(plan_item: RunPlanItem, request: pytest.FixtureRequest) -> Non
         stop_before_fault=cfg.getoption("--stop-before-fault"),
     )
     results = asyncio.run(run_item(plan_item, profile, options))
-    request.node.user_properties.append(("results", results["evidence_dir"]))
+    props = request.node.user_properties
+    props.append(("results", results["evidence_dir"]))
+    props += [("scenario_id", plan_item.scenario.id), ("priority", plan_item.scenario.priority),
+              ("status", results["status"]), ("run_id", results["run_id"])]
+    # The run's own HTML page (Arch §10.4). A report that fails to render is recorded and
+    # printed; it never changes the run's status (spec FR-011).
+    try:
+        props.append(("report", str(render_run(results["evidence_dir"]))))
+    except Exception as exc:  # noqa: BLE001 -- the verdict stands; the page is a view of it
+        props.append(("report_error", f"{type(exc).__name__}: {exc}"))
+        print(f"run report not rendered for {results['run_id']}: {type(exc).__name__}: {exc}")
     summary = json.dumps({k: results[k] for k in ("run_id", "status", "error", "measured", "evidence_dir")}, indent=2, default=str)
     if results["status"] == "stopped_before_fault" and options.stop_before_fault:
         pytest.skip(f"dry run completed (no fault, no verdict):\n{summary}")

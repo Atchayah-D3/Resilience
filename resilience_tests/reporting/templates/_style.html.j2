@@ -1,0 +1,30 @@
+<style>
+  :root { --fg:#1f2937; --muted:#6b7280; --line:#e5e7eb; --bg:#ffffff; --panel:#f9fafb;
+          --pass:#15803d; --fail:#b91c1c; --error:#c2410c; --skip:#6b7280; --nm:#7c3aed; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--fg);
+         background: var(--bg); margin: 0; padding: 24px; max-width: 1180px; }
+  h1 { font-size: 22px; margin: 0 0 4px; } h2 { font-size: 16px; margin: 28px 0 8px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  .muted { color: var(--muted); } code, .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+  table { border-collapse: collapse; width: 100%; margin: 6px 0; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--panel); font-weight: 600; font-size: 12.5px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; color: #fff; }
+  .s-passed, .o-pass { background: var(--pass); }
+  .s-failed, .o-fail { background: var(--fail); }
+  .s-aborted, .s-error, .s-no_result, .o-error, .o-missing { background: var(--error); }
+  .s-skipped, .s-stopped_before_fault { background: var(--skip); }
+  .o-not_measured, .o-not_applicable, .k-not_measured, .k-not_applicable, .k-missing { background: var(--nm); }
+  .status { font-size: 18px; padding: 3px 14px; border-radius: 14px; }
+  .banner { padding: 10px 14px; border-radius: 6px; margin: 12px 0; border: 1px solid; }
+  .banner.err { background: #fff7ed; border-color: #fdba74; } .banner.note { background: #f5f3ff; border-color: #c4b5fd; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 6px 18px; }
+  .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin: 10px 0; }
+  .chart svg { width: 100%; height: auto; }
+  .legend span { margin-right: 14px; font-size: 12px; } .legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  ul.disc li { margin: 3px 0; }
+  .m-fault { color: var(--fail); font-weight: 600; } .m-first_write, .m-recovered, .m-slo_recovered { color: var(--pass); }
+  .m-outage_start { color: var(--error); } .m-note { color: var(--nm); }
+  pre { white-space: pre-wrap; background: var(--panel); padding: 8px; border-radius: 6px; border: 1px solid var(--line); }
+  footer { margin-top: 32px; font-size: 12px; color: var(--muted); }
+</style>

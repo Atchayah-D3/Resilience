@@ -77,6 +77,13 @@ Behaviour comes only from catalog fields:
 bash vendor/elle/setup_elle.sh
 ```
 
+Reports (spec 002): every scenario run writes `<run_dir>/report.html`. Add `--report-dir reports`
+to either suite for `scenarios-junit.xml` + `index.html` + `gate.txt` (scenarios) or
+`unit-summary.html` (unit tests; JUnit via `--junitxml`). P0 gate:
+`.venv/bin/python -m resilience_tests.reporting.gate reports/scenarios-junit.xml` (exit 1 = a P0
+failed or aborted). Regenerate pages: `python -m resilience_tests.reporting.html <run_dir>...`.
+Jinja2 is required (installed in both VM venvs).
+
 The local workstation has no project venv; run tests on the harness VM (or create `.venv`
 with `pip install -e '.[test]'` on Python 3.11+).
 
@@ -84,8 +91,8 @@ with `pip install -e '.[test]'` on Python 3.11+).
 
 | Owner | Scenarios |
 |---|---|
-| Gowri | NL-C-01, NL-C-03, NL-C-04 (blocked: needs a dedicated pg_wal volume), NL-C-06, NL-M-03, NL-M-06, NL-M-07, NL-R-04 |
-| Teammate (Atchayah) | NL-C-02, NL-C-05, NL-M-05 |
+| Owner A | NL-C-01, NL-C-03, NL-C-04 (blocked: needs a dedicated pg_wal volume), NL-C-06, NL-M-03, NL-M-06, NL-M-07, NL-R-04 |
+| Owner B | NL-C-02, NL-C-05, NL-M-05 |
 
 Change another owner's scenario only with that owner (constitution, workflow section).
 Next candidates: NL-N-02 (cgroup CPU throttling, P0) with NL-R-01/02 (shared resource_limit driver).

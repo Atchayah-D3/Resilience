@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Unit tests: {{ counts.passed }}/{{ total }} passed</title>
+{% include "_style.html.j2" %}</head><body>
+<h1>Harness unit tests</h1>
+<div><span class="badge s-passed">passed: {{ counts.passed }}</span>
+  <span class="badge s-failed">failed: {{ counts.failed }}</span>
+  <span class="badge s-error">errors: {{ counts.error }}</span>
+  <span class="badge s-skipped">skipped: {{ counts.skipped }}</span>
+  <span class="muted">of {{ total }}</span></div>
+{% if not_passed %}<h2>Not passed</h2>
+{% for r in not_passed %}<div><b class="mono">{{ r.nodeid }}</b> <span class="badge s-{{ r.outcome }}">{{ r.outcome }}</span>
+<pre>{{ r.message }}</pre></div>{% endfor %}{% endif %}
+<h2>All tests</h2>
+<table><tr><th>Test</th><th>Outcome</th><th>Duration (s)</th></tr>
+{% for r in results %}<tr><td class="mono">{{ r.nodeid }}</td><td><span class="badge s-{{ r.outcome }}">{{ r.outcome }}</span></td>
+<td class="mono">{{ "%.2f" | format(r.duration_s) }}</td></tr>{% endfor %}</table>
+<footer>Generated {{ generated_at }}.</footer>
+</body></html>
