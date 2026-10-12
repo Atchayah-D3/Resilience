@@ -7,6 +7,7 @@ page-checksum counters and the durability settings. The rest of the harness know
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import shlex
 import time
@@ -289,10 +290,39 @@ CORRUPTION_TARGET_ROWS = 2_000          # ~35 pages: a page in the middle is sur
 CORRUPTION_BYTE_FROM_PAGE_END = 64      # inside the tuple area, far from the page header
 # PostgreSQL: "invalid page in block 17 of relation base/16384/16400" (SQLSTATE XX001)
 _INVALID_PAGE_RE = re.compile(r"invalid page in block (\d+) of relation (\S+)")
+# NL-I-02 (relation_kind btree_index): a btree index on the same harness-owned table. Built
+# after the rows are loaded, so the build lays the leaves out in key order from block 1, with
+# the internal pages after them; a block a third of the way in is a leaf. That is proved, not
+# assumed: with the database down the driver reads the page's own flags first (page_check).
+CORRUPTION_INDEX_NAME = "corruption_target_idx"
+CORRUPTION_INDEX = f"resilience.{CORRUPTION_INDEX_NAME}"
+CORRUPTION_INDEX_ROWS = 20_000         # ~55 leaf pages of int keys
+# btree page layout: the last 16 bytes are the special space (BTPageOpaqueData); btpo_flags is
+# the uint16 at offset 12 of it, so its low byte (little-endian) is 4 bytes from the page end,
+# and BTP_LEAF is bit 0. A big-endian target fails the check and the run aborts -- never guesses.
+BTREE_LEAF_FLAG_FROM_PAGE_END = 4
+BTREE_LEAF_FLAG = 0x01
+CORRUPTION_INDEX_BYTE_FROM_PAGE_END = 20   # the tuple area just below the special space
+# A full-range ordered read walks every leaf of the index, so it must reach the damaged page.
+# The scan types that would avoid the index are switched off for that session only.
+INDEX_READ_SQL = f"SELECT id FROM {CORRUPTION_TARGET} WHERE id >= 1 ORDER BY id"
+INDEX_READ_SETTINGS = {"enable_seqscan": "off", "enable_bitmapscan": "off", "enable_sort": "off"}
+_INDEX_SCAN_NODES = ("Index Scan", "Index Only Scan")
 
 _SAME_AS_CONNECT: Any = object()  # sentinel: bound statements by the connect timeout
 
 ChecksumStats = dict[str, tuple[int, str]]  # database -> (checksum_failures, stats_reset)
+
+
+def _plan_nodes(plan: Any) -> list[dict[str, Any]]:
+    """Every node of an EXPLAIN (FORMAT JSON) plan, depth first."""
+    stack = [entry["Plan"] for entry in plan] if isinstance(plan, list) else [plan.get("Plan", plan)]
+    nodes = []
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        stack.extend(node.get("Plans") or [])
+    return nodes
 
 
 def checksum_failures_since(baseline: ChecksumStats | None, now: ChecksumStats) -> int:
@@ -520,8 +550,12 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
 
     corruption_sqlstates = ("XX001",)  # data_corrupted
 
-    async def prepare_corruption_target(self) -> dict[str, Any]:
+    async def prepare_corruption_target(self, kind: str = "heap") -> dict[str, Any]:
         """Recreate the corruption target and locate a populated page in its data file."""
+        if kind == "btree_index":
+            return await self._prepare_index_corruption_target()
+        if kind != "heap":
+            raise ValueError(f"no corruption target of kind {kind!r} for PostgreSQL")
         conn = await self._connect(timeout_s=60.0)
         try:
             await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
@@ -548,6 +582,96 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             "rows": CORRUPTION_TARGET_ROWS,
         }
 
+    async def _prepare_index_corruption_target(self) -> dict[str, Any]:
+        """The table plus a btree index on it; the target is a leaf page of the index file."""
+        conn = await self._connect(timeout_s=60.0)
+        try:
+            await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
+            # autovacuum (and with it autoanalyze) off on the table and its index: nothing in the
+            # background reads the damaged page first, and without statistics the planner does
+            # not probe the index's end pages either
+            await conn.execute(f"CREATE TABLE {CORRUPTION_TARGET} (id int NOT NULL, payload text NOT NULL) "
+                               "WITH (autovacuum_enabled = false)")
+            await conn.execute(f"INSERT INTO {CORRUPTION_TARGET} SELECT g, repeat('i', 16) "
+                               "FROM generate_series(1, $1) g", CORRUPTION_INDEX_ROWS)
+            await conn.execute(f"CREATE INDEX {CORRUPTION_INDEX_NAME} ON {CORRUPTION_TARGET} (id)")
+            row = await conn.fetchrow(
+                "SELECT pg_relation_filepath($1::regclass) AS path, "
+                "pg_relation_filenode($1::regclass)::bigint AS filenode, "
+                "current_setting('block_size')::int AS block_size, "
+                "pg_relation_size($1::regclass)::bigint AS bytes", CORRUPTION_INDEX)
+        finally:
+            await conn.close()
+        block_size = int(row["block_size"])
+        pages = int(row["bytes"]) // block_size
+        if pages < 4:
+            raise RuntimeError(f"{CORRUPTION_INDEX} has only {pages} pages; no leaf page to corrupt")
+        return {
+            "relation": CORRUPTION_INDEX,
+            "relation_kind": "btree_index",
+            "table": CORRUPTION_TARGET,
+            "relation_path": str(row["path"]),
+            "filenode": int(row["filenode"]),
+            "block": pages // 3,
+            "pages": pages,
+            "block_size": block_size,
+            "byte_in_page": block_size - CORRUPTION_INDEX_BYTE_FROM_PAGE_END,
+            "page_check": {"byte_in_page": block_size - BTREE_LEAF_FLAG_FROM_PAGE_END,
+                           "mask": BTREE_LEAF_FLAG, "equals": BTREE_LEAF_FLAG,
+                           "meaning": "btree leaf page (BTP_LEAF set in btpo_flags)"},
+            "rows": CORRUPTION_INDEX_ROWS,
+            # pg_amcheck checks a table's indexes along with it, so the run-wide check leaves out
+            # both; they are checked on their own after REINDEX (heapallindexed)
+            "integrity_exclusions": [CORRUPTION_TARGET, CORRUPTION_INDEX],
+        }
+
+    @staticmethod
+    def _corruption_error(exc: asyncpg.PostgresError) -> dict[str, Any]:
+        message = str(exc)
+        where = _INVALID_PAGE_RE.search(message)
+        return {"error": type(exc).__name__, "sqlstate": getattr(exc, "sqlstate", None),
+                "message": message[:500],
+                "block": int(where.group(1)) if where else None,
+                "relation_path": where.group(2) if where else None}
+
+    async def read_index_target(self, attempts: int = 2) -> dict[str, Any]:
+        """The table read through its index, on a fresh connection each time. The plan is
+        checked first: a read the planner answered without that index says nothing about it."""
+        out = []
+        for _ in range(attempts):
+            conn = await self._connect(timeout_s=10.0, command_timeout=60.0, server_settings=INDEX_READ_SETTINGS)
+            attempt: dict[str, Any] = {"used_index": None}
+            try:
+                plan = await conn.fetchval(f"EXPLAIN (FORMAT JSON) {INDEX_READ_SQL}")
+                nodes = _plan_nodes(json.loads(plan) if isinstance(plan, str) else plan)
+                attempt["plan"] = [n.get("Node Type") for n in nodes]
+                attempt["used_index"] = any(n.get("Node Type") in _INDEX_SCAN_NODES
+                                            and n.get("Index Name") == CORRUPTION_INDEX_NAME for n in nodes)
+                ids = [r[0] for r in await conn.fetch(INDEX_READ_SQL)]
+                attempt.update(error=None, rows=len(ids),
+                               matches_written=ids == list(range(1, CORRUPTION_INDEX_ROWS + 1)))
+            except asyncpg.PostgresError as exc:
+                attempt.update(self._corruption_error(exc))
+            finally:
+                await conn.close()
+            out.append(attempt)
+        return {"attempts": out}
+
+    async def rebuild_corruption_target(self) -> dict[str, Any]:
+        """REINDEX builds new index storage from the table and never reads the damaged pages."""
+        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
+        started = time.monotonic()
+        try:
+            await conn.execute(f"REINDEX INDEX {CORRUPTION_INDEX}")
+            duration = round(time.monotonic() - started, 3)
+            path = await conn.fetchval("SELECT pg_relation_filepath($1::regclass)", CORRUPTION_INDEX)
+            return {"ok": True, "duration_s": duration, "error": None, "relation_path_after": str(path)}
+        except asyncpg.PostgresError as exc:
+            return {"ok": False, "duration_s": None, "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                    "sqlstate": getattr(exc, "sqlstate", None)}
+        finally:
+            await conn.close()
+
     async def read_corruption_target(self, attempts: int = 2) -> dict[str, Any]:
         """A full sequential read (count(*) over a table with no index reads every page),
         on a fresh connection each time so no attempt is answered from a session cache."""
@@ -558,23 +682,20 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                 rows = await conn.fetchval(f"SELECT count(*) FROM {CORRUPTION_TARGET}")
                 out.append({"error": None, "rows": int(rows)})
             except asyncpg.PostgresError as exc:
-                message = str(exc)
-                where = _INVALID_PAGE_RE.search(message)
-                out.append({"error": type(exc).__name__, "sqlstate": getattr(exc, "sqlstate", None),
-                            "message": message[:500],
-                            "block": int(where.group(1)) if where else None,
-                            "relation_path": where.group(2) if where else None})
+                out.append(self._corruption_error(exc))
             finally:
                 await conn.close()
         return {"attempts": out}
 
-    async def amcheck_relation(self, relation: str, timeout_s: float) -> dict[str, Any]:
+    async def amcheck_relation(self, relation: str, timeout_s: float, *,
+                               heapallindexed: bool = False) -> dict[str, Any]:
         """pg_amcheck on the one relation (Arch §10.1 names it for NL-I-01). A checksum failure
         surfaces either as a reported finding or as the check's own read failing with the
         invalid-page error; both mean the checker noticed. A clean exit means it did not."""
         node = self.node
         command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
-                   f"-d {shlex.quote(node.db.dbname)} --relation={shlex.quote(relation)}")
+                   f"-d {shlex.quote(node.db.dbname)} --relation={shlex.quote(relation)}"
+                   + (" --heapallindexed" if heapallindexed else ""))
         async with RemoteHost(node.ssh) as host:
             result = await host.run(as_user(node.os_user, command), timeout_s=timeout_s, check=False)
         output = (result.stdout + result.stderr).strip()
@@ -586,7 +707,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             detected = True
         else:
             detected = None   # e.g. could not connect, or exited non-zero for another reason
-        return {"detected": detected, "exit_status": result.exit_status, "output": output[:2000]}
+        return {"detected": detected, "exit_status": result.exit_status, "output": output[:2000], "command": command}
 
     def corruption_log_locations(self, lines: Sequence[str]) -> list[tuple[int, str]]:
         found = []

@@ -357,6 +357,8 @@ class TestOrchestrator:
             self.injector.duration_s = float(self.scenario.fault.duration)
         if self.scenario.repeat is not None:
             self.injector.repeat_plan = (self.scenario.repeat.cycles, self.scenario.repeat.interval_s)
+        if self.scenario.fault.relation_kind is not None:
+            self.injector.corruption_kind = self.scenario.fault.relation_kind
         self.facts["fault_driver"] = {"section": section, "driver": self.injector.driver_name}
 
         # Integrity counters are cumulative in most engines; the run is judged on its own delta.
@@ -955,7 +957,10 @@ class TestOrchestrator:
         corruption_read: dict[str, Any] | None = None
         if self.scenario.fault.type == "data_corruption":
             try:
-                corruption_read = await self.adapter.read_corruption_target()
+                if self._corrupts_index:
+                    corruption_read = await self.adapter.read_index_target()
+                else:
+                    corruption_read = await self.adapter.read_corruption_target()
             except Exception as exc:  # noqa: BLE001 -- recorded; detection then counts as not measured
                 corruption_read = {"error": f"{type(exc).__name__}: {exc}"}
             self.facts["corruption_read"] = corruption_read
@@ -1148,8 +1153,14 @@ class TestOrchestrator:
                 "timeout enforcement was untestable within this run.")
         return m
 
+    @property
+    def _corrupts_index(self) -> bool:
+        return self.scenario.fault.relation_kind == "btree_index"
+
     async def _measure_corruption(self, read: dict[str, Any]) -> dict[str, Any]:
-        """NL-I-01: was the damaged page detected, on read, at the right place -- and nowhere else?
+        """NL-I-01/02: was the damaged page detected, on read, at the right place -- and nowhere
+        else? For an index (NL-I-02) also: did any read through it return wrong rows, and does
+        REINDEX restore it?
 
         Every value comes from an observation that could have gone the other way: the read the
         harness made, the engine's own checker run on the damaged relation, the engine's own
@@ -1173,6 +1184,8 @@ class TestOrchestrator:
             m["detection_identifies_block"] = (detected and first.get("block") == block
                                                and first.get("relation_path") == path)
             m["detection_repeatable"] = all(a.get("sqlstate") in sqlstates for a in attempts)
+        if self._corrupts_index:
+            m.update(self._measure_index_reads(attempts, sqlstates))
 
         relation = injected.get("relation")
         try:
@@ -1217,6 +1230,86 @@ class TestOrchestrator:
         self.disclosures.append(
             "corruption_count includes the checksum failures this scenario caused on purpose; "
             "damage elsewhere is judged by corruption_outside_target and structural_integrity_errors.")
+        if self._corrupts_index:
+            # after every observation of the damage: the repair destroys the evidence
+            m.update(await self._measure_index_rebuild(injected))
+        return m
+
+    def _measure_index_reads(self, attempts: list[dict[str, Any]], sqlstates: tuple[str, ...]) -> dict[str, Any]:
+        """NL-I-02 "no wrong results returned first": each read through the damaged index either
+        failed with the corruption error or returned exactly the rows written. A read the engine
+        did not serve from that index, or that failed for another reason, cannot say."""
+        m: dict[str, Any] = {}
+        if not attempts:
+            m["wrong_results_returned"] = NOT_MEASURED
+            self.not_measured["wrong_results_returned"] = "the table could not be read through its index at all"
+            return m
+        undecided = [a for a in attempts
+                     if a.get("sqlstate") not in sqlstates and not (a.get("error") is None and a.get("used_index") is True)]
+        if undecided:
+            a = undecided[0]
+            m["wrong_results_returned"] = NOT_MEASURED
+            self.not_measured["wrong_results_returned"] = (
+                "a read neither failed with the corruption error nor was served from the index "
+                f"(used_index={a.get('used_index')}, plan={a.get('plan')}, error={a.get('sqlstate') or a.get('error')})")
+        else:
+            m["wrong_results_returned"] = sum(1 for a in attempts
+                                              if a.get("error") is None and not a.get("matches_written"))
+        return m
+
+    async def _measure_index_rebuild(self, injected: dict[str, Any]) -> dict[str, Any]:
+        """NL-I-02 "REINDEX restores": the rebuild succeeded, a read through the rebuilt index
+        returns exactly the rows written, and the checker -- table with its index, every row
+        cross-checked against the index -- runs clean. All three, from the engine itself."""
+        m: dict[str, Any] = {}
+        rebuild: dict[str, Any] = {}
+        self.facts["index_rebuild"] = rebuild
+        try:
+            rebuild["reindex"] = await self.adapter.rebuild_corruption_target()
+        except Exception as exc:  # noqa: BLE001 -- could not tell either way
+            rebuild["reindex"] = {"ok": None, "error": f"{type(exc).__name__}: {exc}"}
+        reindex = rebuild["reindex"]
+        if reindex.get("ok") is None:
+            m["reindex_restores"] = NOT_MEASURED
+            self.not_measured["reindex_restores"] = f"REINDEX could not be run: {reindex.get('error')}"
+            return m
+        if not reindex["ok"]:
+            m["reindex_restores"] = False
+            return m
+        m["reindex_duration_s"] = reindex.get("duration_s")
+
+        try:
+            after = (await self.adapter.read_index_target(attempts=1)).get("attempts") or [{}]
+        except Exception as exc:  # noqa: BLE001
+            after = [{"error": f"{type(exc).__name__}: {exc}", "used_index": None}]
+        rebuild["read_after"] = after[0]
+        table = injected.get("table") or injected.get("relation")
+        try:
+            rebuild["amcheck_after"] = await self.adapter.amcheck_relation(
+                table, timeout_s=self.profile.phase_timeouts_s["validate"] / 4, heapallindexed=True)
+        except Exception as exc:  # noqa: BLE001
+            rebuild["amcheck_after"] = {"detected": None, "note": f"{type(exc).__name__}: {exc}"}
+
+        read_ok: bool | None
+        a = after[0]
+        if a.get("error") is None and a.get("used_index") is True:
+            read_ok = bool(a.get("matches_written"))
+        elif a.get("error") is not None and a.get("sqlstate") in self.adapter.corruption_sqlstates:
+            read_ok = False                       # the rebuilt index is still damaged
+        else:
+            read_ok = None
+        detected_after = rebuild["amcheck_after"].get("detected")
+        check_ok = None if detected_after is None else not detected_after
+        if read_ok is False or check_ok is False:
+            m["reindex_restores"] = False
+        elif read_ok is None or check_ok is None:
+            m["reindex_restores"] = NOT_MEASURED
+            self.not_measured["reindex_restores"] = (
+                "after REINDEX, " + ("the read through the index could not say" if read_ok is None
+                                     else "the structural check could not say")
+                + f" (read: {a}, check: {rebuild['amcheck_after'].get('note') or rebuild['amcheck_after'].get('output', '')[:200]})")
+        else:
+            m["reindex_restores"] = True
         return m
 
     # measure name -> key in the adapter's verification result, per `during` operation

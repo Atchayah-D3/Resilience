@@ -139,6 +139,10 @@ class Workload(_Model):
 # progress, then injects; which scenario asked is never consulted -- only this field.
 FaultDuring = Literal["checkpoint", "large_transaction", "concurrent_index_build", "autovacuum_worker"]
 
+# What a data_corruption fault damages (Framework §10.4): NL-I-01 a heap page, NL-I-02 a btree
+# file. Absent means heap. The adapter owns the relation; the catalog only says which kind.
+CorruptionRelationKind = Literal["heap", "btree_index"]
+
 
 class Fault(_Model):
     type: FaultType
@@ -146,6 +150,7 @@ class Fault(_Model):
     target: FaultTarget
     duration: Literal["permanent"] | Annotated[float, Field(gt=0)] = "permanent"
     during: FaultDuring | None = None
+    relation_kind: CorruptionRelationKind | None = None
 
     @model_validator(mode="after")
     def _driver_section(self) -> Fault:
@@ -154,6 +159,8 @@ class Fault(_Model):
             raise ValueError(
                 f"fault.driver for {self.type} must be the env-profile section {expected!r}, got {self.driver!r}"
             )
+        if self.relation_kind is not None and self.type != "data_corruption":
+            raise ValueError("fault.relation_kind is only defined for data_corruption")
         return self
 
 

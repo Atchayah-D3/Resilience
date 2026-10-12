@@ -58,6 +58,8 @@ class FaultInjector(ABC):
         # adapter: {"pid", "parent_pid", "title_marker"}. Generic -- the driver re-checks
         # parent and title before acting. Set per attempt by the orchestrator, cleared after.
         self.kill_target: Mapping[str, Any] | None = None
+        # data_corruption: what kind of relation the fault damages (catalog fault.relation_kind)
+        self.corruption_kind: str = "heap"
 
     async def confirm(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
         """After recovery: independent evidence that the fault took effect, beyond the

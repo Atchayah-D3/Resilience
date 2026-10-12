@@ -283,10 +283,15 @@ class BaseDatabaseAdapter(ABC):
     # Error codes this engine raises when a read finds a corrupted page.
     corruption_sqlstates: tuple[str, ...] = ()
 
-    async def prepare_corruption_target(self) -> dict[str, Any]:
+    async def prepare_corruption_target(self, kind: str = "heap") -> dict[str, Any]:
         """Create (or recreate) the harness-owned relation the fault will corrupt, and say
         where one of its populated pages lives on disk: `relation`, `relation_path` (relative
-        to the data directory), `filenode`, `block`, `block_size`, `byte_in_page`, `rows`."""
+        to the data directory), `filenode`, `block`, `block_size`, `byte_in_page`, `rows`.
+
+        `kind` is the catalog's fault.relation_kind (`heap`, `btree_index`). For an index the
+        target also names `table` (the owning table, which revert drops), `integrity_exclusions`
+        and a `page_check` -- {byte_in_page, mask, equals, meaning} -- that the page's own bytes
+        must satisfy, read with the database down, before anything is written."""
         raise NotImplementedError(f"{type(self).__name__} cannot host a corruption target")
 
     async def read_corruption_target(self, attempts: int = 2) -> dict[str, Any]:
@@ -295,9 +300,23 @@ class BaseDatabaseAdapter(ABC):
         `block` / `relation_path` the error names)."""
         raise NotImplementedError(f"{type(self).__name__} cannot read a corruption target")
 
-    async def amcheck_relation(self, relation: str, timeout_s: float) -> dict[str, Any]:
+    async def read_index_target(self, attempts: int = 2) -> dict[str, Any]:
+        """Read the corruption target's table THROUGH its index, `attempts` times on fresh
+        connections. Each attempt records `used_index` (the plan was shown to scan that index;
+        None when planning itself failed), and either the error (`sqlstate`, `message`, `block`,
+        `relation_path`) or `rows` and `matches_written` (exactly the rows written)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot read an index target")
+
+    async def rebuild_corruption_target(self) -> dict[str, Any]:
+        """The engine's documented repair for a damaged index (REINDEX): {ok, duration_s,
+        error, relation_path_after}."""
+        raise NotImplementedError(f"{type(self).__name__} cannot rebuild a corruption target")
+
+    async def amcheck_relation(self, relation: str, timeout_s: float, *,
+                               heapallindexed: bool = False) -> dict[str, Any]:
         """The engine's structural checker on ONE relation. `detected`: True when it reported
-        the relation damaged, False when it ran clean, None when it could not tell."""
+        the relation damaged, False when it ran clean, None when it could not tell.
+        `heapallindexed`: also verify every table row is present in the table's indexes."""
         return {"detected": None, "note": f"{type(self).__name__} has no structural checker"}
 
     def corruption_log_locations(self, lines: Sequence[str]) -> list[tuple[int, str]]:

@@ -158,6 +158,21 @@ def render_summary(r: dict[str, Any]) -> str:
             f"  failures in the server log: {facts.get('corruption_log_locations')}",
             f"  whole-database check left out: {(facts.get('integrity_check') or {}).get('excluded_relations')}",
         ]
+        if corrupted.get("relation_kind") == "btree_index":
+            rebuild = facts.get("index_rebuild") or {}
+            reindex = rebuild.get("reindex") or {}
+            after = rebuild.get("read_after") or {}
+            lines += [
+                f"  leaf-page check before the write: {corrupted.get('page_check')}",
+                "  reads through the index: " + "; ".join(
+                    f"used_index={a.get('used_index')} "
+                    + (f"{a.get('sqlstate')}" if a.get("error") else f"{a.get('rows')} rows, matches={a.get('matches_written')}")
+                    for a in attempts),
+                f"  REINDEX: ok={reindex.get('ok')} in {reindex.get('duration_s')} s {reindex.get('error') or ''}",
+                f"  read after REINDEX: used_index={after.get('used_index')} rows={after.get('rows')} "
+                f"matches={after.get('matches_written')} {after.get('sqlstate') or ''}",
+                f"  pg_amcheck --heapallindexed after REINDEX: detected={(rebuild.get('amcheck_after') or {}).get('detected')}",
+            ]
     if r.get("measured"):
         rendered = []
         for k, v in sorted(r["measured"].items()):
