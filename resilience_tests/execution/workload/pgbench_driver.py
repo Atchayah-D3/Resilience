@@ -105,7 +105,10 @@ def probe_pgbench(path: str, server_major: str | int) -> str:
     try:
         res = subprocess.run([resolved, "--version"], capture_output=True, text=True, check=True)
     except Exception as exc:
-        raise UnsupportedWorkload(f"failed to run pgbench --version on {path!r}: {exc}") from exc
+        raise UnsupportedWorkload(
+            f"failed to run pgbench --version on {path!r} ({resolved}): {exc}. Set workload.pgbench_bin in the "
+            "environment profile to the full path of a pgbench of the server's major version (on Debian, "
+            "/usr/bin/pgbench is pg_wrapper, which fails without a matching local cluster)") from exc
 
     output = (res.stdout or res.stderr).strip()
     pg_major = extract_major_version(output)
