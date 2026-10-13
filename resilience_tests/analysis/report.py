@@ -164,6 +164,11 @@ def render_summary(r: dict[str, Any]) -> str:
             after = rebuild.get("read_after") or {}
             lines += [
                 f"  leaf-page check before the write: {corrupted.get('page_check')}",
+                "  entry corrupted: " + (
+                    f"line pointer {located.get('item')} of {located.get('items')}, key {located.get('key')}, "
+                    f"heap row pointer {tuple(located.get('heap_tid') or ())} -> "
+                    f"{tuple(located.get('heap_tid_after') or ())}"
+                    if (located := corrupted.get("located")) else "not located"),
                 "  reads through the index: " + "; ".join(
                     f"used_index={a.get('used_index')} "
                     + (f"{a.get('sqlstate')}" if a.get("error") else f"{a.get('rows')} rows, matches={a.get('matches_written')}")

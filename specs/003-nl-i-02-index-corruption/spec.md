@@ -26,6 +26,15 @@ precise"; Arch §10.1 names pg_amcheck for NL-I-01/02/07).
   `data_checksums=on` (required, Framework §16.2) the damage is exposed on read; amcheck,
   REINDEX and the "no wrong results" rule are then measured on it.
 
+### Session 2026-10-13
+
+- Q: A read that walks the damaged leaf and returns the right rows without an error passes
+  "no wrong results" -- is that acceptable? → A: No. It means the engine served a corrupted
+  page unverified (silent corruption, Framework §16.2). `detection_identifies_block == true` is
+  gated (NEEDS SIGN-OFF: the Framework row does not name it), and the byte flipped is located
+  from the page itself: the low byte of a data entry's heap row pointer, so an unverified read
+  would fetch another row or none -- a wrong result the read can see.
+
 ## User Scenarios & Testing *(mandatory)*
 
 The "user" is the database reliability engineer certifying a ShaktiDB / DistDB node, and the
@@ -99,6 +108,10 @@ the database must stay intact.
   correct answer (NOT_MEASURED).
 - An unclean stop: aborted before any write (crash recovery could restore the page).
 - The page is not a leaf page (layout or byte order differs): aborted before any write.
+- No plain data entry can be located in the page (unexpected header bounds, special size,
+  posting-list entry, dead line pointer, key not written): aborted before any write.
+- Reads through the index return the right rows without an error: `detection_identifies_block`
+  fails -- the engine read the damaged page without noticing.
 - The harness dies after the flip: the kill switch drops the corruption table (DROP never
   reads its pages), taking the index with it.
 
@@ -113,7 +126,9 @@ the database must stay intact.
   `resilience`), choose a populated leaf page in the index file, and flip one byte in it with
   the database cleanly shut down.
 - **FR-003**: Before writing, the driver MUST confirm the page is a btree leaf page from its
-  on-disk bytes; after writing, offline checksum verification MUST report exactly one failure
+  on-disk bytes and locate the byte from the page itself -- the low byte of the heap row
+  pointer (offset number) of a data entry, found through the page's line pointers, with the
+  page read and the single-byte read agreeing; after writing, offline checksum verification MUST report exactly one failure
   at that block of that file. Otherwise FaultNotLanded (run aborted, still reverted).
 - **FR-004**: Validate MUST read the table through the index (index scan forced, and the plan
   confirmed to use that index) on fresh connections, recording per attempt the error code and
@@ -158,6 +173,7 @@ the database must stay intact.
   reused. NEEDS SIGN-OFF.
 - The target is little-endian (x86-64); the leaf-page check fails closed (abort) otherwise.
 - The `amcheck` extension is installed by the operator (as for every scenario, Framework §16.3).
-- `corruption_detected_on_read`, `detection_identifies_block`, `checksum_failure_reported`,
-  `reindex_duration_s` and `corruption_count` are reported, not gated: the Framework row does
-  not require them for NL-I-02.
+- `detection_identifies_block` is gated (Framework §16.2; NEEDS SIGN-OFF -- the row does not
+  name it): without it "no wrong results" can pass on a read that never noticed the damage.
+  `corruption_detected_on_read`, `checksum_failure_reported`, `reindex_duration_s` and
+  `corruption_count` are reported, not gated.

@@ -4,16 +4,27 @@
 #
 # The same precise fault as NL-I-01 (Arch §5 "targeted byte writes"), aimed at a btree index
 # (fault.relation_kind): one byte in one LEAF page of an index the harness builds on its own
-# table is inverted with the database cleanly shut down. Before the write, the page's own
-# bytes must show it is a leaf page; after it, pg_checksums must report a checksum failure at
-# exactly that block of the index file (Arch §10.1). Otherwise the run is aborted -- nothing is
-# scored against a fault that did not land. data_checksums=on is required (Framework §16.2).
+# table is inverted with the database cleanly shut down. The byte is not chosen blind: with the
+# database down, the page's own bytes must show it is a leaf page, and its line pointers locate
+# a real data entry in it; the byte flipped is the low byte of that entry's heap row pointer
+# (its offset number). An engine that served the page without verifying it would therefore
+# return a missing or a different row -- a wrong result the read can see. After the write,
+# pg_checksums must report a checksum failure at exactly that block of the index file
+# (Arch §10.1). Otherwise the run is aborted -- nothing is scored against a fault that did not
+# land. data_checksums=on is required (Framework §16.2).
 #
 # What each acceptance rule proves, and why it is needed against a false pass:
 #   wrong_results_returned        reads THROUGH THE INDEX (plan checked) either failed with the
 #                                 data-corruption error or returned exactly the rows written. A
 #                                 read the planner served without the index cannot pass this:
 #                                 it is NOT_MEASURED, never 0 ("no wrong results returned first").
+#   detection_identifies_block    the first read through the index failed with the data-corruption
+#                                 error naming exactly the damaged block of the index file. Without
+#                                 it, a read that walked the damaged page and returned the right
+#                                 rows would pass "no wrong results" while the engine read a
+#                                 corrupted page unnoticed -- the silent corruption that checksums
+#                                 exist to prevent (Framework §16.2). The Framework row does not
+#                                 name this rule: NEEDS SIGN-OFF.
 #   amcheck_detects_target        the structural checker, run on the damaged index alone, reports
 #                                 it ("amcheck detects it", Arch §10.1).
 #   reindex_restores              REINDEX succeeded, a read through the rebuilt index returns
@@ -24,8 +35,8 @@
 #                                 corruption table and its index are checked on their own instead.
 #   rpo_txn                       the fault's clean stop and start lost no acknowledged commit.
 #
-# Reported, not gated (the Framework row does not ask for them): corruption_detected_on_read,
-# detection_identifies_block, detection_repeatable, checksum_failure_reported,
+# Reported, not gated (the Framework row does not ask for them): corruption_detected_on_read
+# (implied by detection_identifies_block), detection_repeatable, checksum_failure_reported,
 # reindex_duration_s, and corruption_count (it includes the failures caused on purpose).
 # The Framework gives no steady-state or workload numbers for this row; the values below match
 # NL-I-01. NEEDS SIGN-OFF.
@@ -76,7 +87,7 @@ measure:
   - reindex_restores
   - reindex_duration_s           # reported
   - corruption_detected_on_read  # reported
-  - detection_identifies_block   # reported
+  - detection_identifies_block   # gated: the read reached the damaged page and refused it
   - detection_repeatable         # reported
   - checksum_failure_reported    # reported
   - corruption_outside_target
@@ -87,6 +98,7 @@ measure:
 
 accept:
   - wrong_results_returned == 0
+  - detection_identifies_block == true   # Framework §16.2; NEEDS SIGN-OFF (not in the row)
   - amcheck_detects_target == true
   - reindex_restores == true
   - corruption_outside_target == 0
@@ -98,9 +110,10 @@ priority: P0
 see_also: [NL-I-01]
 
 description: >
-  One byte in one leaf page of a harness-owned btree index is corrupted with the database
-  cleanly shut down, the corruption is confirmed by offline checksum verification at exactly
-  that block, and the database is started again. Reads through the index must fail rather than
-  return wrong rows, the structural checker must report the index damaged, and REINDEX must
+  One byte -- the heap row pointer of a data entry -- in one leaf page of a harness-owned btree
+  index is corrupted with the database cleanly shut down, the corruption is confirmed by
+  offline checksum verification at exactly that block, and the database is started again.
+  Reads through the index must fail at that block rather than return wrong rows, the
+  structural checker must report the index damaged, and REINDEX must
   restore it -- proven by a correct read through the rebuilt index and a clean heap-to-index
   check -- with nothing else damaged (Framework §10.4, Arch §10.1).

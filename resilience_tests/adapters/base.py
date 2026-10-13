@@ -291,8 +291,16 @@ class BaseDatabaseAdapter(ABC):
         `kind` is the catalog's fault.relation_kind (`heap`, `btree_index`). For an index the
         target also names `table` (the owning table, which revert drops), `integrity_exclusions`
         and a `page_check` -- {byte_in_page, mask, equals, meaning} -- that the page's own bytes
-        must satisfy, read with the database down, before anything is written."""
+        must satisfy, read with the database down, before anything is written. A target may
+        name `locate` (what it looks for) instead of `byte_in_page`: the byte is then chosen
+        from the page itself by `locate_corruption_byte`."""
         raise NotImplementedError(f"{type(self).__name__} cannot host a corruption target")
+
+    def locate_corruption_byte(self, target: dict[str, Any], page: bytes) -> dict[str, Any]:
+        """For a target with `locate`: given the page's bytes (read with the database down),
+        return {byte_in_page, ...what was found}. Raises ValueError when the page is not what
+        the target expects -- the run is then aborted with no byte written."""
+        raise NotImplementedError(f"{type(self).__name__} cannot locate a byte in a page")
 
     async def read_corruption_target(self, attempts: int = 2) -> dict[str, Any]:
         """Read every page of the corruption target, `attempts` times on fresh connections.

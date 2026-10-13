@@ -21,6 +21,7 @@ async def prepare_corruption_target(self, kind: str = "heap") -> dict   # + tabl
 async def read_index_target(self, attempts: int = 2) -> dict            # {"attempts": [...]}, see data-model
 async def rebuild_corruption_target(self) -> dict                       # {"ok", "duration_s", "error", "relation_path_after"}
 async def amcheck_relation(self, relation: str, timeout_s: float, *, heapallindexed: bool = False) -> dict
+def locate_corruption_byte(self, target: dict, page: bytes) -> dict     # {"byte_in_page", ...}; ValueError -> abort
 ```
 
 Base implementations raise NotImplementedError (refuse). An unknown `kind` raises
@@ -30,5 +31,7 @@ DriverNotAvailable-equivalent ValueError in the adapter, which the driver's pref
 
 `FaultInjector.corruption_kind: str = "heap"`, set by the orchestrator from
 `fault.relation_kind`. The corruption driver passes it to `prepare_corruption_target`, verifies
-`page_check` after the clean stop and before the write, and reverts with
+`page_check` after the clean stop and before the write; for a target with `locate` it reads
+the whole page (`od -v`), asks `locate_corruption_byte`, and aborts unless the single-byte read
+agrees with the page read. It reverts with
 `DROP TABLE IF EXISTS <table or relation>` (harness schema only).

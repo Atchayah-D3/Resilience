@@ -13,7 +13,9 @@ back for the run to read. Precision and proof come before anything is measured:
                  recovery could restore the page from a full-page image in the WAL and quietly
                  undo the fault -- a run that then "passes" would have tested nothing.
   3. corrupt     if the adapter gave a page check (an index: "this is a leaf page"), the page's
-                 own bytes must satisfy it first. Then the byte is read, inverted, written in
+                 own bytes must satisfy it first. If the target names no fixed byte but what to
+                 `locate` (an index: a data entry's heap row pointer), the whole page is read and
+                 the adapter picks the byte from it. Then the byte is read, inverted, written in
                  place and forced to disk, then read back: it must have changed
   4. verify      pg_checksums (Arch §10.1, offline checksum verification) must report a
                  checksum failure at exactly that block of exactly that relation; its own output
@@ -116,31 +118,48 @@ class OsSshCorruptionDriver(OsSshProcessDriver):
                 raise DriverNotAvailable(f"refusing to corrupt {name}: not a harness-owned relation")
         if not 0 < int(target["block"]) < int(target["pages"]):
             raise DriverNotAvailable(f"block {target['block']} is not a populated page of {target['relation']}")
-        if not 24 <= int(target["byte_in_page"]) < int(target["block_size"]):  # never the page header
-            raise DriverNotAvailable(f"byte {target['byte_in_page']} is outside the page's tuple area")
-        if self._offset(target) >= SEGMENT_BYTES:
+        if target.get("byte_in_page") is None:
+            if not target.get("locate"):
+                raise DriverNotAvailable("the corruption target names neither a byte nor what to locate")
+        else:
+            self._check_byte(target, int(target["byte_in_page"]), DriverNotAvailable)
+        if self._page_end(target) > SEGMENT_BYTES:
             raise DriverNotAvailable("the chosen page is beyond the relation's first segment file")
         check = target.get("page_check")
         if check is not None and not 0 <= int(check["byte_in_page"]) < int(target["block_size"]):
             raise DriverNotAvailable(f"page check byte {check['byte_in_page']} is outside the page")
 
     @staticmethod
-    def _offset(target: Mapping[str, Any]) -> int:
-        return int(target["block"]) * int(target["block_size"]) + int(target["byte_in_page"])
+    def _check_byte(target: Mapping[str, Any], byte_in_page: int, error: type[Exception]) -> None:
+        if not 24 <= byte_in_page < int(target["block_size"]):  # never the page header
+            raise error(f"byte {byte_in_page} is outside the page's tuple area")
+
+    @staticmethod
+    def _page_start(target: Mapping[str, Any]) -> int:
+        return int(target["block"]) * int(target["block_size"])
+
+    @classmethod
+    def _page_end(cls, target: Mapping[str, Any]) -> int:
+        return cls._page_start(target) + int(target["block_size"])
+
+    @classmethod
+    def _offset(cls, target: Mapping[str, Any]) -> int:
+        return cls._page_start(target) + int(target["byte_in_page"])
 
     async def inject(self, node: Node) -> dict[str, Any]:
         target = getattr(self, "_target", None)
         if target is None:
             raise DriverNotAvailable("data_corruption needs preflight to have located its target")
         path = f"{node.pgdata.rstrip('/')}/{target['relation_path']}"
-        offset = self._offset(target)
-        read_byte = as_user(node.os_user, f"od -An -tx1 -j {offset} -N1 {q(path)}")
+        located = target.get("byte_in_page") is None
+        # until the byte is located, the whole page must be inside the file
+        offset = self._page_end(target) - 1 if located else self._offset(target)
         kind = target.get("relation_kind", "heap")
         detail: dict[str, Any] = {"action": f"flip one byte in one {'btree leaf' if kind == 'btree_index' else 'heap'} page",
                                   "relation": target["relation"], "relation_kind": kind,
                                   "table": target.get("table", target["relation"]),
                                   "relation_path": target["relation_path"], "file": path,
-                                  "block": target["block"], "byte_offset": offset,
+                                  "block": target["block"], "byte_offset": None if located else offset,
                                   "integrity_exclusions": list(target.get("integrity_exclusions")
                                                                or [target["relation"]])}
         async with RemoteHost(node.ssh) as host:
@@ -170,9 +189,30 @@ class OsSshCorruptionDriver(OsSshProcessDriver):
                     raise FaultNotLanded(f"block {target['block']} of {path} is not a {check['meaning']} "
                                          f"(byte {at} reads {seen!r}); no byte was written", detail)
 
+            page: bytes | None = None
+            if located:
+                # the page as it is on disk, with the database down; the adapter picks the byte
+                bs = int(target["block_size"])
+                dump = (await host.run(as_user(node.os_user, f"od -An -v -tx1 -j {self._page_start(target)} "
+                                                              f"-N {bs} {q(path)}"), timeout_s=SSH_TIMEOUT_S)).stdout
+                try:
+                    page = bytes.fromhex("".join(dump.split()))
+                    found = self._database_adapter(node).locate_corruption_byte(dict(target), page)
+                    self._check_byte(target, int(found["byte_in_page"]), ValueError)
+                except ValueError as exc:
+                    raise FaultNotLanded(f"could not locate the byte to corrupt in block {target['block']} of "
+                                         f"{path}: {exc}; no byte was written", detail) from exc
+                detail["located"] = found
+                offset = self._page_start(target) + int(found["byte_in_page"])
+                detail["byte_offset"] = offset
+
+            read_byte = as_user(node.os_user, f"od -An -tx1 -j {offset} -N1 {q(path)}")
             original = (await host.run(read_byte, timeout_s=SSH_TIMEOUT_S)).stdout.strip()
             if not re.fullmatch(r"[0-9a-f]{2}", original):
                 raise FaultNotLanded(f"could not read the byte at {offset} of {path}: {original!r}", detail)
+            if page is not None and original != f"{page[offset - self._page_start(target)]:02x}":
+                raise FaultNotLanded(f"the byte at {offset} reads {original} but the page read showed "
+                                     f"{page[offset - self._page_start(target)]:02x}; no byte was written", detail)
             flipped = int(original, 16) ^ 0xFF
             detail.update(original_byte=original, written_byte=f"{flipped:02x}")
             await host.run(as_user(node.os_user, f"printf '\\{flipped:03o}' | dd of={q(path)} bs=1 "

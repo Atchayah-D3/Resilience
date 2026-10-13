@@ -47,3 +47,9 @@ description: "Task list for NL-I-02 Index Corruption"
 - [ ] T018 Live run NL-I-02 on e2-dedicated-vm passes; evidence dir referenced in the PR
 - [ ] T019 Live re-run NL-I-01 (shared driver/adapter code) passes
 - [ ] T020 CLAUDE.md owner table: add NL-I-02 to its owner
+
+## Phase 7: Review fixes (2026-10-13)
+
+- [X] T021 Gate `detection_identifies_block == true` in catalog/NL/NL-I-02.yaml (Framework §16.2; NEEDS SIGN-OFF): a read that walked the damaged leaf and returned the right rows unverified passed before
+- [X] T022 Locate the flipped byte from the page: `locate_corruption_byte` in resilience_tests/adapters/postgresql/adapter.py (header bounds, special size, leaf/level 0, middle data entry, plain entry, key written; low byte of the heap row pointer's offset number); driver reads the page with `od -v` after the leaf check and aborts unless the single-byte read agrees (resilience_tests/execution/injectors/corruption.py); report line for the entry
+- [X] T023 Tests (tests/test_index_corruption.py): locator happy path and rightmost page, refusals, driver abort before any write, page/byte disagreement, the undetected-read false pass, a failure at another block. Local: 50 passed; full suite 386 passed, 2 failed (the real-Elle tests, local Java -- as before), catalog checks pass; mutation check: each protection removed makes its tests fail

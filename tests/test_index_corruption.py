@@ -3,8 +3,10 @@
 Built on the NL-I-01 data_corruption fault; only what NL-I-02 adds is tested here:
   the catalog    fault.relation_kind picks the index, and only for data_corruption;
   the driver     the page is PROVEN a btree leaf from its own bytes before any write, the
+                 byte is located from the whole page (a data entry's heap row pointer), the
                  exclusions cover table and index, revert drops the table;
-  the adapter    the index target, the forced and plan-checked index read, REINDEX;
+  the adapter    the index target, the page parser that locates the byte, the forced and
+                 plan-checked index read, REINDEX;
   the run        every acceptance rule can fail -- one test per false-pass path.
 """
 
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 import time
 from typing import Any
 
@@ -39,9 +42,33 @@ BLOCK, PATH, PAGES, BS = 19, "base/16384/16410", 57, 8192
 ROWS = 20_000
 LEAF_CHECK = {"byte_in_page": BS - 4, "mask": 1, "equals": 1, "meaning": "btree leaf page (BTP_LEAF set in btpo_flags)"}
 TARGET = {"relation": INDEX, "relation_kind": "btree_index", "table": TABLE, "relation_path": PATH,
-          "filenode": 16410, "block": BLOCK, "pages": PAGES, "block_size": BS, "byte_in_page": BS - 20,
+          "filenode": 16410, "block": BLOCK, "pages": PAGES, "block_size": BS,
+          "locate": "the low byte of the heap row pointer (offset number) of a data entry",
           "page_check": LEAF_CHECK, "rows": ROWS, "integrity_exclusions": [TABLE, INDEX]}
 LEAF_FLAG_OFFSET = BLOCK * BS + BS - 4
+
+
+def leaf_page(*, entries=10, right=20, level=0, flags=0x01, special=BS - 16, posid=0x48, t_info=16,
+              lp_flags=1, first_key=7000) -> bytes:
+    """A btree leaf page as PostgreSQL lays it out: header, line pointers, 16-byte int4 entries
+    packed down from the special space (line pointer 1 highest), BTPageOpaqueData at the end.
+    With a right sibling, line pointer 1 is the high key and the data entries start at 2."""
+    page = bytearray(BS)
+    items = entries + (1 if right else 0)
+    lower, upper = 24 + 4 * items, special - 16 * items
+    struct.pack_into("<HHH", page, 12, lower, upper, special)
+    struct.pack_into("<IIIH", page, BS - 16, 0, right, level, flags)
+    for i in range(items):
+        off = special - 16 * (i + 1)
+        struct.pack_into("<I", page, 24 + 4 * i, off | (lp_flags << 15) | (16 << 17))
+        struct.pack_into("<HHHHi", page, off, 0, 45, posid, t_info, first_key + i)
+    return bytes(page)
+
+
+# with a right sibling and 10 data entries: line pointers 2..11, the middle one is 6, 6 * 16
+# bytes down from the special space; its offset number's low byte is 4 bytes into it
+LOCATED_ITEM, LOCATED_KEY = 6, 7005
+LOCATED_BYTE = BS - 16 - 16 * LOCATED_ITEM + 4
 CHECKSUM_FAIL = (f'pg_checksums: error: checksum verification failed in file "{NODE.pgdata}/{PATH}", '
                  f"block {BLOCK}: calculated checksum 1A2B but block contains 3C4D\nBad checksums:  1\n")
 INVALID_PAGE = f"invalid page in block {BLOCK} of relation {PATH}"
@@ -55,7 +82,8 @@ def test_nl_i_02_encodes_the_framework_row():
     assert (sc.category, sc.priority, sc.fault.type, sc.fault.relation_kind) == \
         ("NL-I", "P0", "data_corruption", "btree_index")
     assert {"page_checksums", "structural_integrity_check"} <= set(sc.requires)
-    assert set(sc.accept) == {"wrong_results_returned == 0", "amcheck_detects_target == true",
+    assert set(sc.accept) == {"wrong_results_returned == 0", "detection_identifies_block == true",
+                              "amcheck_detects_target == true",
                               "reindex_restores == true", "corruption_outside_target == 0",
                               "structural_integrity_errors == 0", "rpo_txn == 0"}
     assert not [a for a in sc.accept if "corruption_count" in a]     # failures caused on purpose
@@ -73,16 +101,22 @@ def test_relation_kind_is_only_defined_for_data_corruption():
 
 
 class IndexHost(TargetHost):
-    """The fake target, with the btree page's flags byte readable at its own offset."""
+    """The fake target, with the btree page's flags byte readable at its own offset and the
+    whole page readable as od prints it. The single byte the base fake serves (48) is the
+    located entry's offset-number low byte in the default page."""
 
-    def __init__(self, calls, *, flags="01", **kw):
+    def __init__(self, calls, *, flags="01", page=None, **kw):
         super().__init__(calls, checksums=CHECKSUM_FAIL, **kw)
-        self.flags = flags
+        self.flags, self.page = flags, leaf_page() if page is None else page
 
     async def run(self, command, *, timeout_s, check=True):
         if "od -An" in command and f"-j {LEAF_FLAG_OFFSET} " in command:
             self.calls.append(command)
             return RemoteResult(0, f" {self.flags}\n", "")
+        if "od -An -v" in command and f"-j {BLOCK * BS} -N {BS} " in command:
+            self.calls.append(command)
+            rows = [" " + " ".join(f"{b:02x}" for b in self.page[i:i + 16]) for i in range(0, len(self.page), 16)]
+            return RemoteResult(0, "\n".join(rows) + "\n", "")
         return await super().run(command, timeout_s=timeout_s, check=check)
 
 
@@ -110,6 +144,42 @@ def test_the_leaf_page_is_proven_before_the_byte_is_flipped(monkeypatch):
     assert host.state["byte"] == "b7" and host.state["running"] is True
 
 
+def test_the_byte_flipped_is_a_real_entrys_heap_row_pointer_found_in_the_page(monkeypatch):
+    driver, calls, host = index_driver(monkeypatch)
+    detail = asyncio.run(driver.inject(NODE))
+    offset = BLOCK * BS + LOCATED_BYTE
+    assert detail["byte_offset"] == offset
+    assert {k: detail["located"][k] for k in ("item", "items", "key", "heap_tid", "heap_tid_after")} == \
+        {"item": LOCATED_ITEM, "items": 11, "key": LOCATED_KEY, "heap_tid": [45, 0x48], "heap_tid_after": [45, 0xB7]}
+    assert (detail["original_byte"], detail["written_byte"]) == ("48", "b7")
+    page_read = next(i for i, c in enumerate(calls) if "od -An -v" in c)
+    stop = next(i for i, c in enumerate(calls) if "systemctl stop" in c)
+    write = next(c for c in calls if "dd of=" in c)
+    assert stop < page_read < calls.index(write)     # located with the database down, before the write
+    assert f"seek={offset} " in write
+
+
+@pytest.mark.parametrize("page,why", [
+    (leaf_page(posid=0x48, t_info=16 | 0x2000), "not a plain index entry"),   # posting list
+    (leaf_page(lp_flags=3), "not a normal entry"),                             # dead line pointer
+    (leaf_page(special=BS - 24), "not a btree page"),
+    (leaf_page(first_key=900_000), "not one of the rows written"),
+    (leaf_page()[:-1], "expected 8192"),                                       # short read
+])
+def test_a_page_the_byte_cannot_be_located_in_aborts_before_any_write(monkeypatch, page, why):
+    driver, calls, host = index_driver(monkeypatch, page=page)
+    with pytest.raises(FaultNotLanded, match=why):
+        asyncio.run(driver.inject(NODE))
+    assert not [c for c in calls if "dd of=" in c] and host.state["byte"] == "48"
+
+
+def test_a_byte_that_disagrees_with_the_page_read_aborts_before_any_write(monkeypatch):
+    driver, calls, host = index_driver(monkeypatch, page=leaf_page(posid=0x51))   # page says 51, file 48
+    with pytest.raises(FaultNotLanded, match="the page read showed 51"):
+        asyncio.run(driver.inject(NODE))
+    assert not [c for c in calls if "dd of=" in c]
+
+
 @pytest.mark.parametrize("flags", ["02", "00", "zz"])   # internal/root page, no flags, unreadable
 def test_a_page_that_is_not_a_leaf_aborts_before_any_byte_is_written(monkeypatch, flags):
     driver, calls, host = index_driver(monkeypatch, flags=flags)
@@ -125,6 +195,8 @@ def test_a_target_whose_table_is_not_harness_owned_is_refused():
         driver._check_target(NODE, TARGET | {"table": "public.orders"})
     with pytest.raises(DriverNotAvailable, match="outside the page"):
         driver._check_target(NODE, TARGET | {"page_check": LEAF_CHECK | {"byte_in_page": BS}})
+    with pytest.raises(DriverNotAvailable, match="neither a byte nor what to locate"):
+        driver._check_target(NODE, {k: v for k, v in TARGET.items() if k != "locate"})
 
 
 def test_preflight_asks_the_adapter_for_the_catalogs_relation_kind(monkeypatch):
@@ -214,6 +286,26 @@ def test_the_index_target_is_a_leaf_page_of_a_harness_index_built_after_the_load
     assert "autovacuum_enabled = false" in next(s for s in log if s.startswith("CREATE TABLE"))
     with pytest.raises(ValueError, match="no corruption target of kind 'toast'"):
         asyncio.run(adapter_with(log).prepare_corruption_target("toast"))
+
+
+def test_the_located_byte_is_the_offset_number_of_a_middle_data_entry():
+    adapter = PostgreSQLAdapter(NODE)
+    found = adapter.locate_corruption_byte(TARGET, leaf_page())
+    assert (found["byte_in_page"], found["item"], found["key"]) == (LOCATED_BYTE, LOCATED_ITEM, LOCATED_KEY)
+    # the rightmost leaf has no high key: its data entries start at line pointer 1
+    rightmost = adapter.locate_corruption_byte(TARGET, leaf_page(right=0))
+    assert (rightmost["item"], rightmost["items"]) == (1 + (10 - 1) // 2, 10)
+
+
+@pytest.mark.parametrize("page,why", [
+    (leaf_page(level=1), "not a leaf page"),
+    (leaf_page(flags=0x02), "not a leaf page"),                 # root, not leaf
+    (leaf_page(entries=0, right=20), "no data entry"),          # only a high key
+    (leaf_page(posid=0), "offset number 0"),
+])
+def test_the_locator_refuses_a_page_it_does_not_understand(page, why):
+    with pytest.raises(ValueError, match=why):
+        PostgreSQLAdapter(NODE).locate_corruption_byte(TARGET, page)
 
 
 def test_a_read_through_the_index_that_returns_the_rows_written():
@@ -371,11 +463,23 @@ def test_a_detected_and_restored_index_passes(env, damaged):
     assert any(TABLE in d and INDEX in d for d in results["disclosures"])
 
 
-def test_an_index_that_answers_correctly_despite_the_damage_is_not_a_wrong_result(env, damaged):
+def test_false_pass_reads_that_never_detect_the_damage_fail_even_with_the_right_rows(env, damaged):
+    # every read walks the damaged leaf; returning the right rows without an error means the
+    # engine served a corrupted page unverified. The checker's failure still puts the block in
+    # the log and amcheck still detects it -- only the detection rule stands in the way
     damaged["read"] = dict(GOOD_READ)
     results = run_nli02(env)
-    assert outcome(results, "wrong_results_returned == 0") == "pass", why(results)
-    assert results["measured"]["corruption_detected_on_read"] is False      # reported, not gated
+    assert results["status"] == "failed", why(results)
+    assert outcome(results, "wrong_results_returned == 0") == "pass"        # the rows were right
+    assert outcome(results, "detection_identifies_block == true") == "fail"
+    assert results["measured"]["corruption_detected_on_read"] is False
+
+
+def test_false_pass_a_read_failing_at_another_block_does_not_identify_the_damage(env, damaged):
+    damaged["read"] = ERROR_READ | {"block": BLOCK + 1, "message": f"invalid page in block {BLOCK + 1} of relation {PATH}"}
+    results = run_nli02(env)
+    assert results["status"] == "failed", why(results)
+    assert outcome(results, "detection_identifies_block == true") == "fail"
 
 
 def test_false_pass_wrong_rows_through_the_damaged_index_fail(env, damaged):

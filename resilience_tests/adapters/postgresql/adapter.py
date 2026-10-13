@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import shlex
+import struct
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -291,9 +292,11 @@ CORRUPTION_BYTE_FROM_PAGE_END = 64      # inside the tuple area, far from the pa
 # PostgreSQL: "invalid page in block 17 of relation base/16384/16400" (SQLSTATE XX001)
 _INVALID_PAGE_RE = re.compile(r"invalid page in block (\d+) of relation (\S+)")
 # NL-I-02 (relation_kind btree_index): a btree index on the same harness-owned table. Built
-# after the rows are loaded, so the build lays the leaves out in key order from block 1, with
-# the internal pages after them; a block a third of the way in is a leaf. That is proved, not
-# assumed: with the database down the driver reads the page's own flags first (page_check).
+# after the rows are loaded, so the build lays the leaves out in key order from block 1; an
+# internal page is allocated whenever a level above first needs one (the first one early, at
+# block 3), so a block a third of the way in is normally a leaf. That is proved, not assumed:
+# with the database down the driver reads the page's own flags first (page_check), then the
+# whole page, from which locate_corruption_byte picks the byte (a data entry's heap pointer).
 CORRUPTION_INDEX_NAME = "corruption_target_idx"
 CORRUPTION_INDEX = f"resilience.{CORRUPTION_INDEX_NAME}"
 CORRUPTION_INDEX_ROWS = 20_000         # ~55 leaf pages of int keys
@@ -302,7 +305,20 @@ CORRUPTION_INDEX_ROWS = 20_000         # ~55 leaf pages of int keys
 # and BTP_LEAF is bit 0. A big-endian target fails the check and the run aborts -- never guesses.
 BTREE_LEAF_FLAG_FROM_PAGE_END = 4
 BTREE_LEAF_FLAG = 0x01
-CORRUPTION_INDEX_BYTE_FROM_PAGE_END = 20   # the tuple area just below the special space
+# Page header (PageHeaderData, 24 bytes): pd_lower, pd_upper, pd_special are uint16 at 12, 14,
+# 16; the line pointer array starts at 24, 4 bytes each (lp_off:15, lp_flags:2, lp_len:15).
+PAGE_HEADER_BYTES = 24
+PAGE_BOUNDS_AT = 12
+LINE_POINTER_BYTES = 4
+LP_NORMAL = 1
+BTREE_SPECIAL_BYTES = 16              # btpo_prev, btpo_next, btpo_level (uint32), btpo_flags, cycleid
+# An index entry (IndexTupleData): t_tid = {bi_hi, bi_lo, ip_posid} (uint16 each), t_info
+# (uint16: size in the low 13 bits); the int key follows at byte 8. INDEX_ALT_TID_MASK marks a
+# posting-list or pivot entry, whose t_tid is not a heap row pointer -- such an entry is refused.
+INDEX_TUPLE_HEADER_BYTES = 8
+INDEX_SIZE_MASK = 0x1FFF
+INDEX_ALT_TID_MASK = 0x2000
+TID_OFFSET_NUMBER_AT = 4              # ip_posid; its low byte (little-endian) is the byte flipped
 # A full-range ordered read walks every leaf of the index, so it must reach the damaged page.
 # The scan types that would avoid the index are switched off for that session only.
 INDEX_READ_SQL = f"SELECT id FROM {CORRUPTION_TARGET} WHERE id >= 1 ORDER BY id"
@@ -615,7 +631,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             "block": pages // 3,
             "pages": pages,
             "block_size": block_size,
-            "byte_in_page": block_size - CORRUPTION_INDEX_BYTE_FROM_PAGE_END,
+            # no fixed byte: the driver reads the page with the database down and asks
+            # locate_corruption_byte, which finds a real entry from the page's own line pointers
+            "locate": "the low byte of the heap row pointer (offset number) of a data entry",
             "page_check": {"byte_in_page": block_size - BTREE_LEAF_FLAG_FROM_PAGE_END,
                            "mask": BTREE_LEAF_FLAG, "equals": BTREE_LEAF_FLAG,
                            "meaning": "btree leaf page (BTP_LEAF set in btpo_flags)"},
@@ -624,6 +642,46 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             # both; they are checked on their own after REINDEX (heapallindexed)
             "integrity_exclusions": [CORRUPTION_TARGET, CORRUPTION_INDEX],
         }
+
+    def locate_corruption_byte(self, target: dict[str, Any], page: bytes) -> dict[str, Any]:
+        """The byte to flip in a btree leaf page, from the page's own bytes: the low byte of the
+        heap row pointer's offset number of a data entry in the middle of the page. With that
+        byte changed, an index scan that used the page unverified would fetch a different heap
+        slot -- another row, or none -- so a wrong result is visible to the read. Every layout
+        fact used is checked against the page first; anything unexpected raises ValueError and
+        no byte is written."""
+        bs = int(target["block_size"])
+        if len(page) != bs:
+            raise ValueError(f"read {len(page)} bytes of the page, expected {bs}")
+        lower, upper, special = struct.unpack_from("<HHH", page, PAGE_BOUNDS_AT)
+        if special != bs - BTREE_SPECIAL_BYTES:
+            raise ValueError(f"pd_special is {special}, not {bs - BTREE_SPECIAL_BYTES}: not a btree page")
+        if not PAGE_HEADER_BYTES <= lower <= upper <= special:
+            raise ValueError(f"page bounds are inconsistent (lower {lower}, upper {upper}, special {special})")
+        _prev, right, level, flags = struct.unpack_from("<IIIH", page, special)
+        if not flags & BTREE_LEAF_FLAG or level != 0:
+            raise ValueError(f"not a leaf page (btpo_flags {flags:#06x}, level {level})")
+        items = (lower - PAGE_HEADER_BYTES) // LINE_POINTER_BYTES
+        first = 1 if right == 0 else 2      # a page with a right sibling starts with its high key
+        if items < first:
+            raise ValueError(f"the page has {items} line pointers and no data entry")
+        item = first + (items - first) // 2
+        (lp,) = struct.unpack_from("<I", page, PAGE_HEADER_BYTES + LINE_POINTER_BYTES * (item - 1))
+        off, lp_flags, length = lp & 0x7FFF, (lp >> 15) & 0x3, lp >> 17
+        if lp_flags != LP_NORMAL or length < INDEX_TUPLE_HEADER_BYTES + 4 or off < upper or off + length > special:
+            raise ValueError(f"line pointer {item} is not a normal entry inside the tuple area "
+                             f"(off {off}, flags {lp_flags}, len {length})")
+        bi_hi, bi_lo, posid, t_info = struct.unpack_from("<HHHH", page, off)
+        if t_info & INDEX_ALT_TID_MASK or (t_info & INDEX_SIZE_MASK) != length or posid == 0:
+            raise ValueError(f"entry {item} is not a plain index entry pointing at a heap row "
+                             f"(t_info {t_info:#06x}, len {length}, offset number {posid})")
+        (key,) = struct.unpack_from("<i", page, off + INDEX_TUPLE_HEADER_BYTES)
+        if not 1 <= key <= int(target.get("rows", CORRUPTION_INDEX_ROWS)):
+            raise ValueError(f"entry {item} holds key {key}, not one of the rows written")
+        heap_block = (bi_hi << 16) | bi_lo
+        return {"byte_in_page": off + TID_OFFSET_NUMBER_AT, "field": target.get("locate"),
+                "item": item, "items": items, "entry_offset": off, "entry_length": length, "key": key,
+                "heap_tid": [heap_block, posid], "heap_tid_after": [heap_block, posid ^ 0xFF]}
 
     @staticmethod
     def _corruption_error(exc: asyncpg.PostgresError) -> dict[str, Any]:

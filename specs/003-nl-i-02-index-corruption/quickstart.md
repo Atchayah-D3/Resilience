@@ -16,10 +16,13 @@ On the harness VM, in `~/resilience` (back it up before replacing code, CLAUDE.m
     --scenario NL-I-01 --target-is-disposable -q -rA
 ```
 
-Expected (NL-I-02): `passed`; in `summary.txt` the injected leaf block and `pg_checksums`
-failure at it, index reads failing with `XX001` naming that block (or returning exactly 20000
-rows), `amcheck on the damaged relation: detected=True`, REINDEX ok, read-after 20000 rows via
-the index, check-after clean. Measured: `wrong_results_returned = 0`, `reindex_restores = True`.
+Expected (NL-I-02): `passed`; in `summary.txt` the injected leaf block, the entry corrupted
+(line pointer, key, heap row pointer before -> after) and the `pg_checksums` failure at that
+block, index reads failing with `XX001` naming that block, `amcheck on the damaged relation:
+detected=True`, REINDEX ok, read-after 20000 rows via the index, check-after clean. Measured:
+`wrong_results_returned = 0`, `detection_identifies_block = True`, `reindex_restores = True`.
+An abort "could not locate the byte to corrupt" means the page did not look as expected; the
+reason is in the message and `located` is absent -- nothing was written.
 
 After the run: `resilience.corruption_target` no longer exists; the ledger has no outstanding
 entry.
