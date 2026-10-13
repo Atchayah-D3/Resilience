@@ -258,7 +258,7 @@ class Conn:
         self.log.append(sql)
         if self.fail is not None:
             raise self.fail
-        return [(i,) for i in (self.rows if self.rows is not None else range(1, ROWS + 1))]
+        return [(i, "i" * 16) for i in (self.rows if self.rows is not None else range(1, ROWS + 1))]
 
     async def close(self):
         pass
@@ -314,13 +314,39 @@ def test_a_read_through_the_index_that_returns_the_rows_written():
     read = asyncio.run(adapter_with(log, settings).read_index_target(attempts=1))
     assert read["attempts"] == [{"used_index": True, "plan": ["Index Scan"], "error": None,
                                  "rows": ROWS, "matches_written": True}]
-    assert settings == [{"enable_seqscan": "off", "enable_bitmapscan": "off", "enable_sort": "off"}]
+    assert settings == [{"enable_seqscan": "off", "enable_bitmapscan": "off", "enable_sort": "off",
+                         "enable_indexonlyscan": "off"}]
+    # payload is not in the index: only a plain Index Scan, returning table rows, can answer
+    assert f"SELECT id, payload FROM {TABLE} WHERE id >= 1 ORDER BY id" in log
+
+
+# The lab run's corrupted entry (NL-I-02-20261013T051043Z-ac5f31): key 6405 -> table row
+# (40,125), redirected to (40,130). At 157 rows per table page (rows loaded in id order) that
+# slot holds id 6410 -- what a plain Index Scan would return for the entry if the engine used
+# the page without verifying its checksum.
+ROWS_PER_HEAP_PAGE = 157
+
+
+def row_id_at(block, offset):
+    return block * ROWS_PER_HEAP_PAGE + offset
+
+
+def test_a_redirected_row_pointer_read_unverified_is_a_wrong_result():
+    assert row_id_at(40, 125) == 6405                         # the entry's own row
+    redirected = row_id_at(40, 0x7D ^ 0xFF)                   # offset number 125 -> 130
+    assert redirected == 6410
+    ids = [redirected if i == 6405 else i for i in range(1, ROWS + 1)]
+    (attempt,) = asyncio.run(adapter_with([], rows=ids).read_index_target(attempts=1))["attempts"]
+    assert (attempt["used_index"], attempt["rows"], attempt["matches_written"]) == (True, ROWS, False)
+
 
 
 @pytest.mark.parametrize("conn_kw,expected", [
     ({"rows": list(range(1, ROWS))}, {"used_index": True, "matches_written": False}),          # a row missing
     ({"rows": list(range(2, ROWS + 2))}, {"used_index": True, "matches_written": False}),      # wrong rows
     ({"plan": "Seq Scan"}, {"used_index": False, "matches_written": True}),                    # not via the index
+    # returns index keys, not table rows: blind to a redirected row pointer
+    ({"plan": "Index Only Scan"}, {"used_index": False, "matches_written": True}),
     ({"index": "some_other_idx"}, {"used_index": False}),
 ])
 def test_index_reads_record_wrong_rows_and_plans_that_avoid_the_index(conn_kw, expected):

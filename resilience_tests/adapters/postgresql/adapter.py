@@ -321,9 +321,15 @@ INDEX_ALT_TID_MASK = 0x2000
 TID_OFFSET_NUMBER_AT = 4              # ip_posid; its low byte (little-endian) is the byte flipped
 # A full-range ordered read walks every leaf of the index, so it must reach the damaged page.
 # The scan types that would avoid the index are switched off for that session only.
-INDEX_READ_SQL = f"SELECT id FROM {CORRUPTION_TARGET} WHERE id >= 1 ORDER BY id"
-INDEX_READ_SETTINGS = {"enable_seqscan": "off", "enable_bitmapscan": "off", "enable_sort": "off"}
-_INDEX_SCAN_NODES = ("Index Scan", "Index Only Scan")
+# It must be a plain Index Scan: that returns each row's id FROM THE TABLE ROW the index entry
+# points at, so a corrupted row pointer read unverified shows up as a wrong id. An Index Only
+# Scan returns the key stored in the index and follows the pointer only to check visibility --
+# a redirected pointer to another visible row would still print the right id. payload is not
+# in the index, so an Index Only Scan cannot answer this query; it is also switched off.
+INDEX_READ_SQL = f"SELECT id, payload FROM {CORRUPTION_TARGET} WHERE id >= 1 ORDER BY id"
+INDEX_READ_SETTINGS = {"enable_seqscan": "off", "enable_bitmapscan": "off", "enable_sort": "off",
+                       "enable_indexonlyscan": "off"}
+_INDEX_SCAN_NODE = "Index Scan"
 
 _SAME_AS_CONNECT: Any = object()  # sentinel: bound statements by the connect timeout
 
@@ -694,7 +700,8 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
 
     async def read_index_target(self, attempts: int = 2) -> dict[str, Any]:
         """The table read through its index, on a fresh connection each time. The plan is
-        checked first: a read the planner answered without that index says nothing about it."""
+        checked first: a read the planner answered without that index -- or with an Index Only
+        Scan, which never returns a table row -- says nothing about it."""
         out = []
         for _ in range(attempts):
             conn = await self._connect(timeout_s=10.0, command_timeout=60.0, server_settings=INDEX_READ_SETTINGS)
@@ -703,7 +710,7 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                 plan = await conn.fetchval(f"EXPLAIN (FORMAT JSON) {INDEX_READ_SQL}")
                 nodes = _plan_nodes(json.loads(plan) if isinstance(plan, str) else plan)
                 attempt["plan"] = [n.get("Node Type") for n in nodes]
-                attempt["used_index"] = any(n.get("Node Type") in _INDEX_SCAN_NODES
+                attempt["used_index"] = any(n.get("Node Type") == _INDEX_SCAN_NODE
                                             and n.get("Index Name") == CORRUPTION_INDEX_NAME for n in nodes)
                 ids = [r[0] for r in await conn.fetch(INDEX_READ_SQL)]
                 attempt.update(error=None, rows=len(ids),

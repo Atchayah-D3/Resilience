@@ -130,7 +130,8 @@ the database must stay intact.
   pointer (offset number) of a data entry, found through the page's line pointers, with the
   page read and the single-byte read agreeing; after writing, offline checksum verification MUST report exactly one failure
   at that block of that file. Otherwise FaultNotLanded (run aborted, still reverted).
-- **FR-004**: Validate MUST read the table through the index (index scan forced, and the plan
+- **FR-004**: Validate MUST read the table through the index (a plain index scan returning table
+  rows forced -- never an index-only scan -- and the plan
   confirmed to use that index) on fresh connections, recording per attempt the error code and
   location, or the rows returned and whether they equal the rows written.
 - **FR-005**: `wrong_results_returned` = number of index reads that returned a row set other

@@ -38,10 +38,16 @@
 
 ## R3 -- Forcing and proving an index read
 
-- **Decision**: per attempt, a fresh connection with `enable_seqscan`, `enable_bitmapscan` and
-  `enable_sort` off; `EXPLAIN (FORMAT JSON)` must show an Index Scan / Index Only Scan on the
-  target index; then `SELECT id FROM t WHERE id >= 1 ORDER BY id`. Rows are compared with
-  `1..N` exactly.
+- **Decision** (revised 2026-10-13): per attempt, a fresh connection with `enable_seqscan`,
+  `enable_bitmapscan`, `enable_sort` and `enable_indexonlyscan` off; `EXPLAIN (FORMAT JSON)`
+  must show a plain **Index Scan** on the target index; then
+  `SELECT id, payload FROM t WHERE id >= 1 ORDER BY id`. Ids are compared with `1..N` exactly.
+- **Why not an Index Only Scan**: the first lab run (NL-I-02-20261013T051043Z-ac5f31) chose
+  one for `SELECT id`. It returns the key stored in the index and follows the row pointer only
+  to check visibility, so the corrupted pointer -- redirected from (40,125) to (40,130), another
+  visible row -- would still print the right id if the page were used unverified. A plain Index
+  Scan returns the table row's id (6410 instead of 6405): a wrong result the read can see.
+  `payload` is not in the index, so an Index Only Scan cannot answer the query at all.
 - **Rationale**: a full-range ordered index scan walks every leaf, so it must reach the damaged
   page. A plan not using the index cannot speak for "no wrong results" (NOT_MEASURED).
   Planner: the table has no statistics (autovacuum off, never analyzed), so the planner does not
