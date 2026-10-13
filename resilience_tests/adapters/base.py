@@ -324,6 +324,7 @@ class BaseDatabaseAdapter(ABC):
                                heapallindexed: bool = False) -> dict[str, Any]:
         """The engine's structural checker on ONE relation. `detected`: True when it reported
         the relation damaged, False when it ran clean, None when it could not tell.
+        `corrupt_pages`: [{block, relation_path}] for each page it reported unreadable.
         `heapallindexed`: also verify every table row is present in the table's indexes."""
         return {"detected": None, "note": f"{type(self).__name__} has no structural checker"}
 

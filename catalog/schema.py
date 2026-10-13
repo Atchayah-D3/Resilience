@@ -50,9 +50,9 @@ InfraFeature = Literal[
     "dedicated_wal_volume",         # pg_wal on its own volume, large enough for 16 GB of WAL
 ]
 
-# Framework §9 -- the 20 categories.
+# Framework §9 -- the 21 categories.
 Category = Literal[
-    "NL-D", "NL-C", "NL-W", "NL-I", "NL-R", "NL-N", "NL-M",
+    "NL-D", "NL-E", "NL-C", "NL-W", "NL-I", "NL-R", "NL-N", "NL-M",
     "CL-F", "CL-S", "CL-R", "CL-N", "CL-C", "CL-B", "CL-X",
     "DX-T", "DX-M", "DX-S", "DX-Q", "DX-P", "DX-D",
 ]
@@ -87,7 +87,7 @@ SCENARIO_REF_RE = re.compile(r"\b(?:NL|CL|DX)-[A-Z]-\d{2}\b")
 # "Framework §7.3" / "Arch §4.2" / a bare "§13.1". The document matters: the two documents
 # have different section trees, so a citation without one cannot be checked (Arch §4.1: a
 # documentation defect must be a build failure, not a finding at the next review).
-SECTION_REF_RE = re.compile(r"(?:(Arch|Architecture|Framework)\s*)?§\s?(\d+(?:\.\d+)*)")
+SECTION_REF_RE = re.compile(r"(?:(Arch|Architecture|Framework)\s*)?§\s?(\d+(?:\.\d+)*[a-z]?)")  # §10.1a
 IDENT_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # User hard rule + Arch §3.1: a scenario never names a host or a driver.

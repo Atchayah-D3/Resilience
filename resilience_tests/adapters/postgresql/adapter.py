@@ -756,7 +756,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                                heapallindexed: bool = False) -> dict[str, Any]:
         """pg_amcheck on the one relation (Arch §10.1 names it for NL-I-01). A checksum failure
         surfaces either as a reported finding or as the check's own read failing with the
-        invalid-page error; both mean the checker noticed. A clean exit means it did not."""
+        invalid-page error; both mean the checker noticed. A clean exit means it did not.
+        `corrupt_pages` lists every page the checker could not read, so the caller can tell
+        whether it found THE damaged page rather than merely something."""
         node = self.node
         command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
                    f"-d {shlex.quote(node.db.dbname)} --relation={shlex.quote(relation)}"
@@ -772,7 +774,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             detected = True
         else:
             detected = None   # e.g. could not connect, or exited non-zero for another reason
-        return {"detected": detected, "exit_status": result.exit_status, "output": output[:2000], "command": command}
+        pages = [{"block": int(b), "relation_path": p} for b, p in _INVALID_PAGE_RE.findall(output)]
+        return {"detected": detected, "exit_status": result.exit_status, "corrupt_pages": pages,
+                "output": output[:2000], "command": command}
 
     def corruption_log_locations(self, lines: Sequence[str]) -> list[tuple[int, str]]:
         found = []

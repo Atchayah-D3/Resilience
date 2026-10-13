@@ -1198,8 +1198,14 @@ class TestOrchestrator:
             self.not_measured["amcheck_detects_target"] = (
                 f"the structural check of {relation} did not say either way: "
                 f"{checked.get('note') or str(checked.get('output', ''))[:200]}")
+        elif checked["detected"]:
+            # it must have found THE damaged page: a finding anywhere else in the relation (or a
+            # message that names no page) is not this detection
+            named = [(p.get("block"), p.get("relation_path")) for p in checked.get("corrupt_pages") or []]
+            checked["names_injected_block"] = (block, path) in named
+            m["amcheck_detects_target"] = checked["names_injected_block"]
         else:
-            m["amcheck_detects_target"] = checked["detected"]
+            m["amcheck_detects_target"] = False
 
         failures = self.facts.get("checksum_failures")
         if failures is None:
@@ -1277,6 +1283,10 @@ class TestOrchestrator:
             m["reindex_restores"] = False
             return m
         m["reindex_duration_s"] = reindex.get("duration_s")
+        # REINDEX builds new storage; still serving the damaged file means nothing was rebuilt
+        before, after_path = injected.get("relation_path"), reindex.get("relation_path_after")
+        new_storage = None if not before or not after_path else after_path != before
+        rebuild["new_storage"] = new_storage
 
         try:
             after = (await self.adapter.read_index_target(attempts=1)).get("attempts") or [{}]
@@ -1300,14 +1310,19 @@ class TestOrchestrator:
             read_ok = None
         detected_after = rebuild["amcheck_after"].get("detected")
         check_ok = None if detected_after is None else not detected_after
-        if read_ok is False or check_ok is False:
+        if read_ok is False or check_ok is False or new_storage is False:
             m["reindex_restores"] = False
-        elif read_ok is None or check_ok is None:
+        elif read_ok is None or check_ok is None or new_storage is None:
             m["reindex_restores"] = NOT_MEASURED
-            self.not_measured["reindex_restores"] = (
-                "after REINDEX, " + ("the read through the index could not say" if read_ok is None
-                                     else "the structural check could not say")
-                + f" (read: {a}, check: {rebuild['amcheck_after'].get('note') or rebuild['amcheck_after'].get('output', '')[:200]})")
+            if new_storage is None:
+                why = (f"the index file after REINDEX is unknown (before: {before}, "
+                       f"after: {after_path}), so a rebuild into new storage was not shown")
+            elif read_ok is None:
+                why = f"the read through the index could not say (read: {a})"
+            else:
+                why = ("the structural check could not say (check: "
+                       f"{rebuild['amcheck_after'].get('note') or rebuild['amcheck_after'].get('output', '')[:200]})")
+            self.not_measured["reindex_restores"] = "after REINDEX, " + why
         else:
             m["reindex_restores"] = True
         return m

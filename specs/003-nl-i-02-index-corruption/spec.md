@@ -137,9 +137,12 @@ the database must stay intact.
 - **FR-005**: `wrong_results_returned` = number of index reads that returned a row set other
   than the one written; NOT_MEASURED when any read neither used the index nor failed with the
   corruption error.
-- **FR-006**: `amcheck_detects_target` MUST come from the structural checker run on the index.
+- **FR-006**: `amcheck_detects_target` MUST come from the structural checker run on the index, and is
+  true only when the checker names the injected block of the injected file as unreadable; a finding
+  elsewhere, or one naming no page, is false (NL-I-01 likewise, on the table).
 - **FR-007**: The harness MUST run REINDEX on the damaged index and set `reindex_restores` true
-  only when the rebuild succeeded, a forced index read returned exactly the rows written, and
+  only when the rebuild succeeded into new storage (the index file differs from the damaged one), a
+  forced index read returned exactly the rows written, and
   the checker (heap-to-index cross-check on) ran clean on the table and index; NOT_MEASURED
   when a step could not say either way.
 - **FR-008**: `corruption_outside_target` (server log), `structural_integrity_errors`

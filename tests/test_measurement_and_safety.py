@@ -583,6 +583,9 @@ def test_check5_distinguishes_the_two_documents():
 
     assert check("see Arch §4.3 for the compound rule").passed          # real Architecture heading
     assert check("see Framework §13.1").passed
+    assert check("see Framework §10.1a").passed                          # lettered section (NL-E)
+    bad_letter = check("see Framework §10.2a")
+    assert not bad_letter.passed and "Framework §10.2a" in bad_letter.detail[0]
     bad_arch = check("see Arch §13.7")                                   # Framework heading, not Arch
     assert not bad_arch.passed and "Arch §13.7" in bad_arch.detail[0]
     ambiguous = check("see §13.1")

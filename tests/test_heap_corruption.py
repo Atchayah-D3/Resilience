@@ -292,6 +292,27 @@ def test_amcheck_on_the_damaged_relation_is_read_strictly(monkeypatch, exit_stat
     assert asyncio.run(PostgreSQLAdapter(NODE).amcheck_relation(RELATION, 30))["detected"] is detected
 
 
+def test_amcheck_reports_the_pages_it_could_not_read(monkeypatch):
+    from resilience_tests.adapters.postgresql import adapter as pg
+
+    output = (f'heap table "resilience.resilience.corruption_target":\n    ERROR:  {INVALID_PAGE}\n'
+              "WARNING:  page verification failed, calculated checksum 48395 but expected 12585")
+
+    class Host:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def run(self, command, *, timeout_s, check=True):
+            return RemoteResult(2, output, "")
+
+    monkeypatch.setattr(pg, "RemoteHost", lambda *a, **k: Host())
+    out = asyncio.run(PostgreSQLAdapter(NODE).amcheck_relation(RELATION, 30))
+    assert out["detected"] is True and out["corrupt_pages"] == [{"block": BLOCK, "relation_path": PATH}]
+
+
 def test_the_whole_database_check_excludes_only_the_damaged_relation(monkeypatch):
     from resilience_tests.adapters.postgresql import adapter as pg
     commands: list[str] = []
@@ -377,7 +398,8 @@ def corrupt(env, monkeypatch):
     monkeypatch.setattr(CorruptionFault, "lands_corruption", True)
     monkeypatch.setattr(OutageAdapter, "corruption_sqlstates", ("XX001",), raising=False)
     behaviour = {"read": {"sqlstate": "XX001", "block": BLOCK, "relation_path": PATH, "message": INVALID_PAGE},
-                 "log": [f"ERROR:  {INVALID_PAGE}"], "amcheck": {"detected": True},
+                 "log": [f"ERROR:  {INVALID_PAGE}"],
+                 "amcheck": {"detected": True, "corrupt_pages": [{"block": BLOCK, "relation_path": PATH}]},
                  "integrity": IntegrityResult(structural_errors=0, checksum_failures=2)}
 
     async def read(self, attempts=2):
@@ -465,8 +487,14 @@ def test_false_pass_a_failure_the_engine_did_not_count(env, corrupt):
     assert outcome(results, "checksum_failure_reported == true") == "fail"
 
 
-@pytest.mark.parametrize("amcheck,expected", [({"detected": False}, "fail"),
-                                              ({"detected": None, "note": "could not connect"}, "not_measured")])
+@pytest.mark.parametrize("amcheck,expected", [
+    ({"detected": False}, "fail"),
+    ({"detected": None, "note": "could not connect"}, "not_measured"),
+    # it found something, but not THE damaged page: another block, or no page named at all
+    ({"detected": True, "corrupt_pages": [{"block": BLOCK + 1, "relation_path": PATH}]}, "fail"),
+    ({"detected": True, "corrupt_pages": [{"block": BLOCK, "relation_path": "base/16384/2619"}]}, "fail"),
+    ({"detected": True, "corrupt_pages": []}, "fail"),
+])
 def test_false_pass_the_checker_must_see_the_damage(env, corrupt, amcheck, expected):
     corrupt["amcheck"] = amcheck
     results = run_nli01(env)

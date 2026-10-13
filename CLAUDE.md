@@ -10,7 +10,7 @@ A resilience test harness for ShaktiDB (standalone PostgreSQL 17) and DistDB. It
 breaks a running database -- kills it, restarts it, floods it, crashes it mid-operation -- and
 measures what the failure cost: transactions lost (RPO), time to recover (RTO), corruption.
 
-- Specs: `docs/DistDB-050826-050505.pdf` is the **Framework** (155 scenarios; cite as
+- Specs: `docs/DistDB-091026-095255.pdf` is the **Framework** (162 scenarios; cite as
   `Framework §n`), `docs/BP-Resilience Test Harness Architecture-050826-050547.pdf` is the
   **Architecture** (cite as `Arch §n`). Their section numbers differ -- never cite a bare `§n`.
 - `docs/infra-requirements.md` lists what the lab still lacks (data disk, power control,
@@ -92,7 +92,7 @@ with `pip install -e '.[test]'` on Python 3.11+).
 | Owner | Scenarios |
 |---|---|
 | Owner A | NL-C-01, NL-C-03, NL-C-04 (blocked: needs a dedicated pg_wal volume), NL-C-06, NL-M-03, NL-M-06, NL-M-07, NL-R-04 |
-| Owner B | NL-C-02, NL-C-05, NL-M-05 |
+| Owner B | NL-C-02, NL-C-05, NL-M-05, NL-I-01, NL-I-02 |
 
 Change another owner's scenario only with that owner (constitution, workflow section).
 Next candidates: NL-N-02 (cgroup CPU throttling, P0) with NL-R-01/02 (shared resource_limit driver).

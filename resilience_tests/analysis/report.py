@@ -29,6 +29,11 @@ def write_results(run_dir: Path, results: dict[str, Any]) -> Path:
     return path
 
 
+def _plan(read: dict[str, Any]) -> str:
+    """The plan nodes a read ran with (EXPLAIN), or `?` when no plan was recorded."""
+    return " > ".join(read.get("plan") or []) or "?"
+
+
 def render_summary(r: dict[str, Any]) -> str:
     lines = [
         f"{r['scenario']['id']}  {r['scenario']['name']}",
@@ -154,7 +159,9 @@ def render_summary(r: dict[str, Any]) -> str:
             f"  pg_checksums before restart: {checks.get('failures')}",
             f"  first read: {first.get('sqlstate') or 'no error'}  {first.get('message') or ''}"
             + (f"  ({first.get('rows')} rows returned)" if first.get("rows") is not None else ""),
-            f"  pg_amcheck on the damaged relation: detected={(facts.get('amcheck_on_corrupted_relation') or {}).get('detected')}",
+            "  pg_amcheck on the damaged relation: " + (
+                f"detected={(amc := facts.get('amcheck_on_corrupted_relation') or {}).get('detected')}"
+                + (f", names the injected block={amc['names_injected_block']}" if "names_injected_block" in amc else "")),
             f"  failures in the server log: {facts.get('corruption_log_locations')}",
             f"  whole-database check left out: {(facts.get('integrity_check') or {}).get('excluded_relations')}",
         ]
@@ -170,11 +177,14 @@ def render_summary(r: dict[str, Any]) -> str:
                     f"{tuple(located.get('heap_tid_after') or ())}"
                     if (located := corrupted.get("located")) else "not located"),
                 "  reads through the index: " + "; ".join(
-                    f"used_index={a.get('used_index')} "
+                    f"used_index={a.get('used_index')} plan={_plan(a)} "
                     + (f"{a.get('sqlstate')}" if a.get("error") else f"{a.get('rows')} rows, matches={a.get('matches_written')}")
                     for a in attempts),
-                f"  REINDEX: ok={reindex.get('ok')} in {reindex.get('duration_s')} s {reindex.get('error') or ''}",
-                f"  read after REINDEX: used_index={after.get('used_index')} rows={after.get('rows')} "
+                f"  REINDEX: ok={reindex.get('ok')} in {reindex.get('duration_s')} s"
+                + (f" {reindex['error']}" if reindex.get("error") else "")
+                + (f"; file {corrupted.get('relation_path')} -> {reindex.get('relation_path_after')}"
+                   f" (new storage={rebuild.get('new_storage')})" if reindex.get("ok") else ""),
+                f"  read after REINDEX: used_index={after.get('used_index')} plan={_plan(after)} rows={after.get('rows')} "
                 f"matches={after.get('matches_written')} {after.get('sqlstate') or ''}",
                 f"  pg_amcheck --heapallindexed after REINDEX: detected={(rebuild.get('amcheck_after') or {}).get('detected')}",
             ]

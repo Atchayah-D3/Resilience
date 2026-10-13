@@ -22,7 +22,7 @@ catalog checks exists to catch it.
 
 ## 1. Overview
 
-“Is the database resilient?” cannot be tested. The specification turns that question into 155
+“Is the database resilient?” cannot be tested. The specification turns that question into 162
 specific questions, each with a number as the answer. For example:
 
 > Kill the database process while the database is taking 200 writes a second. How many
@@ -381,7 +381,7 @@ python3.11 -m venv .venv
 # the harness's own tests, and the catalog checks
 .venv/bin/pytest -q -n 4
 .venv/bin/python -m catalog.schema --partial   # while the catalog is being authored
-.venv/bin/python -m catalog.schema             # release gate: the complete 155-test catalog
+.venv/bin/python -m catalog.schema             # release gate: the complete 162-test catalog
 
 # dry run: reset .. pre_fault only. No fault, no verdict.
 .venv/bin/pytest resilience_tests/test_scenarios.py --env e2-dedicated-vm \

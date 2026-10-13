@@ -410,9 +410,10 @@ class IndexCorruptionFault(FakeFault):
                 "pg_checksums": {"failures": [{"file": PATH, "block": BLOCK}]}, "t0_mono_ns": time.monotonic_ns()}
 
 
-ERROR_READ = {"used_index": True, "error": "DataCorruptedError", "sqlstate": "XX001", "block": BLOCK,
-              "relation_path": PATH, "message": INVALID_PAGE}
-GOOD_READ = {"used_index": True, "error": None, "rows": ROWS, "matches_written": True}
+ERROR_READ = {"used_index": True, "plan": ["Index Scan"], "error": "DataCorruptedError", "sqlstate": "XX001",
+              "block": BLOCK, "relation_path": PATH, "message": INVALID_PAGE}
+GOOD_READ = {"used_index": True, "plan": ["Index Scan"], "error": None, "rows": ROWS, "matches_written": True}
+REBUILT_PATH = "base/16384/16411"            # REINDEX writes the index into a new file
 
 
 @pytest.fixture
@@ -426,8 +427,9 @@ def damaged(env, monkeypatch):
     monkeypatch.setattr(OutageAdapter, "corruption_sqlstates", ("XX001",), raising=False)
     IndexCorruptionFault.kinds = []
     b: dict[str, Any] = {"read": dict(ERROR_READ), "read_after": dict(GOOD_READ), "log": [f"ERROR:  {INVALID_PAGE}"],
-                         "amcheck": {"detected": True}, "amcheck_after": {"detected": False},
-                         "reindex": {"ok": True, "duration_s": 0.2, "error": None},
+                         "amcheck": {"detected": True, "corrupt_pages": [{"block": BLOCK, "relation_path": PATH}]},
+                         "amcheck_after": {"detected": False},
+                         "reindex": {"ok": True, "duration_s": 0.2, "error": None, "relation_path_after": REBUILT_PATH},
                          "integrity": IntegrityResult(structural_errors=0, checksum_failures=2), "calls": []}
 
     async def read_index(self, attempts=2):
@@ -489,6 +491,16 @@ def test_a_detected_and_restored_index_passes(env, damaged):
     assert any(TABLE in d and INDEX in d for d in results["disclosures"])
 
 
+def test_the_summary_shows_the_plan_the_new_file_and_the_block_amcheck_named(env, damaged):
+    from resilience_tests.analysis.report import render_summary
+
+    text = render_summary(run_nli02(env))
+    assert "pg_amcheck on the damaged relation: detected=True, names the injected block=True" in text
+    assert "reads through the index: used_index=True plan=Index Scan XX001; used_index=True plan=Index Scan XX001" in text
+    assert f"file {PATH} -> {REBUILT_PATH} (new storage=True)" in text
+    assert f"read after REINDEX: used_index=True plan=Index Scan rows={ROWS} matches=True" in text
+
+
 def test_false_pass_reads_that_never_detect_the_damage_fail_even_with_the_right_rows(env, damaged):
     # every read walks the damaged leaf; returning the right rows without an error means the
     # engine served a corrupted page unverified. The checker's failure still puts the block in
@@ -528,8 +540,13 @@ def test_false_pass_a_read_that_cannot_speak_for_the_index_is_not_measured(env, 
     assert outcome(results, "wrong_results_returned == 0") == "not_measured"
 
 
-@pytest.mark.parametrize("amcheck,expected", [({"detected": False}, "fail"),
-                                              ({"detected": None, "note": "could not connect"}, "not_measured")])
+@pytest.mark.parametrize("amcheck,expected", [
+    ({"detected": False}, "fail"),
+    ({"detected": None, "note": "could not connect"}, "not_measured"),
+    # it found something, but not THE damaged leaf: another block, or no page named at all
+    ({"detected": True, "corrupt_pages": [{"block": BLOCK + 1, "relation_path": PATH}]}, "fail"),
+    ({"detected": True, "corrupt_pages": []}, "fail"),
+])
 def test_false_pass_the_checker_must_see_the_damaged_index(env, damaged, amcheck, expected):
     damaged["amcheck"] = amcheck
     results = run_nli02(env)
@@ -546,6 +563,9 @@ def test_false_pass_the_checker_must_see_the_damaged_index(env, damaged, amcheck
     ({"read_after": {"used_index": None, "error": "ConnectionDoesNotExistError"}}, "not_measured"),
     ({"amcheck_after": {"detected": True}}, "fail"),
     ({"amcheck_after": {"detected": None, "note": "timeout"}}, "not_measured"),
+    # REINDEX "succeeded" but the index is still the damaged file: nothing was rebuilt
+    ({"reindex": {"ok": True, "duration_s": 0.2, "error": None, "relation_path_after": PATH}}, "fail"),
+    ({"reindex": {"ok": True, "duration_s": 0.2, "error": None, "relation_path_after": None}}, "not_measured"),
 ])
 def test_false_pass_reindex_must_be_shown_to_restore_the_index(env, damaged, change, expected):
     damaged.update(change)

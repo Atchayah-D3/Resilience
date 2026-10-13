@@ -25,7 +25,8 @@ entry_length, key, heap_tid, heap_tid_after}`, and `byte_offset` in the file.
 ## Rebuild (`facts.index_rebuild`)
 
 `reindex` `{ok, duration_s, error, relation_path_after}`, `read_after` (one attempt as above),
-`amcheck_after` (`amcheck_relation(table, heapallindexed=True)` result).
+`amcheck_after` (`amcheck_relation(table, heapallindexed=True)` result), `new_storage` (bool / None:
+`relation_path_after` differs from the damaged file).
 
 ## Measures
 
@@ -33,7 +34,7 @@ entry_length, key, heap_tid, heap_tid_after}`, and `byte_offset` in the file.
 |---|---|---|
 | `wrong_results_returned` | count of index reads whose rows != written | a read neither used the index nor failed with the corruption code |
 | `detection_identifies_block` (gated) | the first read failed with the corruption code naming the damaged block and file | no read attempt |
-| `amcheck_detects_target` | checker on the index reported it | checker inconclusive |
-| `reindex_restores` | REINDEX ok AND read-after matches via index AND amcheck-after clean | any of the three inconclusive |
+| `amcheck_detects_target` | checker on the index reported it unreadable at the injected block of the injected file (`corrupt_pages`) | checker inconclusive |
+| `reindex_restores` | REINDEX ok AND the index is in a new file AND read-after matches via index AND amcheck-after clean | any of these inconclusive |
 | `reindex_duration_s` | seconds (reported) | REINDEX failed |
 | others | as NL-I-01 | as NL-I-01 |

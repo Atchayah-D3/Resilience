@@ -20,7 +20,7 @@ other fault type is a validation error. Absent means `heap` (NL-I-01 unchanged).
 async def prepare_corruption_target(self, kind: str = "heap") -> dict   # + table, relation_kind, page_check, integrity_exclusions
 async def read_index_target(self, attempts: int = 2) -> dict            # {"attempts": [...]}, see data-model
 async def rebuild_corruption_target(self) -> dict                       # {"ok", "duration_s", "error", "relation_path_after"}
-async def amcheck_relation(self, relation: str, timeout_s: float, *, heapallindexed: bool = False) -> dict
+async def amcheck_relation(self, relation: str, timeout_s: float, *, heapallindexed: bool = False) -> dict  # {"detected", "corrupt_pages": [{"block", "relation_path"}], "exit_status", "output", "command"}
 def locate_corruption_byte(self, target: dict, page: bytes) -> dict     # {"byte_in_page", ...}; ValueError -> abort
 ```
 

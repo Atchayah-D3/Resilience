@@ -60,7 +60,9 @@
   `pg_amcheck --relation=<table> --heapallindexed` (checks the heap and its index, including
   that every heap tuple is in the index).
 - **Rationale**: REINDEX is the Framework's named recovery path; restoration is proven by the
-  engine's own answers, not by REINDEX having returned.
+  engine's own answers, not by REINDEX having returned. Since 2026-10-13 also by the index file:
+  `pg_relation_filepath` after REINDEX must differ from the damaged file (unknown -> NOT_MEASURED),
+  so a rebuild that kept serving the damaged storage cannot pass.
 
 ## R5 -- Whole-database check exclusions
 
