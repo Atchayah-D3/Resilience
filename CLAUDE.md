@@ -25,8 +25,9 @@ measures what the failure cost: transactions lost (RPO), time to recover (RTO), 
 | `catalog/schema.py` | Scenario schema + catalog checks (`FaultType`, `FaultDuring`, `InfraFeature`, ...) |
 | `envs/*.yaml` | Machines, ports, paths, drivers, phase bounds, safety allowlist, disclosures, `infra` |
 | `resilience_tests/control/orchestrator.py` | The 9 phases: reset, init, baseline, pre_fault, fault_inject, recovery, validate, report, cleanup |
-| `resilience_tests/adapters/postgresql/adapter.py` | The ONLY place that knows PostgreSQL |
-| `resilience_tests/execution/injectors/process.py` | os_ssh driver: kill, restart, reload, idle txn, connection flood |
+| `resilience_tests/control/faults/` | Per-fault and per-`during` behaviour the phases call (no fault-type branches in the orchestrator) |
+| `resilience_tests/adapters/postgresql/` | The ONLY place that knows PostgreSQL (`adapter.py` core + corruption/operations/sessions mixins) |
+| `resilience_tests/execution/injectors/process.py` | os_ssh driver: kill, restart, reload, idle txn, connection flood (one class per fault; shared helpers in `os_ssh.py`) |
 | `resilience_tests/execution/workload/driver.py` | asyncpg marker workload (+ Elle list-append mode) |
 | `resilience_tests/analysis/` | RTO decomposer, predicates/verdict, report, Elle checker |
 | `tests/` | Unit tests with fake engines -- plumbing, not scenarios |

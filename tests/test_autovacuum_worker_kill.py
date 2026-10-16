@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from resilience_tests.adapters.postgresql import adapter as pg
+from resilience_tests.adapters.postgresql import operations as pg_operations
 from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
 from resilience_tests.control.profile import load_profile
 from resilience_tests.execution.injectors import process as process_mod
@@ -241,9 +242,9 @@ def adapter_with(conn: FakeConn) -> PostgreSQLAdapter:
 
 @pytest.fixture
 def fast(monkeypatch):
-    monkeypatch.setattr(pg, "AVAC_POLL_S", 0.001)
-    monkeypatch.setattr(pg, "AVAC_WAIT_SLACK_S", 0.2)
-    monkeypatch.setattr(pg, "AVAC_VERIFY_SAMPLE_S", 0.001)
+    monkeypatch.setattr(pg_operations, "AVAC_POLL_S", 0.001)
+    monkeypatch.setattr(pg_operations, "AVAC_WAIT_SLACK_S", 0.2)
+    monkeypatch.setattr(pg_operations, "AVAC_VERIFY_SAMPLE_S", 0.001)
 
 
 def worker(pid, relation, query="autovacuum: VACUUM resilience.avac_target"):

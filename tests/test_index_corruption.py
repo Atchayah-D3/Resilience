@@ -27,6 +27,7 @@ from resilience_tests.adapters.base import IntegrityResult
 from resilience_tests.adapters.postgresql import adapter as pg
 from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
 from resilience_tests.control import orchestrator as orch
+from resilience_tests.control.faults import corruption as corruption_behaviour
 from resilience_tests.control.matrix import RunPlanItem
 from resilience_tests.control.orchestrator import RunOptions, TestOrchestrator
 from resilience_tests.execution.injectors import corruption as corruption_mod
@@ -423,7 +424,7 @@ def damaged(env, monkeypatch):
     afterwards the index answers correctly and the cross-check is clean."""
     monkeypatch.setattr(orch, "resolve", lambda fault, prof: IndexCorruptionFault(prof, fault.type))
     monkeypatch.setattr(orch, "LogTailer", EchoTail)
-    monkeypatch.setattr(orch, "CORRUPTION_LOG_WAIT_S", 0.5)
+    monkeypatch.setattr(corruption_behaviour, "CORRUPTION_LOG_WAIT_S", 0.5)
     monkeypatch.setattr(OutageAdapter, "corruption_sqlstates", ("XX001",), raising=False)
     IndexCorruptionFault.kinds = []
     b: dict[str, Any] = {"read": dict(ERROR_READ), "read_after": dict(GOOD_READ), "log": [f"ERROR:  {INVALID_PAGE}"],

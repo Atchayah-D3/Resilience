@@ -460,7 +460,7 @@ def test_inject_idle_transaction_rolls_back_and_does_not_fall_back(monkeypatch):
         mock_conn.is_closed = MagicMock(return_value=False)
         mock_conn.close = AsyncMock()
         adapter._connect = AsyncMock(return_value=mock_conn)
-        monkeypatch.setattr("resilience_tests.adapters.postgresql.adapter.RemoteHost",
+        monkeypatch.setattr("resilience_tests.adapters.postgresql.sessions.RemoteHost",
                             MagicMock(side_effect=AssertionError("no SSH fallback")))
 
         result = await adapter.inject_idle_transaction()

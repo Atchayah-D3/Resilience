@@ -18,7 +18,8 @@ from resilience_tests.execution.remote import RemoteResult
 from tests.test_orchestrator import OutageAdapter, Engine
 
 
-ADAPTER_MODULE = "resilience_tests.adapters.postgresql.adapter"
+# the connection flood lives in the adapter's sessions module
+ADAPTER_MODULE = "resilience_tests.adapters.postgresql.sessions"
 TOO_MANY = "FATAL: 53300: remaining connection slots are reserved for roles with the SUPERUSER attribute"
 
 

@@ -11,8 +11,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
-from catalog.schema import DEFAULT_DRIVER_SECTION, FAULT_DRIVER_SECTION, Fault
-from resilience_tests.adapters.base import BaseDatabaseAdapter
+from catalog.schema import DEFAULT_DRIVER_SECTION, FAULT_DRIVER_SECTION, Fault, Repeat
+from resilience_tests.adapters.base import BaseDatabaseAdapter, adapter_for
 from resilience_tests.control.profile import EnvProfile, Node
 
 
@@ -61,12 +61,31 @@ class FaultInjector(ABC):
         # data_corruption: what kind of relation the fault damages (catalog fault.relation_kind)
         self.corruption_kind: str = "heap"
 
+    def configure(self, fault: Fault, repeat: Repeat | None, adapter: BaseDatabaseAdapter | None) -> None:
+        """Take what the driver needs from the scenario's fault section, in one place. The
+        orchestrator calls this once, right after resolving the driver; the kill switch, which
+        has no scenario, sets only `adapter`."""
+        self.adapter = adapter   # faults inside the database act on the run's own sessions
+        if fault.duration != "permanent":
+            self.duration_s = float(fault.duration)
+        if repeat is not None:
+            self.repeat_plan = (repeat.cycles, repeat.interval_s)
+        if fault.relation_kind is not None:
+            self.corruption_kind = fault.relation_kind
+
     async def confirm(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
         """After recovery: independent evidence that the fault took effect, beyond the
         injection call having returned. {"fault_confirmed": True/False/None, ...}; None means
         this driver cannot tell, which is reported as not measured -- never as confirmed.
         `detail` is the injection's ledger detail (`preflight` and `inject`)."""
         return {"fault_confirmed": None, "note": f"{self.driver_name} has no confirmation for {self.fault_type}"}
+
+    def _database_adapter(self, node: Node) -> BaseDatabaseAdapter:
+        """The run's adapter when it was handed over; otherwise one built from the profile
+        (the kill switch after a crash, where the run's adapter no longer exists)."""
+        if self.adapter is None:
+            self.adapter = adapter_for(self.profile.database.engine, node)
+        return self.adapter
 
     @abstractmethod
     async def preflight(self, node: Node) -> dict[str, Any]:

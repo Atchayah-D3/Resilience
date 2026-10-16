@@ -86,6 +86,7 @@ stops a half-finished run from looking perfect.
 | File | Job |
 |---|---|
 | `control/orchestrator.py` | The manager. Runs the nine phases in order, sets a time limit on each, collects every measurement, decides whether the result may be trusted. |
+| `control/faults/` | What each fault type (and each `fault.during` operation) adds to the phases: its recovery action, its own measures, the operation the fault must land inside. The manager calls these and never compares a fault type itself. |
 | `control/safety.py` | The refusals: not production, the right machine, the operator’s approval, one machine only. |
 | `control/ledger.py` | The record book of faults caused. Written and forced to disk *before* each fault. |
 | `control/killswitch.py` | The repair tool. Undoes every fault still recorded as outstanding, including after a crash. |
@@ -99,7 +100,9 @@ stops a half-finished run from looking perfect.
 |---|---|
 | `execution/remote.py` | The SSH layer. Every command sent to the target passes through here. |
 | `execution/injectors/base.py` | The shape every fault tool must have, and the list of tools available. |
-| `execution/injectors/process.py` | Kill the process, restart the service, reload the configuration. Confirms the kill really landed. |
+| `execution/injectors/process.py` | Kill the process, restart the service, reload the configuration, hold an idle transaction, flood connections -- one small class per fault. Confirms the kill really landed. |
+| `execution/injectors/corruption.py` | Flip one byte in one page of the harness's own relation, and prove it landed. |
+| `execution/injectors/os_ssh.py` | What the OS/SSH tools share: the service manager's state and stop mode, and psql on the target. |
 | `execution/injectors/power.py` | Cut and restore power, through libvirt. |
 | `execution/workload/driver.py` | The load generator: 64 connections, paced transactions, one summary per second. |
 | `execution/workload/markers.py` | The data-loss evidence: two journals on the harness machine, and the arithmetic over them. |
@@ -110,7 +113,7 @@ stops a half-finished run from looking perfect.
 | File | Job |
 |---|---|
 | `adapters/base.py` | The interface an engine must implement, and the capabilities an engine can declare. |
-| `adapters/postgresql/adapter.py` | The only file that knows PostgreSQL: connections, SQL, error meanings, `pg_amcheck`, checksum counters. |
+| `adapters/postgresql/` | The only package that knows PostgreSQL. `adapter.py` holds the core (connections, SQL, error meanings, `pg_amcheck`, checksum counters); `corruption.py`, `operations.py` and `sessions.py` add the methods particular faults need. |
 | `adapters/target_resolver.py` | Turns a test’s allowed roles into the actual machines in the file. |
 | `observability/event_stream.py` | The append-only record: one JSON line per event into `events.jsonl`. |
 | `analysis/rto_decomposer.py` | Everything time-related: when service stopped, when writes returned, when throughput truly recovered, and the breakdown. |
@@ -489,7 +492,9 @@ Plus `injection-ledger.jsonl` in the harness machine’s run directory, shared a
 **A new fault type** — add it to `FaultType` and, if it needs a new profile section, to
 `FAULT_DRIVER_SECTION` in `catalog/schema.py`; write a `FaultInjector` subclass with
 `preflight` / `inject` / `revert`, call `register()` at the bottom of the file, add the file to
-the import line in `injectors/__init__.py`, and add the section to the profile.
+the import line in `injectors/__init__.py`, and add the section to the profile. If the run must
+do anything different for it -- a recovery action, measures of its own -- add a `FaultBehaviour`
+in `control/faults/` with `@register_fault`; the orchestrator itself is not edited.
 
 **A second database engine** — implement `BaseDatabaseAdapter`, declare its capabilities, and
 `register_adapter()` it against the engine name in the profile. A capability the engine lacks

@@ -38,11 +38,13 @@ from collections.abc import Mapping
 from typing import Any
 
 from resilience_tests.control.profile import Node
-from resilience_tests.execution.injectors.base import DriverNotAvailable, FaultNotLanded, register
-from resilience_tests.execution.injectors.process import (
+from resilience_tests.execution.injectors.base import DriverNotAvailable, FaultInjector, FaultNotLanded, register
+from resilience_tests.execution.injectors.os_ssh import (
     REVERT_TOTAL_BUDGET_S,
     SSH_TIMEOUT_S,
-    OsSshProcessDriver,
+    psql_command,
+    settled_state,
+    unit_property,
     unit_stop_mode,
 )
 from resilience_tests.execution.remote import RemoteHost, as_root, as_user
@@ -68,7 +70,7 @@ def parse_cluster_state(output: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
-class OsSshCorruptionDriver(OsSshProcessDriver):
+class OsSshCorruptionDriver(FaultInjector):
     """`data_corruption` -- flip one byte in one page of the harness's own relation."""
 
     fault_types = frozenset({"data_corruption"})
@@ -86,8 +88,8 @@ class OsSshCorruptionDriver(OsSshProcessDriver):
                 raise DriverNotAvailable(f"{node.name}: service {node.service} is {active!r}")
             # A smart shutdown waits for the workload's connections and is then killed by the
             # service manager -- an unclean stop, which step 2 would refuse anyway.
-            exec_stop = await self._unit(host, node, "ExecStop")
-            kill_signal = await self._unit(host, node, "KillSignal")
+            exec_stop = await unit_property(host, node, "ExecStop")
+            kill_signal = await unit_property(host, node, "KillSignal")
             mode = unit_stop_mode(exec_stop, kill_signal)
             if mode != "fast":
                 raise DriverNotAvailable(
@@ -244,7 +246,7 @@ class OsSshCorruptionDriver(OsSshProcessDriver):
                                      f"{target['block']} of {target['relation_path']}: {failures}", detail)
 
             await host.run(as_root(f"systemctl start {q(node.service)}"), timeout_s=REVERT_TOTAL_BUDGET_S)
-            state = await self._settled_state(host, node, time.monotonic() + REVERT_TOTAL_BUDGET_S)
+            state = await settled_state(host, node, time.monotonic() + REVERT_TOTAL_BUDGET_S)
             if state != "active":
                 raise RuntimeError(f"{node.name}: {node.service} is {state!r} after restart with the damaged page")
             detail["t0_mono_ns"] = time.monotonic_ns()
@@ -254,11 +256,11 @@ class OsSshCorruptionDriver(OsSshProcessDriver):
         """Idempotent: bring the service back if the run left it stopped, then drop the target."""
         out: dict[str, Any] = {}
         async with RemoteHost(node.ssh) as host:
-            state = await self._settled_state(host, node, time.monotonic() + REVERT_TOTAL_BUDGET_S)
+            state = await settled_state(host, node, time.monotonic() + REVERT_TOTAL_BUDGET_S)
             if state != "active":
                 await host.run(as_root(f"systemctl reset-failed {q(node.service)}"), timeout_s=SSH_TIMEOUT_S, check=False)
                 await host.run(as_root(f"systemctl start {q(node.service)}"), timeout_s=REVERT_TOTAL_BUDGET_S, check=False)
-                state = await self._settled_state(host, node, time.monotonic() + REVERT_TOTAL_BUDGET_S)
+                state = await settled_state(host, node, time.monotonic() + REVERT_TOTAL_BUDGET_S)
                 out["service_started"] = True
             if state != "active":
                 raise RuntimeError(f"{node.name}: {node.service} is {state!r}; the corruption target was not dropped")
@@ -267,7 +269,7 @@ class OsSshCorruptionDriver(OsSshProcessDriver):
             relation = injected.get("table") or injected.get("relation") or "resilience.corruption_target"
             if not str(relation).startswith("resilience."):
                 raise RuntimeError(f"refusing to drop {relation}: not a harness-owned relation")
-            await host.run(self._psql(node, f"DROP TABLE IF EXISTS {relation}"), timeout_s=SSH_TIMEOUT_S)
+            await host.run(psql_command(node, f"DROP TABLE IF EXISTS {relation}"), timeout_s=SSH_TIMEOUT_S)
         out.update(action=f"DROP TABLE IF EXISTS {relation}", state=state)
         return out
 

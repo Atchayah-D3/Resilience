@@ -20,6 +20,7 @@ from catalog.schema import load_catalog
 from resilience_tests.adapters.base import IntegrityResult
 from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
 from resilience_tests.control import orchestrator as orch
+from resilience_tests.control.faults import corruption as corruption_behaviour
 from resilience_tests.control.matrix import RunPlanItem
 from resilience_tests.control.orchestrator import RunOptions, TestOrchestrator
 from resilience_tests.execution.injectors import corruption as corruption_mod
@@ -394,7 +395,7 @@ def corrupt(env, monkeypatch):
     data-corruption error, the server logs it, the checker sees it, the counter counts it."""
     monkeypatch.setattr(orch, "resolve", lambda fault, prof: CorruptionFault(prof, fault.type))
     monkeypatch.setattr(orch, "LogTailer", EchoTail)
-    monkeypatch.setattr(orch, "CORRUPTION_LOG_WAIT_S", 0.5)
+    monkeypatch.setattr(corruption_behaviour, "CORRUPTION_LOG_WAIT_S", 0.5)
     monkeypatch.setattr(CorruptionFault, "lands_corruption", True)
     monkeypatch.setattr(OutageAdapter, "corruption_sqlstates", ("XX001",), raising=False)
     behaviour = {"read": {"sqlstate": "XX001", "block": BLOCK, "relation_path": PATH, "message": INVALID_PAGE},
