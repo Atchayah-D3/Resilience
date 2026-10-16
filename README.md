@@ -494,7 +494,11 @@ Plus `injection-ledger.jsonl` in the harness machine’s run directory, shared a
 `preflight` / `inject` / `revert`, call `register()` at the bottom of the file, add the file to
 the import line in `injectors/__init__.py`, and add the section to the profile. If the run must
 do anything different for it -- a recovery action, measures of its own -- add a `FaultBehaviour`
-in `control/faults/` with `@register_fault`; the orchestrator itself is not edited.
+in `control/faults/` with `@register_fault`; the orchestrator itself is not edited. A behaviour
+sees the run only through `self.ctx` (`control/faults/context.py`): the scenario, the adapter,
+the run's facts / not-measured reasons / disclosures, T0, and named actions on the fault. When
+a behaviour needs something new from the run, add it there rather than reaching into the
+orchestrator.
 
 **A second database engine** — implement `BaseDatabaseAdapter`, declare its capabilities, and
 `register_adapter()` it against the engine name in the profile. A capability the engine lacks

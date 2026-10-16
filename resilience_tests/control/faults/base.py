@@ -6,14 +6,16 @@ orchestrator calls a hook on the behaviour registered for that fault type (or `d
 value), and never compares a fault type itself. A new fault type is added by registering a
 new behaviour, without editing the orchestrator.
 
-A behaviour is built once per run and reads and writes the run's own state (facts,
-measures, disclosures) through `self.run`.
+A behaviour is built once per run and sees the run only through `self.ctx`, a RunContext
+(context.py): the scenario, the adapter, the run's records and a few actions on the fault.
 """
 
 from __future__ import annotations
 
 import time
 from typing import TYPE_CHECKING, Any, ClassVar
+
+from resilience_tests.control.faults.context import RunContext
 
 if TYPE_CHECKING:
     from resilience_tests.control.orchestrator import TestOrchestrator
@@ -37,22 +39,21 @@ class FaultBehaviour:
     # revert has confirmed the node is back in its pre-fault state
     recovers_unattended: ClassVar[bool] = False
 
-    def __init__(self, run: TestOrchestrator) -> None:
-        self.run = run
+    def __init__(self, ctx: RunContext) -> None:
+        self.ctx = ctx
 
     async def begin_recovery(self) -> dict[str, Any]:
         """Set T1 (the moment recovery may begin) and return the recovery phase's detail."""
-        run = self.run
+        ctx = self.ctx
         if not self.recovers_unattended:
-            raise NotImplementedError(f"recovery for {run.scenario.fault.type}/{run.scenario.fault.duration} not built yet")
+            raise NotImplementedError(f"recovery for {ctx.scenario.fault.type}/{ctx.scenario.fault.duration} not built yet")
         # No harness action: the service comes back on its own (restart policy, or the
         # restart command itself). T1 = T0, so rto_first_write_s and "starts unattended"
         # are measured from the fault. The ledger entry is deliberately left outstanding:
         # cleanup's revert confirms the service is running (and, for a reload, restores the
         # parameter), and a harness crash before then leaves it to the kill switch.
-        assert run.stream is not None
-        run.t1_ns = run.t0_ns
-        run.stream.emit("orchestrator", "t1", t1_mono_ns=run.t1_ns, action="unattended recovery expected")
+        ctx.set_t1(ctx.t0_ns)
+        ctx.emit("t1", t1_mono_ns=ctx.t1_ns, action="unattended recovery expected")
         return {"recovery": "unattended (no harness action)"}
 
     def recovery_hold_s(self, available_bound_s: float) -> float | None:
@@ -76,13 +77,11 @@ class PowerRestoredRecovery(FaultBehaviour):
     (Framework §10.1). T1 = power restored."""
 
     async def begin_recovery(self) -> dict[str, Any]:
-        run = self.run
-        assert run.injector is not None and run.stream is not None
-        entry = next(e for e in run.ledger.outstanding() if e.injection_id == run.facts["injection_id"])
-        power_on = await run.injector.revert(run.node, entry.detail)
-        run.t1_ns = time.monotonic_ns()
-        run.ledger.transition(entry, "reverted", revert=power_on, by="orchestrator")
-        run.stream.emit("orchestrator", "t1", t1_mono_ns=run.t1_ns, action="power restored")
+        ctx = self.ctx
+        entry, power_on = await ctx.revert_fault()
+        ctx.set_t1(time.monotonic_ns())
+        ctx.mark_fault_reverted(entry, power_on)
+        ctx.emit("t1", t1_mono_ns=ctx.t1_ns, action="power restored")
         return {"power_on": power_on}
 
 
@@ -92,13 +91,13 @@ class DuringBehaviour:
 
     during: ClassVar[str] = ""
 
-    def __init__(self, run: TestOrchestrator) -> None:
-        self.run = run
+    def __init__(self, ctx: RunContext) -> None:
+        self.ctx = ctx
 
     async def prepare(self) -> None:
         """Init: create the harness-owned objects the operation works on."""
-        run = self.run
-        run.facts["during_objects"] = await run.adapter.prepare_scenario_objects(self.during)
+        ctx = self.ctx
+        ctx.facts["during_objects"] = await ctx.adapter.prepare_scenario_objects(self.during)
 
     def check_settings(self, observed: dict[str, Any]) -> None:
         """Init: refuse or disclose on the deployment settings observed for this fault."""
@@ -120,21 +119,41 @@ _FAULTS: dict[str, type[FaultBehaviour]] = {}
 _DURING: dict[str, type[DuringBehaviour]] = {}
 
 
+def _register(registry: dict[str, Any], kind: str, name: str, cls: type) -> None:
+    """Refuse a nameless or second registration: silently replacing a behaviour would change
+    what a scenario runs depending on import order."""
+    if not name:
+        raise ValueError(f"{cls.__qualname__} does not set its {kind}")
+    existing = registry.get(name)
+    if existing is not None and existing is not cls:
+        raise ValueError(f"{kind} {name!r} is registered twice: {existing.__module__}.{existing.__qualname__} "
+                         f"and {cls.__module__}.{cls.__qualname__}")
+    registry[name] = cls
+
+
 def register_fault(cls: type[FaultBehaviour]) -> type[FaultBehaviour]:
-    _FAULTS[cls.fault_type] = cls
+    _register(_FAULTS, "fault_type", cls.fault_type, cls)
     return cls
 
 
 def register_during(cls: type[DuringBehaviour]) -> type[DuringBehaviour]:
-    _DURING[cls.during] = cls
+    _register(_DURING, "during", cls.during, cls)
     return cls
 
 
 def fault_behaviour(run: TestOrchestrator) -> FaultBehaviour:
     """The behaviour for the run's fault type; the defaults when none is registered."""
-    return _FAULTS.get(run.scenario.fault.type, FaultBehaviour)(run)
+    return _FAULTS.get(run.scenario.fault.type, FaultBehaviour)(RunContext(run))
 
 
 def during_behaviour(run: TestOrchestrator) -> DuringBehaviour | None:
     during = run.scenario.fault.during
-    return None if during is None else _DURING[during](run)
+    if during is None:
+        return None
+    cls = _DURING.get(during)
+    if cls is None:
+        # the catalog schema only accepts FaultDuring values, so this is a value added there
+        # without a behaviour in control/faults/during.py
+        raise NotImplementedError(f"no behaviour is registered for fault.during {during!r} "
+                                  f"(registered: {', '.join(sorted(_DURING))})")
+    return cls(RunContext(run))
