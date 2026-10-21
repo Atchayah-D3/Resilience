@@ -99,6 +99,13 @@ class OsSsh(_Model):
     driver: Literal["os_ssh"]
 
 
+class Alerting(_Model):
+    """Where the harness reads whether monitoring raised an alert (Framework §10.6 "alerted",
+    §10.7 NL-M-05). `none`: no source is connected, so every "alerted" measure is NOT_MEASURED."""
+
+    source: Literal["none"] = "none"
+
+
 class StorageFault(_Model):
     dm_shim: bool
 
@@ -147,6 +154,7 @@ class EnvProfile(_Model):
     noisy_neighbour: NoisyNeighbour
     os_ssh: OsSsh | None = None
     storage_fault: StorageFault
+    alerting: Alerting = Alerting()
     # Infrastructure this environment provides (docs/infra-requirements.md). A scenario that
     # needs something not listed is skipped with the reason -- never run on a substitute.
     infra: list[InfraFeature] = Field(default_factory=list)

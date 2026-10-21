@@ -11,10 +11,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from resilience_tests.analysis.predicates import NOT_MEASURED
+from resilience_tests.observability.alerts import alert_source_for
+
 if TYPE_CHECKING:
     from catalog.schema import Scenario
     from resilience_tests.adapters.base import BaseDatabaseAdapter
     from resilience_tests.control.orchestrator import TestOrchestrator
+    from resilience_tests.control.profile import Node
+    from resilience_tests.observability.event_stream import EventStream
 
 
 class RunContext:
@@ -55,6 +60,44 @@ class RunContext:
     @property
     def kills_landed(self) -> int:
         return self._run.kills_landed
+
+    @property
+    def baseline(self) -> Any:
+        """The undisturbed load (MeasuredWindow), once the baseline phase has measured it."""
+        return self._run.baseline
+
+    # ------------------------------------------------------------------ observing the target
+
+    @property
+    def node(self) -> Node:
+        """The node under test, for samplers that read it over SSH."""
+        return self._run.node
+
+    @property
+    def stream(self) -> EventStream:
+        """The run's event stream, for samplers that record into it."""
+        assert self._run.stream is not None
+        return self._run.stream
+
+    def open_load_window(self) -> None:
+        """Start an exact measurement window on the running workload (as the baseline's)."""
+        assert self._run.workload is not None
+        self._run.workload.begin_window()
+
+    def close_load_window(self) -> Any:
+        """End it: the MeasuredWindow (every commit counted, p99 over every latency)."""
+        assert self._run.workload is not None
+        return self._run.workload.end_window()
+
+    async def alert_measure(self, measure: str, alert: str, since_wall_s: float, until_wall_s: float) -> Any:
+        """True/False when the environment's alert source can tell whether `alert` fired in the
+        window; otherwise NOT_MEASURED with the source's reason. Kept under facts["alerts"]."""
+        answer = await alert_source_for(self._run.profile).fired(alert, since_wall_s, until_wall_s)
+        self.facts.setdefault("alerts", {})[measure] = {"alert": alert, **answer}
+        if isinstance(answer.get("fired"), bool):
+            return answer["fired"]
+        self.not_measured[measure] = answer.get("note") or "the alert source could not tell"
+        return NOT_MEASURED
 
     # ------------------------------------------------------------------ the timeline
 

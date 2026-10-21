@@ -44,6 +44,7 @@ from resilience_tests.analysis.rto_decomposer import (
     write_recovery,
 )
 from resilience_tests.control.faults import PhaseAbort, during_behaviour, fault_behaviour
+from resilience_tests.control.faults.base import Sampler
 from resilience_tests.control.killswitch import ledger_for, revert_outstanding
 from resilience_tests.control.ledger import InjectionLedger
 from resilience_tests.control.matrix import RunPlanItem, missing_infra
@@ -119,6 +120,7 @@ class TestOrchestrator:
         self.write_prober: WriteProber | None = None
         self.log_tailer: LogTailer | None = None
         self.disk_prober: DiskUsageProber | None = None
+        self.fault_samplers: list[Sampler] = []   # the fault behaviour's own background measurements
         self.injector: FaultInjector | None = None
         self.abort_task: asyncio.Task[None] | None = None
         self.phases: list[PhaseRecord] = []
@@ -277,8 +279,8 @@ class TestOrchestrator:
         """Every phase is bounded by the machine file. A repeated scenario runs its fault
         phase `cycles` times, so its bound is the profile's per-fault bound multiplied by the
         declared cycles plus the settle time between them -- still profile-derived, never a
-        number chosen here."""
-        base = self.profile.phase_timeouts_s[name]
+        number chosen here. A fault held inside a phase adds its hold to that phase's bound."""
+        base = self.profile.phase_timeouts_s[name] + self.fault_behaviour.phase_extension_s(name)
         r = self.scenario.repeat
         if name == "fault_inject" and r is not None:
             return r.cycles * (base + r.interval_s)
@@ -384,6 +386,9 @@ class TestOrchestrator:
         else:
             self.disclosures.append("No standing abort condition is configured for this environment "
                                     "(safety.max_data_fs_used_pct): nothing stops the run if the data filesystem fills.")
+        self.fault_samplers = self.fault_behaviour.samplers()
+        for sampler in self.fault_samplers:
+            sampler.start()
         await self.workload.start()
         self.abort_task = asyncio.create_task(self._abort_monitor(), name="abort-monitor")
         # Warm-up ends on evidence -- every declared worker connected and offering load -- and
@@ -392,8 +397,10 @@ class TestOrchestrator:
         await self.workload.wait_until_ready()
         await asyncio.sleep(WORKLOAD_RAMP_S)
         self.workload.begin_window()
+        await self.fault_behaviour.baseline_started()
         await asyncio.sleep(self.scenario.steady_state.duration_s)
         self.baseline = self.workload.end_window()
+        await self.fault_behaviour.baseline_ended()
         self.stream.emit("orchestrator", "baseline", **asdict(self.baseline))
         check = baseline_slo_check(self.stream.events(), self.workload.window_t0_ns, time.monotonic_ns(),
                                    Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0))
@@ -464,6 +471,8 @@ class TestOrchestrator:
 
     async def _inject_once(self, cycle: int | None = None) -> dict[str, Any]:
         assert self.injector and self.stream
+        # before the ledger intent: a behaviour that refuses here leaves nothing to revert
+        await self.fault_behaviour.before_inject()
         section = self.facts["fault_driver"]["section"]
         entry = self.ledger.intent(run_id=self.run_id, env_profile=self.profile.name, fault_type=self.scenario.fault.type,
                                    driver=self.injector.driver_name, node=self.node.name,
@@ -527,9 +536,20 @@ class TestOrchestrator:
         self._cycle_entries = getattr(self, "_cycle_entries", {})
         self._cycle_entries[cycle] = entry
         self.redo_at_t0.append(redo)
+        await self.fault_behaviour.after_inject(detail)
 
         return {"cycle": cycle, "t0_mono_ns": t0, "redo_distance_bytes": redo,
                 "redo_sampling_delay_ms": sampling_delay_ms, **detail}
+
+    def _slo_t0(self) -> int:
+        """The moment time-to-SLO is measured from: the last cycle's fault for a repeated
+        scenario, T1 for a fault the harness held and released, otherwise T0."""
+        assert self.t0_ns is not None
+        if self.scenario.repeat:
+            return self.cycle_t0s[-1]
+        if self.fault_behaviour.slo_clock_from_t1() and self.t1_ns is not None:
+            return self.t1_ns
+        return self.t0_ns
 
     async def _establish_fault_state(self) -> tuple[dict[str, Any], asyncio.Task[None] | None]:
         """Bring the target into the state the catalog says the fault must land inside
@@ -582,7 +602,7 @@ class TestOrchestrator:
         detail = await self.fault_behaviour.begin_recovery()
 
         baseline = Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0)
-        slo_t0 = self.cycle_t0s[-1] if self.scenario.repeat else self.t0_ns
+        slo_t0 = self._slo_t0()
         self.facts["slo_t0_mono_ns"] = slo_t0
         deadline = time.monotonic() + self.profile.phase_timeouts_s["recovery"] - RECOVERY_EXIT_MARGIN_S
 
@@ -646,7 +666,7 @@ class TestOrchestrator:
                                     "could not have stopped this run (see disk_usage_unavailable events).")
 
         expect_outage = self.fault_behaviour.expects_outage
-        slo_t0 = self.cycle_t0s[-1] if self.scenario.repeat else self.t0_ns
+        slo_t0 = self._slo_t0()
         self.facts["slo_t0_mono_ns"] = slo_t0
         d = decompose(events, slo_t0, Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0),
                       clustered=False, detection_patterns=self.adapter.fault_detection_log_patterns(),
@@ -993,6 +1013,9 @@ class TestOrchestrator:
         if self.disk_prober:
             await self.disk_prober.stop()
             self.disk_prober = None
+        samplers, self.fault_samplers = self.fault_samplers, []
+        for sampler in samplers:
+            await sampler.stop()
         if self.journals:
             self.journals.close()
             self.journals = None

@@ -116,6 +116,8 @@ stops a half-finished run from looking perfect.
 | `adapters/postgresql/` | The only package that knows PostgreSQL. `adapter.py` holds the core (connections, SQL, error meanings, `pg_amcheck`, checksum counters); `corruption.py`, `operations.py` and `sessions.py` add the methods particular faults need. |
 | `adapters/target_resolver.py` | Turns a test’s allowed roles into the actual machines in the file. |
 | `observability/event_stream.py` | The append-only record: one JSON line per event into `events.jsonl`. |
+| `observability/alerts.py` | Asks the environment's monitoring whether an alert fired (`alerting.source` in the profile). Only `none` exists: "alerted" measures are then NOT_MEASURED with the reason. |
+| `analysis/degradation.py` | For a fault held under load: TPS and p99 during the hold over the baseline (`oltp_tps_ratio`, `oltp_p99_ratio`). |
 | `analysis/rto_decomposer.py` | Everything time-related: when service stopped, when writes returned, when throughput truly recovered, and the breakdown. |
 | `analysis/predicates.py` | Evaluates one rule, such as `rpo_txn == 0`, against the measured values. |
 | `analysis/threshold_eval.py` | Applies every rule and produces the verdict, with a reason recorded for each rule. |
@@ -499,6 +501,17 @@ sees the run only through `self.ctx` (`control/faults/context.py`): the scenario
 the run's facts / not-measured reasons / disclosures, T0, and named actions on the fault. When
 a behaviour needs something new from the run, add it there rather than reaching into the
 orchestrator.
+
+Hooks a behaviour may override, in the order the phases call them (each defaults to nothing):
+`samplers()` (extra background measurements, started and stopped with the run's probes),
+`baseline_started()` / `baseline_ended()`, `before_inject()` / `after_inject(detail)`,
+`begin_recovery()`, `recovery_hold_s()`, `measure_client_impact()`, `before_integrity_check()`,
+`measure()`; `phase_extension_s(phase)` adds a hold to that phase's profile bound, and
+`slo_clock_from_t1()` measures time back to SLO from T1. A fault the harness holds and then
+releases (contention, pressure: Framework §10.6) subclasses `HeldFault`: its driver applies the
+fault in `inject`, the recovery phase holds it for `fault.duration` with the workload measured
+in its own window (`on_hold_start` / `on_hold_end` for snapshots), releases it through the
+driver's `revert` (T1), and `oltp_tps_ratio` / `oltp_p99_ratio` are measured for it.
 
 **A second database engine** — implement `BaseDatabaseAdapter`, declare its capabilities, and
 `register_adapter()` it against the engine name in the profile. A capability the engine lacks

@@ -12,9 +12,12 @@ A behaviour is built once per run and sees the run only through `self.ctx`, a Ru
 
 from __future__ import annotations
 
+import asyncio
 import time
-from typing import TYPE_CHECKING, Any, ClassVar
+from dataclasses import asdict
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
+from resilience_tests.analysis.degradation import load_ratios
 from resilience_tests.control.faults.context import RunContext
 
 if TYPE_CHECKING:
@@ -23,6 +26,14 @@ if TYPE_CHECKING:
 
 class PhaseAbort(RuntimeError):
     """The run cannot proceed for a reason that is a finding, not a harness defect."""
+
+
+class Sampler(Protocol):
+    """A background measurement started with the run's probes (the probers' own interface)."""
+
+    def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
 
 
 class FaultBehaviour:
@@ -42,6 +53,34 @@ class FaultBehaviour:
     def __init__(self, ctx: RunContext) -> None:
         self.ctx = ctx
 
+    # Every hook below defaults to doing nothing, so a behaviour overrides only what its
+    # fault needs. In the order the phases call them:
+
+    def phase_extension_s(self, phase: str) -> float:
+        """Seconds this fault adds to `phase`'s profile bound -- the time it is held there, so a
+        fault held longer than the bound is not cut off by it. The bound itself still comes
+        from the profile."""
+        return 0.0
+
+    def samplers(self) -> list[Sampler]:
+        """Extra background measurements for this fault (OS counters, cgroup files, ...). Built
+        when the baseline starts, after the run's own probes, and stopped with them. Each
+        records into the event stream (`self.ctx.stream`)."""
+        return []
+
+    async def baseline_started(self) -> None:
+        """The baseline measurement window has just opened (snapshot counters here)."""
+
+    async def baseline_ended(self) -> None:
+        """The baseline measurement window has just closed."""
+
+    async def before_inject(self) -> None:
+        """Once per injection, before the fault (and before any `fault.during` operation is
+        established) -- never between establishing that operation and the fault itself."""
+
+    async def after_inject(self, detail: dict[str, Any]) -> None:
+        """Right after the fault landed and T0 was recorded; `detail` is the driver's."""
+
     async def begin_recovery(self) -> dict[str, Any]:
         """Set T1 (the moment recovery may begin) and return the recovery phase's detail."""
         ctx = self.ctx
@@ -60,6 +99,12 @@ class FaultBehaviour:
         """A fixed time to observe after the fault instead of waiting for the return to SLO,
         or None to wait for the SLO. `available_bound_s` is what the recovery phase allows."""
         return None
+
+    def slo_clock_from_t1(self) -> bool:
+        """Measure time back to SLO from T1 instead of T0. For a fault the harness holds and
+        then releases, degradation during the hold is the point of the test, not slowness to
+        recover from it."""
+        return False
 
     def measure_client_impact(self, m: dict[str, Any]) -> None:
         """Measures read from the client-visible disturbance already in `m`."""
@@ -83,6 +128,71 @@ class PowerRestoredRecovery(FaultBehaviour):
         ctx.mark_fault_reverted(entry, power_on)
         ctx.emit("t1", t1_mono_ns=ctx.t1_ns, action="power restored")
         return {"power_on": power_on}
+
+
+class HeldFault(FaultBehaviour):
+    """A fault held for `fault.duration` and then released by the harness: contention and
+    pressure (Framework §10.6 NL-N recovery procedure: contention injected -> the database
+    degrades without crashing -> contention clears -> performance returns to baseline, with no
+    recovery action by anyone).
+
+    The driver's `inject` applies the fault and returns at once (T0). Recovery holds it with
+    the workload running, measured in its own exact window, then reverts it through the driver
+    (T1 = released), and the phase watches the return to SLO from there. The hold is added to
+    the recovery phase's bound. Subclasses add snapshots in `on_hold_start` / `on_hold_end`.
+
+    Measures produced for every held fault: oltp_tps_ratio and oltp_p99_ratio (load during
+    the hold over the baseline, analysis/degradation.py)."""
+
+    def _hold_s(self) -> float | None:
+        duration = self.ctx.scenario.fault.duration
+        return None if duration == "permanent" else float(duration)
+
+    def phase_extension_s(self, phase: str) -> float:
+        return (self._hold_s() or 0.0) if phase == "recovery" else 0.0
+
+    async def before_inject(self) -> None:
+        if self._hold_s() is None:
+            # refused before anything is applied: a held fault with no end would never clear
+            raise PhaseAbort(f"{self.ctx.scenario.fault.type} is held and released by the harness, "
+                             "so the scenario must set fault.duration (seconds)")
+
+    async def on_hold_start(self) -> None:
+        """The fault is applied and the hold window has opened."""
+
+    async def on_hold_end(self) -> None:
+        """The hold is over; the fault is still applied (released right after this)."""
+
+    async def begin_recovery(self) -> dict[str, Any]:
+        ctx = self.ctx
+        hold_s = self._hold_s()
+        assert hold_s is not None   # before_inject refused otherwise
+        window: dict[str, Any] = {"planned_s": hold_s, "start_wall_s": time.time(),
+                                  "start_mono_ns": time.monotonic_ns()}
+        ctx.facts["hold"] = window
+        ctx.emit("hold_start", planned_s=hold_s)
+        ctx.open_load_window()
+        await self.on_hold_start()
+        await asyncio.sleep(hold_s)
+        await self.on_hold_end()
+        held = ctx.close_load_window()
+        window.update(end_wall_s=time.time(), end_mono_ns=time.monotonic_ns(), load=asdict(held))
+        self._held = held
+        ctx.emit("hold_end", tps=held.tps, p99_ms=held.p99_ms)
+
+        entry, released = await ctx.revert_fault()
+        ctx.set_t1(time.monotonic_ns())
+        ctx.mark_fault_reverted(entry, released)
+        ctx.emit("t1", t1_mono_ns=ctx.t1_ns, action="fault released after hold")
+        return {"held_s": round((window["end_mono_ns"] - window["start_mono_ns"]) / 1e9, 3), "released": released}
+
+    def slo_clock_from_t1(self) -> bool:
+        return True
+
+    async def measure(self, events: list[Any]) -> dict[str, Any]:
+        ratios, why = load_ratios(getattr(self, "_held", None), self.ctx.baseline)
+        self.ctx.not_measured.update(why)
+        return ratios
 
 
 class DuringBehaviour:

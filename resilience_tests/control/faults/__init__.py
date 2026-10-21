@@ -10,6 +10,7 @@ from resilience_tests.control.faults import (  # noqa: F401  (registers behaviou
 from resilience_tests.control.faults.base import (  # noqa: F401
     DuringBehaviour,
     FaultBehaviour,
+    HeldFault,
     PhaseAbort,
     during_behaviour,
     fault_behaviour,
