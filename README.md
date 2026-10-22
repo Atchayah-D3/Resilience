@@ -576,3 +576,99 @@ deliberately not used: on a customer cluster it would scan every database they o
 not finish inside the validate time limit.
 
 → `adapters/postgresql/adapter.py`, `control/profile.py`
+
+## 13. Design note: tests on several machines (Tier 2 and 3)
+
+**Status: not built.** This note records the plan for the cluster (CL, Tier 2) and distributed
+(DX, Tier 3) scenarios, so the work can start from an agreed design. Until it is built:
+- cluster scenarios cannot run: there is no cluster `Role` to declare yet, and on a node whose
+  role is not `standalone` the orchestrator stops at the Tier-2 checks (`NotImplementedError`);
+- a compound scenario (CL-X) is refused with a reason, in the run plan and again in init
+  (`control/matrix.py` `not_built_reason`). Nothing injects its second fault yet, and a run that
+  applied only the first could pass without testing the scenario.
+
+### What is in place today
+
+| Already supports several machines | Still assumes one machine per run |
+|---|---|
+| The environment file lists any number of `nodes`, each with `role` and `topology_role` (primary, sync_standby, async_standby) and a `client` endpoint (the pooler, if there is one) | `RunPlanItem.node`: a run gets one node |
+| The scenario names the fault's target (`fault.target`: primary or sync_standby) | `TestOrchestrator.node`: used in 24 places (probes, injection, integrity check, safety) |
+| `TargetResolver` chooses nodes through a replaceable `ResolverStrategy` | `RunContext.node`: fault classes see one node |
+| The safety controller counts nodes affected (compound scenarios: at most 2) | RTO decomposition is called with `clustered=False`; Tier-2 probes raise `NotImplementedError` (`orchestrator.py`) |
+| The injection ledger records the node of every injection | Only `standalone` and `distdb.*` exist as `Role` values (`catalog/schema.py`) |
+
+Fault classes, drivers, the driver and fault registries, the database adapter interface, the
+verdict and the report do not change. New cluster faults are added as new classes, as today.
+
+### Proposed design
+
+**1. Environment file: describe the cluster.** The node list stays. Add a `cluster` section
+for what belongs to the whole group, and a role for members of a PostgreSQL HA group:
+
+```yaml
+cluster:
+  manager: patroni                       # who elects the primary; read, never configured
+  manager_api: {port: 8008}              # where the current primary and state are read
+  consensus: [10.0.0.21:2379, 10.0.0.22:2379, 10.0.0.23:2379]   # etcd
+nodes:
+  - {name: pg-a, role: ha_member, topology_role: primary, ...}
+  - {name: pg-b, role: ha_member, topology_role: sync_standby, ...}
+  - {name: pg-c, role: ha_member, topology_role: async_standby, ...}
+```
+
+`topology_role` in the file is only the starting layout. After a failover the primary is a
+different machine, so the current roles are read from the cluster manager when needed (a new
+`ResolverStrategy`, e.g. `PatroniStrategy`).
+
+**2. Run plan: one run gets the whole group.** `RunPlanItem` carries a `Topology`: every node of
+the group, plus the node the fault targets. A standalone profile gives a topology of one node,
+so today's scenarios run exactly as now.
+
+**3. Orchestrator: work on the topology, not one node.**
+
+| Today | Planned |
+|---|---|
+| `self.node` everywhere | `self.topology`; the fault node is `topology.target(fault.target)`, resolved at injection time |
+| write probes on the node | write probes on the `client` endpoint (pooler or virtual IP), as an application would see it |
+| integrity check on the node | integrity check on the current primary, plus a primary-to-replica data comparison |
+| `clustered=False` | `clustered=topology.is_cluster`: detect / elect / promote times become measurable |
+| Tier-2 probes raise `NotImplementedError` | replication lag, standby health and leader changes as samplers on each node |
+| safety checks the one node | safety checks every node, and the blast radius against the topology |
+
+**4. RunContext: give fault classes the group.** Add `ctx.topology` (all nodes, the current
+primary) and `ctx.node_for(role)`. `ctx.node` stays, meaning the fault's target, so existing
+fault classes need no change.
+
+**5. Compound faults (CL-X).** A second driver is resolved for `compound.fault_b` and its target
+node. A watcher waits for the trigger (`on_state`, `on_metric` or `after_phase`, within
+`timeout_s`) and injects fault B, with its own ledger entry. If the trigger never comes, the run
+is aborted. A compound run never reports a pass when only fault A was applied. The guard is
+removed when this is built.
+
+**6. Distributed tests (Tier 3).** A DistDB adapter in `adapters/distdb/`. Topology roles for the
+primary coordinator, query coordinators and workers (`distdb.pc`, `distdb.qc`,
+`distdb.worker`, already in the schema).
+
+### Order of work
+
+| Step | Proves | Existing scenarios |
+|---|---|---|
+| 1. `Topology` model + environment `cluster` section; standalone = topology of one | the model | must give identical results (before/after comparison of the orchestrator tests) |
+| 2. Orchestrator and `RunContext` use the topology | the refactor | identical results again; then a live run of every scenario |
+| 3. Cluster probes and clustered RTO decomposition | cluster measurements | unchanged (standalone skips them) |
+| 4. First cluster scenario, CL-F-02 (kill the primary), on a lab cluster | the whole chain on real machines | — |
+| 5. Remaining CL scenarios, a few at a time, with their drivers (network, pooler, backup) | each scenario | — |
+| 6. Compound injection; remove the guard | CL-X | — |
+| 7. DistDB adapter and roles | Tier 3 | — |
+
+### Decisions needed before step 1
+
+- The lab cluster: machines, cluster manager (Patroni assumed), pooler, consensus store.
+- Checks that apply only to a cluster (e.g. `leader_changed == false`) on a standalone target:
+  proposal is to mark them cluster-only and report them as not applicable there, with the
+  reason.
+- Whether a cluster test may change the cluster manager's state (e.g. pause automatic failover
+  for a test). The current rule is that configuration is observed, never written.
+
+→ `control/matrix.py`, `control/orchestrator.py`, `control/faults/context.py`,
+`control/profile.py`, `adapters/target_resolver.py`

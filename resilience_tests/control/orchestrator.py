@@ -47,7 +47,7 @@ from resilience_tests.control.faults import PhaseAbort, during_behaviour, fault_
 from resilience_tests.control.faults.base import Sampler
 from resilience_tests.control.killswitch import ledger_for, revert_outstanding
 from resilience_tests.control.ledger import InjectionLedger
-from resilience_tests.control.matrix import RunPlanItem, missing_infra
+from resilience_tests.control.matrix import RunPlanItem, missing_infra, not_built_reason
 from resilience_tests.control.profile import EnvProfile
 from resilience_tests.control.reset import resolve_reset
 from resilience_tests.control.safety import SafetyController, SafetyViolation
@@ -310,6 +310,11 @@ class TestOrchestrator:
 
     async def _p_init(self) -> dict[str, Any]:
         assert self.stream is not None
+        not_built = not_built_reason(self.scenario)
+        if not_built:
+            # the run plan skips these too; refused here before anything is applied, so a direct
+            # run can never report a pass for a fault it did not inject
+            raise PhaseAbort(not_built)
         lacking = missing_infra(self.scenario, self.profile)
         if lacking:
             # the run plan skips these; refused here too, so a direct run cannot measure a

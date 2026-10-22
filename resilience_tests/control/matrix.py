@@ -38,6 +38,19 @@ def missing_infra(scenario: Scenario, profile: EnvProfile) -> list[str]:
     return sorted(set(scenario.needs_infra) - set(profile.infra))
 
 
+def not_built_reason(scenario: Scenario) -> str | None:
+    """Why the harness cannot run this scenario to specification yet, or None.
+
+    A compound scenario (CL-X) declares a second fault, `compound.fault_b`, that nothing injects
+    yet: run anyway, it would apply fault A alone and could pass without being tested. Refused
+    until compound injection is built with the Tier-2 work (README: "Design note: tests on
+    several machines")."""
+    if scenario.compound is not None:
+        return ("compound faults are not built yet: compound.fault_b would never be injected, "
+                "so the scenario cannot be run to specification")
+    return None
+
+
 def expand(catalog: Catalog, profile: EnvProfile, *, reference_env_class: str,
            only: set[str] | None = None) -> tuple[list[RunPlanItem], list[Skipped]]:
     """Run plan for ONE environment profile. Scenarios whose classes exclude this profile's
@@ -62,6 +75,10 @@ def expand(catalog: Catalog, profile: EnvProfile, *, reference_env_class: str,
         missing = sorted(set(sc.requires) - engine_can)
         if missing:
             skipped.append(Skipped(sid, f"engine {engine!r} lacks {', '.join(missing)}"))
+            continue
+        not_built = not_built_reason(sc)
+        if not_built:
+            skipped.append(Skipped(sid, not_built))
             continue
         lacking = missing_infra(sc, profile)
         if lacking:
