@@ -56,6 +56,11 @@ class FaultBehaviour:
     # Every hook below defaults to doing nothing, so a behaviour overrides only what its
     # fault needs. In the order the phases call them:
 
+    async def observe_settings(self) -> dict[str, str]:
+        """Init: the engine settings that decide how this fault plays out, read through the
+        adapter -- never written. Recorded and disclosed with the result."""
+        return {}
+
     def phase_extension_s(self, phase: str) -> float:
         """Seconds this fault adds to `phase`'s profile bound -- the time it is held there, so a
         fault held longer than the bound is not cut off by it. The bound itself still comes
@@ -206,8 +211,15 @@ class DuringBehaviour:
 
     async def prepare(self) -> None:
         """Init: create the harness-owned objects the operation works on."""
-        ctx = self.ctx
-        ctx.facts["during_objects"] = await ctx.adapter.prepare_scenario_objects(self.during)
+        self.ctx.facts["during_objects"] = await self.create_objects()
+
+    async def create_objects(self) -> dict[str, Any]:
+        """The objects this operation needs, created through the adapter. Default: none."""
+        return {}
+
+    async def observe_settings(self) -> dict[str, str]:
+        """Init: the engine settings that decide whether the operation can run (read only)."""
+        return {}
 
     def check_settings(self, observed: dict[str, Any]) -> None:
         """Init: refuse or disclose on the deployment settings observed for this fault."""

@@ -17,8 +17,11 @@ is unchanged.
 
 ![Recommended architecture](architecture-recommended.svg)
 
-*Figure: the orchestrator calls three extension points: fault classes, fault drivers, and the
-database adapter. Green = added in this work. Dashed = recommended next.*
+*Figure, part 1: how the code is organised now. The orchestrator uses three groups of
+classes: fault classes, fault drivers and the database adapter. In each group the base class is
+dark, and every subclass is joined to its base class by an arrow that points to the base
+class. Part 2: each file that changed, before and after. Green = added in this work.
+Dashed = recommended next.*
 
 ---
 
@@ -31,7 +34,6 @@ database adapter. Green = added in this work. Dashed = recommended next.*
 | Orchestrator size | 1,571 lines | 1,100 lines |
 | Database adapter | one class with 58 methods | one core class + three groups by topic |
 | Support for faults applied for a set time and then removed | none | added |
-| Automated tests passing | 427 | 440 |
 | Behaviour of existing tests | — | unchanged |
 
 ---

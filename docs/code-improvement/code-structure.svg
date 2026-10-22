@@ -1,0 +1,279 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1300" height="1596" viewBox="0 0 1300 1596" role="img" aria-label="Resilience test harness: architecture and code structure">
+<title>Resilience test harness: architecture and code structure</title>
+<style>
+ text{font-family:'IBM Plex Sans','DejaVu Sans',Verdana,sans-serif;fill:#131b22}
+ .h1{font-size:24px;font-weight:600}
+ .h2{font-size:18px;font-weight:600}
+ .sub{font-size:13px;fill:#5a6b78}
+ .step{font-family:'IBM Plex Mono','DejaVu Sans Mono',monospace;font-size:11px;fill:#5a6b78;letter-spacing:1.2px}
+ .ti{font-size:15px;font-weight:600}
+ .tib{font-size:13px;font-weight:600}
+ .path{font-family:'IBM Plex Mono','DejaVu Sans Mono',monospace;font-size:11px;fill:#5a6b78}
+ .code{font-family:'IBM Plex Mono','DejaVu Sans Mono',monospace;font-size:11.5px;fill:#131b22}
+ .bd{font-size:12px;fill:#3c4a55}
+ .chip{font-size:12px;fill:#131b22}
+ .midn{font-size:12px;font-weight:600;fill:#131b22}
+ .basen{font-size:13px;font-weight:600;fill:#ffffff}
+ .basetag{font-family:'IBM Plex Mono','DejaVu Sans Mono',monospace;font-size:9.5px;fill:#c9d6df;letter-spacing:1px}
+ .note{font-size:10.5px;fill:#5a6b78}
+ .small{font-size:11px;fill:#5a6b78}
+ .next{font-size:12px;fill:#5a6b78;font-style:italic}
+ .ph{font-size:11px;text-anchor:middle}
+ .arr{font-size:12px;fill:#3c4a55}
+ .colh{font-size:13px;font-weight:600;fill:#5a6b78;letter-spacing:.5px}
+</style>
+<defs><marker id="am" viewBox="0 0 8 8" refX="4" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 1 L5 4 L0 7z" fill="#5a6b78"/></marker><marker id="uses" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M1 1 L8 5 L1 9" fill="none" stroke="#3c4a55" stroke-width="1.4"/></marker></defs>
+<rect x="0" y="0" width="1300" height="1596" rx="0" fill="#ffffff" stroke="none" stroke-width="1.2"/>
+<text x="40" y="44" class="h1">Resilience test harness: architecture and code structure</text>
+<text x="40" y="68" class="sub">Part 1 shows how the classes are organised now. Part 2 shows which files changed and how.</text>
+<text x="40" y="104" class="step">PART 1 · HOW THE CODE IS ORGANISED NOW</text>
+<rect x="40" y="116" width="280" height="62" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<text x="54" y="138" class="tib">Test definition</text>
+<text x="54" y="156" class="path">catalog/NL/&lt;ID&gt;.yaml</text>
+<text x="54" y="171" class="small">fault, what to measure, pass criteria</text>
+<rect x="40" y="188" width="280" height="62" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<text x="54" y="210" class="tib">Environment file</text>
+<text x="54" y="228" class="path">envs/&lt;lab&gt;.yaml</text>
+<text x="54" y="243" class="small">machines, driver to use, time limits</text>
+<line x1="322" y1="183" x2="352" y2="183" stroke="#5a6b78" stroke-width="1.4" marker-end="url(#am)"/>
+<rect x="360" y="116" width="900" height="134" rx="6" fill="#ffffff" stroke="#7d93a1" stroke-width="1.6"/>
+<text x="376" y="140" class="ti">TestOrchestrator</text>
+<text x="540" y="140" class="path">control/orchestrator.py</text>
+<text x="376" y="160" class="bd">Runs the same nine phases for every test. Contains no fault-specific code.</text>
+<rect x="376.0" y="170" width="94" height="26" rx="4" fill="#f3f6f8" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="423.0" y="187" class="ph">reset</text>
+<rect x="472.5" y="170" width="94" height="26" rx="4" fill="#f3f6f8" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="519.5" y="187" class="ph">init</text>
+<rect x="569.0" y="170" width="94" height="26" rx="4" fill="#f3f6f8" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="616.0" y="187" class="ph">baseline</text>
+<rect x="665.5" y="170" width="94" height="26" rx="4" fill="#f3f6f8" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="712.5" y="187" class="ph">pre-fault</text>
+<rect x="762.0" y="170" width="94" height="26" rx="4" fill="#f3f6f8" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="809.0" y="187" class="ph">fault injection</text>
+<rect x="858.5" y="170" width="94" height="26" rx="4" fill="#f3f6f8" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="905.5" y="187" class="ph">recovery</text>
+<rect x="955.0" y="170" width="94" height="26" rx="4" fill="#f3f6f8" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="1002.0" y="187" class="ph">validate</text>
+<rect x="1051.5" y="170" width="94" height="26" rx="4" fill="#f3f6f8" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="1098.5" y="187" class="ph">report</text>
+<rect x="1148.0" y="170" width="94" height="26" rx="4" fill="#f3f6f8" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="1195.0" y="187" class="ph">cleanup</text>
+<rect x="376" y="206" width="430" height="34" rx="4" fill="#ffffff" stroke="#dbe3e8" stroke-width="1.2"/>
+<text x="388" y="227" class="small">Safety: every fault is recorded before it is applied and can be undone</text>
+<rect x="814" y="206" width="430" height="34" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="826" y="227" class="small">RunContext: the only access fault classes have to the test run</text>
+<line x1="100" y1="252" x2="100" y2="290" stroke="#5a6b78" stroke-width="1.4" marker-end="url(#am)"/>
+<text x="110" y="276" class="arr">looks up by fault type</text>
+<line x1="515" y1="252" x2="515" y2="290" stroke="#5a6b78" stroke-width="1.4" marker-end="url(#am)"/>
+<text x="525" y="276" class="arr">looks up by environment driver</text>
+<line x1="930" y1="252" x2="930" y2="290" stroke="#5a6b78" stroke-width="1.4" marker-end="url(#am)"/>
+<text x="940" y="276" class="arr">database calls</text>
+<rect x="40" y="296" width="390" height="540" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<rect x="455" y="296" width="390" height="540" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<rect x="870" y="296" width="390" height="540" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<text x="56" y="322" class="ti">Fault classes</text>
+<text x="180" y="322" class="path">control/faults/  (new folder)</text>
+<text x="56" y="342" class="bd">What the test does for this fault: how recovery</text>
+<text x="56" y="358" class="bd">starts and what extra to measure.</text>
+<rect x="56" y="372" width="358" height="30" rx="4" fill="#1f3a4d" stroke="#1f3a4d" stroke-width="1.2"/>
+<text x="66" y="392" class="basen">FaultBehaviour</text>
+<text x="404" y="392" class="basetag" text-anchor="end">BASE CLASS · NEW</text>
+<rect x="96" y="424" width="318" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="106" y="441" class="chip">ProcessKill</text>
+<rect x="96" y="458" width="318" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="106" y="475" class="chip">ServiceRestart</text>
+<rect x="96" y="492" width="318" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="106" y="509" class="chip">ConfigReload</text>
+<rect x="96" y="526" width="318" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="106" y="543" class="chip">ConnectionExhaustion</text>
+<rect x="96" y="560" width="318" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="106" y="577" class="chip">IdleTransaction</text>
+<rect x="96" y="594" width="318" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="106" y="611" class="chip">DataCorruption</text>
+<rect x="96" y="628" width="318" height="26" rx="4" fill="#e9f5ee" stroke="#1f3a4d" stroke-width="1.6"/>
+<text x="106" y="645" class="midn">PowerRestoredRecovery</text>
+<text x="406" y="645" class="note" text-anchor="end">restores power</text>
+<polygon points="116,654 109,665 123,665" fill="#ffffff" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="116" y1="665" x2="116" y2="685" stroke="#1f3a4d" stroke-width="1.3"/>
+<rect x="136" y="672" width="278" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="146" y="689" class="chip">HostPowerLoss</text>
+<line x1="116" y1="685" x2="136" y2="685" stroke="#1f3a4d" stroke-width="1.3"/>
+<rect x="96" y="712" width="318" height="26" rx="4" fill="#e9f5ee" stroke="#1f3a4d" stroke-width="1.6"/>
+<text x="106" y="729" class="midn">HeldFault</text>
+<text x="406" y="729" class="note" text-anchor="end">held for a set time</text>
+<polygon points="116,738 109,749 123,749" fill="#ffffff" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="116" y1="749" x2="116" y2="769" stroke="#1f3a4d" stroke-width="1.3"/>
+<rect x="136" y="756" width="278" height="26" rx="4" fill="#ffffff" stroke="#9aa9b3" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="146" y="773" class="next">Noisy-neighbour faults (next)</text>
+<line x1="116" y1="769" x2="136" y2="769" stroke="#1f3a4d" stroke-width="1.3"/>
+<polygon points="76,402 69,413 83,413" fill="#ffffff" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="76" y1="413" x2="76" y2="725" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="76" y1="437" x2="96" y2="437" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="76" y1="471" x2="96" y2="471" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="76" y1="505" x2="96" y2="505" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="76" y1="539" x2="96" y2="539" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="76" y1="573" x2="96" y2="573" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="76" y1="607" x2="96" y2="607" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="76" y1="641" x2="96" y2="641" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="76" y1="725" x2="96" y2="725" stroke="#1f3a4d" stroke-width="1.3"/>
+<text x="471" y="322" class="ti">Fault drivers</text>
+<text x="595" y="322" class="path">execution/injectors/</text>
+<text x="471" y="342" class="bd">How the fault is applied to the machine and</text>
+<text x="471" y="358" class="bd">removed again.</text>
+<rect x="471" y="372" width="358" height="30" rx="4" fill="#1f3a4d" stroke="#1f3a4d" stroke-width="1.2"/>
+<text x="481" y="392" class="basen">FaultInjector</text>
+<text x="819" y="392" class="basetag" text-anchor="end">BASE CLASS</text>
+<rect x="511" y="424" width="318" height="26" rx="4" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.1"/>
+<text x="521" y="441" class="chip">OsSshProcessDriver</text>
+<text x="821" y="441" class="note" text-anchor="end">process.py</text>
+<rect x="511" y="458" width="318" height="26" rx="4" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.1"/>
+<text x="521" y="475" class="chip">OsSshCorruptionDriver</text>
+<text x="821" y="475" class="note" text-anchor="end">corruption.py</text>
+<rect x="511" y="492" width="318" height="26" rx="4" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.1"/>
+<text x="521" y="509" class="chip">LibvirtPowerDriver</text>
+<text x="821" y="509" class="note" text-anchor="end">power.py</text>
+<rect x="511" y="526" width="318" height="26" rx="4" fill="#ffffff" stroke="#9aa9b3" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="521" y="543" class="next">CPU / memory limit driver (next)</text>
+<rect x="511" y="560" width="318" height="26" rx="4" fill="#ffffff" stroke="#9aa9b3" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="521" y="577" class="next">Load from a second VM (next)</text>
+<polygon points="491,402 484,413 498,413" fill="#ffffff" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="413" x2="491" y2="573" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="437" x2="511" y2="437" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="471" x2="511" y2="471" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="505" x2="511" y2="505" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="539" x2="511" y2="539" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="573" x2="511" y2="573" stroke="#1f3a4d" stroke-width="1.3"/>
+<text x="471" y="610" class="bd">OsSshProcessDriver uses one small class per fault:</text>
+<path d="M 829 437 H 839 V 636 H 833" fill="none" stroke="#3c4a55" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#uses)"/>
+<text x="831" y="597" class="note" text-anchor="end">uses</text>
+<rect x="471" y="622" width="358" height="28" rx="4" fill="#1f3a4d" stroke="#1f3a4d" stroke-width="1.2"/>
+<text x="481" y="642" class="basen">_ProcessFault</text>
+<text x="819" y="642" class="basetag" text-anchor="end">BASE CLASS · NEW</text>
+<rect x="511" y="664" width="318" height="24" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="521" y="681" class="chip">_ProcessKill</text>
+<rect x="511" y="694" width="318" height="24" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="521" y="711" class="chip">_ServiceRestart</text>
+<rect x="511" y="724" width="318" height="24" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="521" y="741" class="chip">_ConfigReload</text>
+<rect x="511" y="754" width="318" height="24" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="521" y="771" class="chip">_IdleTransaction</text>
+<rect x="511" y="784" width="318" height="24" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="521" y="801" class="chip">_ConnectionExhaustion</text>
+<polygon points="491,650 484,661 498,661" fill="#ffffff" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="661" x2="491" y2="796" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="676" x2="511" y2="676" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="706" x2="511" y2="706" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="736" x2="511" y2="736" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="766" x2="511" y2="766" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="491" y1="796" x2="511" y2="796" stroke="#1f3a4d" stroke-width="1.3"/>
+<text x="886" y="322" class="ti">Database adapter</text>
+<text x="1052" y="322" class="path">adapters/</text>
+<text x="886" y="342" class="bd">The only code that is specific to PostgreSQL.</text>
+<rect x="886" y="372" width="358" height="30" rx="4" fill="#1f3a4d" stroke="#1f3a4d" stroke-width="1.2"/>
+<text x="896" y="392" class="basen">BaseDatabaseAdapter</text>
+<text x="1234" y="392" class="basetag" text-anchor="end">BASE CLASS</text>
+<rect x="926" y="424" width="318" height="26" rx="4" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.1"/>
+<text x="936" y="441" class="chip">PostgreSQLAdapter</text>
+<text x="1236" y="441" class="note" text-anchor="end">adapter.py · core</text>
+<polygon points="1210,450 1203,461 1217,461" fill="#ffffff" stroke="#1f3a4d" stroke-width="1.3"/>
+<rect x="946" y="476" width="244" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="956" y="493" class="chip">CorruptionMixin</text>
+<text x="1182" y="493" class="note" text-anchor="end">corruption.py</text>
+<rect x="946" y="510" width="244" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="956" y="527" class="chip">OperationsMixin</text>
+<text x="1182" y="527" class="note" text-anchor="end">operations.py</text>
+<rect x="946" y="544" width="244" height="26" rx="4" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.3"/>
+<text x="956" y="561" class="chip">SessionsMixin</text>
+<text x="1182" y="561" class="note" text-anchor="end">sessions.py</text>
+<line x1="1210" y1="461" x2="1210" y2="557" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="1210" y1="489" x2="1190" y2="489" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="1210" y1="523" x2="1190" y2="523" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="1210" y1="557" x2="1190" y2="557" stroke="#1f3a4d" stroke-width="1.3"/>
+<rect x="926" y="590" width="318" height="26" rx="4" fill="#ffffff" stroke="#9aa9b3" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="936" y="607" class="next">Second database adapter (next)</text>
+<line x1="906" y1="413" x2="906" y2="603" stroke="#1f3a4d" stroke-width="1.3"/>
+<polygon points="906,402 899,413 913,413" fill="#ffffff" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="906" y1="437" x2="926" y2="437" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="906" y1="603" x2="926" y2="603" stroke="#1f3a4d" stroke-width="1.3"/>
+<text x="886" y="650" class="small">PostgreSQLAdapter inherits from the base class and</text>
+<text x="886" y="666" class="small">from three method groups (mixins). Each group</text>
+<text x="886" y="682" class="small">holds the methods for one topic, in its own file.</text>
+<line x1="650" y1="838" x2="650" y2="864" stroke="#5a6b78" stroke-width="1.4" marker-end="url(#am)"/>
+<text x="660" y="856" class="arr">events and measurements</text>
+<rect x="40" y="870" width="1220" height="56" rx="6" fill="#ffffff" stroke="#b9c8d0" stroke-width="1.4"/>
+<text x="56" y="893" class="tib">Analysis</text>
+<text x="126" y="893" class="path">analysis/ · observability/</text>
+<text x="56" y="914" class="small">Measurements are checked against the pass criteria. A value that cannot be measured is reported as "not measured" and fails.</text>
+<rect x="940" y="880" width="304" height="36" rx="4" fill="#f3f6f8" stroke="#7d93a1" stroke-width="1.2"/>
+<text x="952" y="903" class="tib">Result: pass / fail</text>
+<rect x="40" y="952" width="22" height="14" rx="3" fill="#1f3a4d"/>
+<text x="70" y="964" class="small">base class</text>
+<rect x="160" y="952" width="22" height="14" rx="3" fill="#dde7ee" stroke="#1f3a4d" stroke-width="1.4"/>
+<text x="190" y="964" class="small">subclass that is also a base class (bold border)</text>
+<rect x="470" y="952" width="22" height="14" rx="3" fill="#ffffff" stroke="#b9c8d0"/>
+<text x="500" y="964" class="small">subclass</text>
+<rect x="570" y="952" width="22" height="14" rx="3" fill="#e9f5ee" stroke="#3d9a5f"/>
+<text x="600" y="964" class="small">added in this work</text>
+<rect x="720" y="952" width="22" height="14" rx="3" fill="#ffffff" stroke="#9aa9b3" stroke-dasharray="4 3"/>
+<text x="750" y="964" class="small">recommended next</text>
+<polygon points="892,953 885,964 899,964" fill="#ffffff" stroke="#1f3a4d" stroke-width="1.3"/>
+<line x1="892" y1="964" x2="892" y2="968" stroke="#1f3a4d" stroke-width="1.3"/>
+<text x="906" y="964" class="small">inherits from (points to the base class)</text>
+<line x1="1160" y1="959" x2="1192" y2="959" stroke="#3c4a55" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#uses)"/>
+<text x="1202" y="964" class="small">uses</text>
+<line x1="40" y1="992" x2="1260" y2="992" stroke="#dbe3e8" stroke-width="1"/>
+<text x="40" y="1022" class="step">PART 2 · CODE STRUCTURE: BEFORE → AFTER</text>
+<text x="40" y="1048" class="colh">BEFORE</text>
+<text x="680" y="1048" class="colh">AFTER</text>
+<rect x="40" y="1058" width="580" height="140" rx="6" fill="#fbf1ef" stroke="#c98b84" stroke-width="1.2"/>
+<rect x="680" y="1058" width="580" height="140" rx="6" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.2"/>
+<text x="54" y="1080" class="tib">Orchestrator and fault-specific code</text>
+<text x="694" y="1080" class="tib">Orchestrator and fault-specific code</text>
+<text x="54" y="1102" class="code">control/orchestrator.py · 1,571 lines</text>
+<text x="54" y="1121" class="bd">• the nine phases and the code for each fault in one file</text>
+<text x="54" y="1140" class="bd">• 12 checks of the fault name and 3 fixed lists of fault names</text>
+<text x="54" y="1159" class="bd">• one _measure_&lt;fault&gt;() method per fault</text>
+<text x="54" y="1178" class="bd">• adding a fault meant editing this file in several places</text>
+<text x="694" y="1102" class="code">control/orchestrator.py · 1,100 lines · no fault names</text>
+<text x="694" y="1121" class="code">control/faults/  (new folder)</text>
+<text x="694" y="1140" class="bd">• base.py: FaultBehaviour, HeldFault, registration of fault classes</text>
+<text x="694" y="1159" class="bd">• context.py: RunContext</text>
+<text x="694" y="1178" class="bd">• service.py, corruption.py, idle_transaction.py, connection_exhaustion.py, during.py</text>
+<line x1="628" y1="1128.0" x2="672" y2="1128.0" stroke="#5a6b78" stroke-width="1.6" marker-end="url(#am)"/>
+<rect x="40" y="1212" width="580" height="140" rx="6" fill="#fbf1ef" stroke="#c98b84" stroke-width="1.2"/>
+<rect x="680" y="1212" width="580" height="140" rx="6" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.2"/>
+<text x="54" y="1234" class="tib">Fault drivers</text>
+<text x="694" y="1234" class="tib">Fault drivers</text>
+<text x="54" y="1256" class="code">execution/injectors/process.py · 543 lines</text>
+<text x="54" y="1275" class="bd">• one class, OsSshProcessDriver, for five faults</text>
+<text x="54" y="1294" class="bd">• 15 checks of the fault name inside its methods</text>
+<text x="54" y="1313" class="bd">• corruption.py: OsSshCorruptionDriver inherited from OsSshProcessDriver</text>
+<text x="54" y="1332" class="bd">• the orchestrator set the driver's fields one by one</text>
+<text x="694" y="1256" class="code">execution/injectors/process.py · 578 lines</text>
+<text x="694" y="1275" class="bd">• OsSshProcessDriver + one small class per fault (_ProcessKill, ...)</text>
+<text x="694" y="1294" class="bd">• os_ssh.py (new): SSH functions shared by both SSH drivers</text>
+<text x="694" y="1313" class="bd">• corruption.py: OsSshCorruptionDriver inherits from FaultInjector</text>
+<text x="694" y="1332" class="bd">• the orchestrator passes the settings in one call: configure(...)</text>
+<line x1="628" y1="1282.0" x2="672" y2="1282.0" stroke="#5a6b78" stroke-width="1.6" marker-end="url(#am)"/>
+<rect x="40" y="1366" width="580" height="92" rx="6" fill="#fbf1ef" stroke="#c98b84" stroke-width="1.2"/>
+<rect x="680" y="1366" width="580" height="92" rx="6" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.2"/>
+<text x="54" y="1388" class="tib">Database adapter</text>
+<text x="694" y="1388" class="tib">Database adapter</text>
+<text x="54" y="1410" class="code">adapters/postgresql/adapter.py · 2,014 lines</text>
+<text x="54" y="1429" class="bd">• one class, PostgreSQLAdapter, with 58 methods for every fault type</text>
+<text x="694" y="1410" class="code">adapters/postgresql/</text>
+<text x="694" y="1429" class="bd">• adapter.py (698 lines): core class</text>
+<text x="694" y="1448" class="bd">• corruption.py (272) · operations.py (737) · sessions.py (398): method groups</text>
+<line x1="628" y1="1412.0" x2="672" y2="1412.0" stroke="#5a6b78" stroke-width="1.6" marker-end="url(#am)"/>
+<rect x="40" y="1472" width="580" height="108" rx="6" fill="#fbf1ef" stroke="#c98b84" stroke-width="1.2"/>
+<rect x="680" y="1472" width="580" height="108" rx="6" fill="#e9f5ee" stroke="#3d9a5f" stroke-width="1.2"/>
+<text x="54" y="1494" class="tib">Measurements for held faults and alerts</text>
+<text x="694" y="1494" class="tib">Measurements for held faults and alerts</text>
+<text x="54" y="1516" class="bd">• no support for a fault applied for a set time and then removed</text>
+<text x="54" y="1535" class="bd">• no common way to check monitoring alerts</text>
+<text x="694" y="1516" class="bd">• analysis/degradation.py (new): compares throughput and latency during the</text>
+<text x="704" y="1533" class="bd">fault with the baseline (e.g. 70% of baseline TPS).</text>
+<text x="694" y="1552" class="bd">• observability/alerts.py (new): asks the monitoring system whether an alert fired.</text>
+<text x="704" y="1569" class="bd">No monitoring system is connected yet, so alert checks report "not measured".</text>
+<line x1="628" y1="1526.0" x2="672" y2="1526.0" stroke="#5a6b78" stroke-width="1.6" marker-end="url(#am)"/>
+</svg>

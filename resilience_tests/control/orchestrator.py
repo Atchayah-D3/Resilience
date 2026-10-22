@@ -350,8 +350,9 @@ class TestOrchestrator:
         # Read-only: the settings that decide how this fault plays out are recorded, never
         # changed -- a result measured against a configuration the harness chose describes a
         # deployment nobody runs.
-        during_arg = {"during": self.scenario.fault.during} if self.scenario.fault.during else {}
-        observed = await self.adapter.observe_fault_settings(self.scenario.fault.type, **during_arg)
+        observed = await self.fault_behaviour.observe_settings()
+        if self.during_behaviour is not None:
+            observed = {**observed, **await self.during_behaviour.observe_settings()}
         if observed:
             self.facts["scenario_observed"] = observed
             self.disclosures.append(
@@ -505,7 +506,7 @@ class TestOrchestrator:
                 raise PhaseAbort(f"{self.scenario.fault.type} fault did not land"
                                  f"{f' after {attempt} attempts' if missed else ''}: {exc}") from None
             finally:
-                self.injector.kill_target = None
+                self.injector.aim_at(None)
                 if index_task is not None and not index_task.done():
                     index_task.cancel()
         if missed:

@@ -449,13 +449,16 @@ def test_the_harness_never_retunes_the_server_for_nl_c_05(env, footprints, monke
     bloat figure described a server configuration the customer does not run."""
     observed: list[str] = []
 
-    async def observe(self, fault_type):
-        observed.append(fault_type)
-        return {}
+    def recorder(name):
+        async def observe(self):
+            observed.append(name)
+            return {}
+        return observe
 
-    monkeypatch.setattr(OutageAdapter, "observe_fault_settings", observe)
+    for name in ("observe_idle_transaction_settings", "observe_autovacuum_settings"):
+        monkeypatch.setattr(OutageAdapter, name, recorder(name))
     results = run_cycles(env)
-    assert observed == ["process_kill"]
+    assert observed == []   # a kill reads no settings, and writes none
     assert "scenario_tuning" not in results["facts"]
     assert not any("tuning" in d.lower() for d in results["disclosures"])
 

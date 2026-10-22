@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from resilience_tests.analysis import predicates
 
@@ -146,7 +146,10 @@ CorruptionRelationKind = Literal["heap", "btree_index"]
 
 class Fault(_Model):
     type: FaultType
-    driver: str  # env-profile section name, resolved at run time -- never a driver name
+    # The env-profile section that serves this fault type (os_ssh, power_control, ...); the
+    # profile's <section>.driver then names the driver. Written `section:`; the former key
+    # `driver:` is still accepted, so existing scenario files read unchanged.
+    section: str = Field(validation_alias=AliasChoices("section", "driver"))
     target: FaultTarget
     duration: Literal["permanent"] | Annotated[float, Field(gt=0)] = "permanent"
     during: FaultDuring | None = None
@@ -155,9 +158,9 @@ class Fault(_Model):
     @model_validator(mode="after")
     def _driver_section(self) -> Fault:
         expected = FAULT_DRIVER_SECTION.get(self.type, DEFAULT_DRIVER_SECTION)
-        if self.driver != expected:
+        if self.section != expected:
             raise ValueError(
-                f"fault.driver for {self.type} must be the env-profile section {expected!r}, got {self.driver!r}"
+                f"fault.section for {self.type} must be the env-profile section {expected!r}, got {self.section!r}"
             )
         if self.relation_kind is not None and self.type != "data_corruption":
             raise ValueError("fault.relation_kind is only defined for data_corruption")

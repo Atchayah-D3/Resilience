@@ -626,20 +626,18 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, BaseDat
     idle_timeout_sqlstates = ("25P03",)  # idle_in_transaction_session_timeout
 
 
-    async def observe_fault_settings(self, fault_type: str, during: str | None = None) -> dict[str, str]:
-        """Read only -- nothing is written. For the idle-in-transaction fault the deciding
-        setting is the server's own timeout; for a kill that must land on an autovacuum
-        worker, the autovacuum settings (NL-M-03)."""
-        if during == "autovacuum_worker":
-            conn = await self._connect(timeout_s=10.0)
-            try:
-                rows = await conn.fetch("SELECT name, setting || coalesce(unit, '') AS v FROM pg_settings "
-                                        "WHERE name = ANY($1::text[])", list(AVAC_SETTINGS))
-                return {r["name"]: r["v"] for r in rows}
-            finally:
-                await conn.close()
-        if fault_type != "idle_in_transaction":
-            return {}
+    async def observe_autovacuum_settings(self) -> dict[str, str]:
+        """Read only -- nothing is written (NL-M-03)."""
+        conn = await self._connect(timeout_s=10.0)
+        try:
+            rows = await conn.fetch("SELECT name, setting || coalesce(unit, '') AS v FROM pg_settings "
+                                    "WHERE name = ANY($1::text[])", list(AVAC_SETTINGS))
+            return {r["name"]: r["v"] for r in rows}
+        finally:
+            await conn.close()
+
+    async def observe_idle_transaction_settings(self) -> dict[str, str]:
+        """Read only -- nothing is written: the server's own timeout (NL-M-05)."""
         conn = await self._connect(timeout_s=10.0)
         try:
             return {"idle_in_transaction_session_timeout": str(await conn.fetchval("SHOW idle_in_transaction_session_timeout"))}

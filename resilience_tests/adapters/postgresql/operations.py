@@ -128,15 +128,11 @@ class OperationsMixin:
     """fault.during methods of PostgreSQLAdapter. Mixed into the class in
     adapter.py; uses the core's `_connect` and `_psql_as_os_user`."""
 
-    async def prepare_scenario_objects(self, during: str | None) -> dict[str, Any]:
-        """Objects a `during` operation needs, created in init -- before the baseline, so
-        seeding them never disturbs the steady state being measured."""
-        if during == "autovacuum_worker":
-            return await self._prepare_avac_table()
-        if during == "checkpoint":
-            return await self._prepare_checkpoint_table()
-        if during != "concurrent_index_build":
-            return {}
+    # Objects a `during` operation needs, created in init -- before the baseline, so seeding
+    # them never disturbs the steady state being measured. Each `during` behaviour asks for its own.
+
+    async def prepare_index_build_objects(self) -> dict[str, Any]:
+        """The table NL-C-06 builds its index on."""
         conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
         try:
             await conn.execute(CIC_DDL)
@@ -152,7 +148,8 @@ class OperationsMixin:
         finally:
             await conn.close()
 
-    async def _prepare_avac_table(self) -> dict[str, Any]:
+    async def prepare_autovacuum_objects(self) -> dict[str, Any]:
+        """The table NL-M-03's autovacuum worker vacuums."""
         conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
         try:
             await conn.execute(AVAC_DDL)
@@ -251,7 +248,7 @@ class OperationsMixin:
         finally:
             await conn.close()
 
-    async def _prepare_checkpoint_table(self) -> dict[str, Any]:
+    async def prepare_checkpoint_objects(self) -> dict[str, Any]:
         """Create the checkpoint table, sized to a fraction of this server's shared_buffers.
         An existing table of the right size is reused; otherwise it is reseeded."""
         conn = await self._connect(timeout_s=30.0, command_timeout=600.0)

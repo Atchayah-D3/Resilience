@@ -137,7 +137,7 @@ class RunContext:
     def aim_fault_at(self, target: dict[str, Any]) -> None:
         """A single process the fault must hit instead of the whole service (FaultInjector.kill_target)."""
         assert self._run.injector is not None
-        self._run.injector.kill_target = target
+        self._run.injector.aim_at(target)
 
     async def revert_fault(self) -> tuple[Any, dict[str, Any]]:
         """Undo this run's injection now (its ledger entry stays outstanding until

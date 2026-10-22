@@ -242,11 +242,16 @@ class BaseDatabaseAdapter(ABC):
         """Dead-tuple counters on the churn table, as context for NL-M-05. Default: none."""
         return {}
 
-    async def observe_fault_settings(self, fault_type: str, during: str | None = None) -> dict[str, str]:
-        """Read -- never write -- the engine settings that decide how `fault_type` (and the
-        state it lands inside, `during`) plays out -- e.g. the idle-in-transaction timeout,
-        or the autovacuum settings -- so the run can say what it was measured against.
-        Default: nothing to observe."""
+    # Read -- never write -- the engine settings that decide how a fault plays out, so the run
+    # can say what it was measured against. The fault (or `during`) behaviour that depends on
+    # them asks for them; the adapter never chooses by fault type. Default: nothing to observe.
+
+    async def observe_idle_transaction_settings(self) -> dict[str, str]:
+        """The setting that decides whether an idle-in-transaction session is ended (NL-M-05)."""
+        return {}
+
+    async def observe_autovacuum_settings(self) -> dict[str, str]:
+        """The settings that decide whether and when autovacuum workers run (NL-M-03)."""
         return {}
 
     async def config_deviations(self) -> dict[str, str]:
@@ -335,7 +340,7 @@ class BaseDatabaseAdapter(ABC):
 
     def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
         """The engine's idle-in-transaction timeout in seconds, from the settings
-        `observe_fault_settings` returned; 0.0 when it is disabled or unknown."""
+        `observe_idle_transaction_settings` returned; 0.0 when it is disabled or unknown."""
         return 0.0
 
     # --- operations a fault must land inside (fault.during) ---------------------------
@@ -345,9 +350,19 @@ class BaseDatabaseAdapter(ABC):
     # an engine that does not implement it -- aborts the run before the fault: a kill that
     # missed the operation would test nothing and must never be reported as a pass.
 
-    async def prepare_scenario_objects(self, during: str | None) -> dict[str, Any]:
-        """Create what a `during` operation needs (e.g. a table to index), in init, before
-        the baseline is measured. Default: nothing."""
+    # Create what a `during` operation needs, in init, before the baseline is measured. The
+    # `during` behaviour asks for its own objects. Default: nothing.
+
+    async def prepare_checkpoint_objects(self) -> dict[str, Any]:
+        """A table whose pages the checkpoint will be writing when the fault lands."""
+        return {}
+
+    async def prepare_index_build_objects(self) -> dict[str, Any]:
+        """A table to build an index on."""
+        return {}
+
+    async def prepare_autovacuum_objects(self) -> dict[str, Any]:
+        """A table an autovacuum worker will be vacuuming."""
         return {}
 
     async def start_autovacuum_worker(self) -> dict[str, Any]:

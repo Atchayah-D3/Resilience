@@ -139,8 +139,16 @@ class SessionsMixin:
                     }
             finally:
                 await stat_conn.close()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 -- reported; the caller then cannot tell either way
+            # Without the activity row the session's state is unknown. Probing the held session
+            # instead would read a crashed server as "terminated", and a SELECT on a session that
+            # is still open would advance its xmin -- the state being measured.
+            return {
+                "pid": target_pid,
+                "terminated_by_timeout": False,
+                "still_idle": False,
+                "error": f"pg_stat_activity could not be read: {type(exc).__name__}: {exc}",
+            }
 
         # Backend is not present in pg_stat_activity. Now probe the held session to confirm
         # whether the server terminated it (Path A), keeping the error code it was closed with.

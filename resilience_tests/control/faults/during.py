@@ -13,6 +13,9 @@ from resilience_tests.control.faults.base import DuringBehaviour, PhaseAbort, re
 class Checkpoint(DuringBehaviour):
     during = "checkpoint"
 
+    async def create_objects(self) -> dict[str, Any]:
+        return await self.ctx.adapter.prepare_checkpoint_objects()
+
     async def establish(self) -> tuple[dict[str, Any], Any]:
         # The kill must land while the checkpoint is still running. Everything the kill
         # needs (SSH session, postmaster identity) is prepared BEFORE the checkpoint
@@ -157,6 +160,9 @@ class ConcurrentIndexBuild(_StartedOperation):
                 "table_readable": "table_readable",
                 "rebuild_succeeds": "rebuild_succeeds"}
 
+    async def create_objects(self) -> dict[str, Any]:
+        return await self.ctx.adapter.prepare_index_build_objects()
+
     async def _start(self) -> dict[str, Any]:
         return await self.ctx.adapter.start_concurrent_index_build()
 
@@ -170,6 +176,12 @@ class AutovacuumWorker(_InterruptedOperation):
     MEASURES = {"autovacuum_worker_respawned": "autovacuum_worker_respawned",
                 "relations_eligible": "relations_eligible",
                 "relations_left_unvacuumed": "relations_left_unvacuumed"}
+
+    async def create_objects(self) -> dict[str, Any]:
+        return await self.ctx.adapter.prepare_autovacuum_objects()
+
+    async def observe_settings(self) -> dict[str, str]:
+        return await self.ctx.adapter.observe_autovacuum_settings()
 
     def check_settings(self, observed: dict[str, Any]) -> None:
         ctx = self.ctx

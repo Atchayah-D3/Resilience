@@ -136,3 +136,49 @@ def test_the_orchestrator_never_compares_a_fault_type_or_during_value():
                         and isinstance(side.value, ast.Attribute) and side.value.attr == "fault":
                     offending.append(node.lineno)
     assert not offending, f"orchestrator.py compares fault.type/fault.during at lines {offending}"
+
+
+def _fault_names(node: ast.AST) -> list[str]:
+    names = set(FaultType.__args__) | set(FaultDuring.__args__)
+    if isinstance(node, ast.Constant) and node.value in names:
+        return [node.value]
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return [v for e in node.elts for v in _fault_names(e)]
+    return []
+
+
+def test_no_module_branches_on_a_fault_type_or_during_name():
+    """Was: the adapter chose what to observe and create with `fault_type != "idle_in_transaction"`
+    and `during == "checkpoint"`, which the orchestrator-only check above could not see. A fault
+    or `during` name compared anywhere in the harness -- through any variable, in any module --
+    is the branching the behaviour classes replaced."""
+    root = Path(faults.__file__).parents[2]   # resilience_tests/
+    offending = []
+    for path in sorted(root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            sides = [node.left, *node.comparators] if isinstance(node, ast.Compare) else \
+                    [c.pattern.value for c in node.cases if isinstance(c.pattern, ast.MatchValue)] \
+                    if isinstance(node, ast.Match) else []
+            hits = [v for side in sides for v in _fault_names(side)]
+            if hits:
+                offending.append(f"{path.relative_to(root)}:{node.lineno} {hits}")
+    assert not offending, f"fault names compared outside the behaviour registry: {offending}"
+
+
+def test_a_second_driver_for_the_same_fault_type_is_refused(monkeypatch):
+    """Was: `register` appended any class, so two drivers serving one fault type under the same
+    profile section ran whichever was imported first."""
+    from resilience_tests.execution.injectors import base as injectors
+
+    monkeypatch.setattr(injectors, "_REGISTRY", {k: list(v) for k, v in injectors._REGISTRY.items()})
+
+    class AnotherKill(OsSshProcessDriver):
+        fault_types = frozenset({"process_kill"})
+
+    class Unrelated(OsSshProcessDriver):
+        fault_types = frozenset({"clock_skew"})
+
+    with pytest.raises(ValueError, match=r"process_kill of os_ssh/os_ssh registered twice"):
+        injectors.register("os_ssh", AnotherKill)
+    assert injectors.register("os_ssh", OsSshProcessDriver) is OsSshProcessDriver   # again: harmless
+    assert injectors.register("os_ssh", Unrelated) is Unrelated                     # other fault types: fine

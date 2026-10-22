@@ -138,4 +138,6 @@ Principles I-VII. Feature creation does not create git branches; it writes `spec
   title in the same command.
 - NL-M-03 keeps `resilience.avac_target` (1M rows, ~40 MB) between runs, seeded once; a run
   takes ~15-20 min at a 60 s `autovacuum_naptime` (worker wait per cycle up to 2 x naptime + 30 s).
-- `observe_fault_settings` gets `during=` only when the scenario sets one (keeps older fakes valid).
+- Engine settings a fault depends on are read by its behaviour's `observe_settings()` through a
+  named adapter method (`observe_idle_transaction_settings`, `observe_autovacuum_settings`); the
+  adapter never chooses by fault type.

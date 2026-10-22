@@ -45,8 +45,8 @@ class FaultInjector(ABC):
         self.fault_type = fault_type
         # The run's database adapter. Faults that live inside the database (a held session,
         # a connection flood) are applied and reverted through it, so the session the fault
-        # opened is the same one the run observes and cleanup ends. Set by the orchestrator
-        # and by the kill switch; None when no adapter was handed over.
+        # opened is the same one the run observes and cleanup ends. Handed over with
+        # `use_adapter` (by `configure`, or by the kill switch); None when none was.
         self.adapter: BaseDatabaseAdapter | None = None
         # (cycles, interval_s) when the scenario repeats its fault, so preflight can check the
         # target can actually take that cadence (Framework NL-C-05)
@@ -64,14 +64,23 @@ class FaultInjector(ABC):
     def configure(self, fault: Fault, repeat: Repeat | None, adapter: BaseDatabaseAdapter | None) -> None:
         """Take what the driver needs from the scenario's fault section, in one place. The
         orchestrator calls this once, right after resolving the driver; the kill switch, which
-        has no scenario, sets only `adapter`."""
-        self.adapter = adapter   # faults inside the database act on the run's own sessions
+        has no scenario, calls only `use_adapter`."""
+        self.use_adapter(adapter)
         if fault.duration != "permanent":
             self.duration_s = float(fault.duration)
         if repeat is not None:
             self.repeat_plan = (repeat.cycles, repeat.interval_s)
         if fault.relation_kind is not None:
             self.corruption_kind = fault.relation_kind
+
+    def use_adapter(self, adapter: BaseDatabaseAdapter | None) -> None:
+        """The run's database adapter: faults inside the database act on its own sessions."""
+        self.adapter = adapter
+
+    def aim_at(self, target: Mapping[str, Any] | None) -> None:
+        """The single process the next injection must hit (see `kill_target`); None for the
+        whole service again."""
+        self.kill_target = target
 
     async def confirm(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
         """After recovery: independent evidence that the fault took effect, beyond the
@@ -120,7 +129,19 @@ _REGISTRY: dict[tuple[str, str], list[type[FaultInjector]]] = {}
 
 
 def register(section: str, cls: type[FaultInjector]) -> type[FaultInjector]:
-    _REGISTRY.setdefault((section, cls.driver_name), []).append(cls)
+    """Refuse a nameless driver, and a second driver for a fault type the same profile section
+    and driver name already serve: which one ran would depend on import order."""
+    if not getattr(cls, "driver_name", "") or not getattr(cls, "fault_types", None):
+        raise ValueError(f"{cls.__qualname__} does not set its driver_name and fault_types")
+    classes = _REGISTRY.setdefault((section, cls.driver_name), [])
+    if cls in classes:
+        return cls
+    for other in classes:
+        shared = other.fault_types & cls.fault_types
+        if shared:
+            raise ValueError(f"fault type(s) {', '.join(sorted(shared))} of {section}/{cls.driver_name} registered "
+                             f"twice: {other.__module__}.{other.__qualname__} and {cls.__module__}.{cls.__qualname__}")
+    classes.append(cls)
     return cls
 
 

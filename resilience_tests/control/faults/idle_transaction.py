@@ -18,6 +18,9 @@ class IdleTransaction(FaultBehaviour):
     fact_key = "idle_transaction"
     recovers_unattended = True
 
+    async def observe_settings(self) -> dict[str, str]:
+        return await self.ctx.adapter.observe_idle_transaction_settings()
+
     def recovery_hold_s(self, available_bound_s: float) -> float | None:
         """Hold the session open for the configured timeout plus a grace when that fits the
         recovery bound; the return to SLO is polled only as telemetry, never as the exit."""
@@ -72,7 +75,13 @@ class IdleTransaction(FaultBehaviour):
         sqlstate = idle_check.get("termination_sqlstate")
         sqlstate_evidence = sqlstate if sqlstate in ctx.adapter.idle_timeout_sqlstates else None
         ctx.facts["idle_timeout_evidence"] = {"log_line": log_evidence, "sqlstate": sqlstate_evidence}
-        if not idle_check.get("terminated_by_timeout"):
+        if idle_check.get("error"):
+            # the session's state could not be read: neither ended nor still open is known
+            m["idle_in_transaction_session_timeout_enforced"] = NOT_MEASURED
+            ctx.not_measured["idle_in_transaction_session_timeout_enforced"] = (
+                f"the idle session's state could not be read ({idle_check['error']}), so whether the "
+                "timeout ended it is unknown")
+        elif not idle_check.get("terminated_by_timeout"):
             m["idle_in_transaction_session_timeout_enforced"] = False
         elif log_evidence or sqlstate_evidence:
             m["idle_in_transaction_session_timeout_enforced"] = True

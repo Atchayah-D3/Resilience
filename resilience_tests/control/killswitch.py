@@ -43,7 +43,7 @@ async def revert_outstanding(profile: EnvProfile, ledger: InjectionLedger, *, ru
         try:
             injector = resolve_by_name(section, entry.driver, profile, entry.fault_type)
             if adapter is not None and adapter.node.name == entry.node:
-                injector.adapter = adapter
+                injector.use_adapter(adapter)
             async with asyncio.timeout(timeout_s):
                 detail = await injector.revert(profile.node(entry.node), entry.detail)
             ledger.transition(entry, "reverted", revert=detail, by="killswitch")

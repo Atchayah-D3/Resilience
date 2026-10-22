@@ -178,7 +178,7 @@ def test_restart_and_kill_share_the_os_ssh_driver():
     assert {"process_kill", "service_restart"} <= process_mod.OsSshProcessDriver.fault_types
     catalog = load_catalog()
     for sid, sc in catalog.scenarios.items():
-        if sc.fault.driver == "os_ssh":
+        if sc.fault.section == "os_ssh":
             injector = resolve(sc.fault, PROFILE)
             assert injector.fault_type == sc.fault.type, sid
 

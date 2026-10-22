@@ -50,7 +50,7 @@ def test_nl_c_02_catalog_specification():
     assert sc.category == "NL-C"
     assert sc.priority == "P0"
     assert sc.fault.type == "process_kill"
-    assert sc.fault.driver == "os_ssh"
+    assert sc.fault.section == "os_ssh"
 
     # Capability requirements
     assert "transactional_markers" in sc.requires
@@ -215,7 +215,7 @@ def test_the_checkpoint_table_is_sized_from_shared_buffers_and_reused(have, rese
         return conn
 
     adapter._connect = connect
-    out = asyncio.run(adapter.prepare_scenario_objects("checkpoint"))
+    out = asyncio.run(adapter.prepare_checkpoint_objects())
     assert (out["rows"], out["reseeded"], out["shared_buffers_bytes"]) == (67108, reseeded, 128 * 1024 * 1024)
     assert any(q.startswith("TRUNCATE") for q in conn.sql) is reseeded
 
