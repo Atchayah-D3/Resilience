@@ -16,6 +16,46 @@ class Checkpoint(DuringBehaviour):
     async def create_objects(self) -> dict[str, Any]:
         return await self.ctx.adapter.prepare_checkpoint_objects()
 
+    @classmethod
+    def summary_lines(cls, r: dict[str, Any]) -> list[str]:
+        lines: list[str] = []
+        cp = (r.get("facts") or {}).get("checkpoint_injection")
+        if cp:
+            w_event = cp.get("wait_event")
+            w_type = cp.get("wait_event_type")
+            if w_event and w_type:
+                event_desc = f"{w_event} ({w_type})"
+            elif w_event or w_type:
+                event_desc = str(w_event or w_type)
+            else:
+                event_desc = "none (checkpointer running, not waiting)"
+
+            verification = (r.get("facts") or {}).get("checkpoint_verification") or {}
+            changed = (r.get("facts") or {}).get("checkpoint_pages_changed") or {}
+            if changed.get("supported"):
+                lines += ["", f"data changed just before the checkpoint: {changed.get('rows_updated')} rows of "
+                              f"{changed.get('table')} ({(changed.get('table_bytes') or 0) / 1024**2:.1f} MB) "
+                              f"in {changed.get('update_s')} s"]
+            lines += [
+                "",
+                "checkpoint fault injection (NL-C-02):",
+                f"  checkpointer seen active before kill: {cp.get('checkpointer_active')}",
+                f"  checkpointer pid: {cp.get('checkpointer_pid')}",
+                f"  wait event: {event_desc}",
+            ]
+            if verification:
+                lines += [
+                    f"  checkpoint still in flight at kill: {verification.get('in_flight')}",
+                    f"    redo point before CHECKPOINT: {verification.get('prior_redo_lsn')}  "
+                    f"recovery redo started at: {verification.get('recovery_redo_start_lsn')}",
+                    f"    {verification.get('note', '')}",
+                ]
+            if cp.get("buffers_written_during_cp") is not None:
+                lines.append(f"  stat counter delta (pg_stat_checkpointer.buffers_written): {cp['buffers_written_during_cp']}")
+            if cp.get("io_writes_during_cp") is not None:
+                lines.append(f"  io writes delta (pg_stat_io): {cp['io_writes_during_cp']}")
+        return lines
+
     async def establish(self) -> tuple[dict[str, Any], Any]:
         # The kill must land while the checkpoint is still running. Everything the kill
         # needs (SSH session, postmaster identity) is prepared BEFORE the checkpoint

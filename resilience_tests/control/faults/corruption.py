@@ -15,6 +15,11 @@ from resilience_tests.control.faults.context import RunContext
 CORRUPTION_LOG_WAIT_S = 15.0
 
 
+def _plan(read: dict[str, Any]) -> str:
+    """The plan nodes a read ran with (EXPLAIN), or `?` when no plan was recorded."""
+    return " > ".join(read.get("plan") or []) or "?"
+
+
 @register_fault
 class DataCorruption(FaultBehaviour):
     fault_type = "data_corruption"
@@ -24,6 +29,55 @@ class DataCorruption(FaultBehaviour):
     def __init__(self, ctx: RunContext) -> None:
         super().__init__(ctx)
         self._read: dict[str, Any] | None = None
+
+    @classmethod
+    def summary_lines(cls, r: dict[str, Any]) -> list[str]:
+        lines: list[str] = []
+        corrupted = (r.get("facts") or {}).get("data_corruption")
+        if corrupted:
+            facts = r.get("facts") or {}
+            attempts = (facts.get("corruption_read") or {}).get("attempts") or []
+            first = attempts[0] if attempts else {}
+            checks = corrupted.get("pg_checksums") or {}
+            lines += [
+                "",
+                "data-file corruption (NL-I):",
+                f"  injected: {corrupted.get('relation')} block {corrupted.get('block')} "
+                f"({corrupted.get('relation_path')}), byte {corrupted.get('original_byte')} -> "
+                f"{corrupted.get('written_byte')}, after a {corrupted.get('cluster_state')!r} stop",
+                f"  pg_checksums before restart: {checks.get('failures')}",
+                f"  first read: {first.get('sqlstate') or 'no error'}  {first.get('message') or ''}"
+                + (f"  ({first.get('rows')} rows returned)" if first.get("rows") is not None else ""),
+                "  pg_amcheck on the damaged relation: " + (
+                    f"detected={(amc := facts.get('amcheck_on_corrupted_relation') or {}).get('detected')}"
+                    + (f", names the injected block={amc['names_injected_block']}" if "names_injected_block" in amc else "")),
+                f"  failures in the server log: {facts.get('corruption_log_locations')}",
+                f"  whole-database check left out: {(facts.get('integrity_check') or {}).get('excluded_relations')}",
+            ]
+            if corrupted.get("relation_kind") == "btree_index":
+                rebuild = facts.get("index_rebuild") or {}
+                reindex = rebuild.get("reindex") or {}
+                after = rebuild.get("read_after") or {}
+                lines += [
+                    f"  leaf-page check before the write: {corrupted.get('page_check')}",
+                    "  entry corrupted: " + (
+                        f"line pointer {located.get('item')} of {located.get('items')}, key {located.get('key')}, "
+                        f"heap row pointer {tuple(located.get('heap_tid') or ())} -> "
+                        f"{tuple(located.get('heap_tid_after') or ())}"
+                        if (located := corrupted.get("located")) else "not located"),
+                    "  reads through the index: " + "; ".join(
+                        f"used_index={a.get('used_index')} plan={_plan(a)} "
+                        + (f"{a.get('sqlstate')}" if a.get("error") else f"{a.get('rows')} rows, matches={a.get('matches_written')}")
+                        for a in attempts),
+                    f"  REINDEX: ok={reindex.get('ok')} in {reindex.get('duration_s')} s"
+                    + (f" {reindex['error']}" if reindex.get("error") else "")
+                    + (f"; file {corrupted.get('relation_path')} -> {reindex.get('relation_path_after')}"
+                       f" (new storage={rebuild.get('new_storage')})" if reindex.get("ok") else ""),
+                    f"  read after REINDEX: used_index={after.get('used_index')} plan={_plan(after)} rows={after.get('rows')} "
+                    f"matches={after.get('matches_written')} {after.get('sqlstate') or ''}",
+                    f"  pg_amcheck --heapallindexed after REINDEX: detected={(rebuild.get('amcheck_after') or {}).get('detected')}",
+                ]
+        return lines
 
     @property
     def _corrupts_index(self) -> bool:

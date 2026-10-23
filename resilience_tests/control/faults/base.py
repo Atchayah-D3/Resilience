@@ -17,6 +17,7 @@ import time
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
+from resilience_tests.analysis import report
 from resilience_tests.analysis.degradation import load_ratios
 from resilience_tests.control.faults.context import RunContext
 
@@ -120,6 +121,12 @@ class FaultBehaviour:
     async def measure(self, events: list[Any]) -> dict[str, Any]:
         """This fault's own measures, taken last in validate."""
         return {}
+
+    @classmethod
+    def summary_lines(cls, r: dict[str, Any]) -> list[str]:
+        """Report: the lines this fault adds to summary.txt, built from the results file alone
+        (`r`), and none for a run it does not concern. Default: none."""
+        return []
 
 
 class PowerRestoredRecovery(FaultBehaviour):
@@ -236,6 +243,12 @@ class DuringBehaviour:
     async def cleanup(self) -> None:
         """Cleanup, after the revert: remove what the operation left behind."""
 
+    @classmethod
+    def summary_lines(cls, r: dict[str, Any]) -> list[str]:
+        """Report: the lines this operation adds to summary.txt, built from the results file alone
+        (`r`), and none for a run it does not concern. Default: none."""
+        return []
+
 
 _FAULTS: dict[str, type[FaultBehaviour]] = {}
 _DURING: dict[str, type[DuringBehaviour]] = {}
@@ -251,6 +264,11 @@ def _register(registry: dict[str, Any], kind: str, name: str, cls: type) -> None
         raise ValueError(f"{kind} {name!r} is registered twice: {existing.__module__}.{existing.__qualname__} "
                          f"and {cls.__module__}.{cls.__qualname__}")
     registry[name] = cls
+    # its own report section, if it has one (registered once, however often it is registered)
+    section = cls.summary_lines.__func__
+    defaults = (FaultBehaviour.summary_lines.__func__, DuringBehaviour.summary_lines.__func__)
+    if section not in defaults and all(s.__func__ is not section for s in report.SECTIONS):
+        report.SECTIONS.append(cls.summary_lines)
 
 
 def register_fault(cls: type[FaultBehaviour]) -> type[FaultBehaviour]:

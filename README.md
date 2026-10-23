@@ -503,11 +503,16 @@ a behaviour needs something new from the run, add it there rather than reaching 
 orchestrator.
 
 Hooks a behaviour may override, in the order the phases call them (each defaults to nothing):
-`samplers()` (extra background measurements, started and stopped with the run's probes),
+`observe_settings()` (engine settings that decide how the fault plays out, read in init through
+a named adapter method, never written), `samplers()` (extra background measurements, started
+and stopped with the run's probes),
 `baseline_started()` / `baseline_ended()`, `before_inject()` / `after_inject(detail)`,
 `begin_recovery()`, `recovery_hold_s()`, `measure_client_impact()`, `before_integrity_check()`,
 `measure()`; `phase_extension_s(phase)` adds a hold to that phase's profile bound, and
-`slo_clock_from_t1()` measures time back to SLO from T1. A fault the harness holds and then
+`slo_clock_from_t1()` measures time back to SLO from T1. Its section of `summary.txt` comes from
+the classmethod `summary_lines(results)`, registered with the behaviour; `analysis/report.py`
+names no fault. A `fault.during` behaviour has the same `observe_settings()` and
+`summary_lines()`, plus `create_objects()` for what the operation needs. A fault the harness holds and then
 releases (contention, pressure: Framework §10.6) subclasses `HeldFault`: its driver applies the
 fault in `inject`, the recovery phase holds it for `fault.duration` with the workload measured
 in its own window (`on_hold_start` / `on_hold_end` for snapshots), releases it through the

@@ -95,6 +95,12 @@ def test_nl_m_05_path_a_timeout_enforced(env):
     assert "idle_transaction_check" in facts
     assert facts["idle_transaction_check"].get("terminated_by_timeout") is True
 
+    # Was: path B was not taken (the session had ended), so the declared dead_tuples_not_removable
+    # was silently left out. Every declared measure is produced, with the reason when unmeasured.
+    assert facts["declared_not_produced"] == []
+    assert str(m["dead_tuples_not_removable"]) == "NOT_MEASURED"
+    assert "already ended" in facts["not_measured"]["dead_tuples_not_removable"]
+
 
 def _run_nlm05(env):
     item = RunPlanItem(scenario=scenario("NL-M-05"), env_class=env.env_class,

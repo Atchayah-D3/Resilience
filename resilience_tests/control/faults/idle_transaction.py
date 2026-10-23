@@ -21,6 +21,33 @@ class IdleTransaction(FaultBehaviour):
     async def observe_settings(self) -> dict[str, str]:
         return await self.ctx.adapter.observe_idle_transaction_settings()
 
+    @classmethod
+    def summary_lines(cls, r: dict[str, Any]) -> list[str]:
+        lines: list[str] = []
+        idle = (r.get("facts") or {}).get("idle_transaction")
+        if idle:
+            facts = r.get("facts") or {}
+            idle_chk = facts.get("idle_transaction_check") or {}
+            evidence = facts.get("idle_timeout_evidence") or {}
+            probe = facts.get("vacuum_horizon_probe") or {}
+            measured = r.get("measured") or {}
+            lines += [
+                "",
+                "idle-in-transaction vacuum blocking (NL-M-05):",
+                f"  idle backend pid: {idle.get('pid')}  state at injection: {idle.get('state')}  "
+                f"backend_xid: {idle.get('backend_xid')}",
+                f"  backend_xmin: {idle.get('backend_xmin')}",
+                f"  path A  session ended: {idle_chk.get('terminated_by_timeout')}  "
+                f"timeout log line: {'seen' if evidence.get('log_line') else 'not seen'}  "
+                f"sqlstate: {evidence.get('sqlstate')}  -> timeout enforced: "
+                f"{measured.get('idle_in_transaction_session_timeout_enforced')}",
+                f"  path B  vacuum blocked: {measured.get('vacuum_blocked')}  "
+                f"dead but not removable: {probe.get('dead_not_removable')}  "
+                f"removable cutoff: {probe.get('removable_cutoff')}  "
+                f"bloat alert fired: {measured.get('bloat_alert_fired')}",
+            ]
+        return lines
+
     def recovery_hold_s(self, available_bound_s: float) -> float | None:
         """Hold the session open for the configured timeout plus a grace when that fits the
         recovery bound; the return to SLO is polled only as telemetry, never as the exit."""
@@ -137,6 +164,11 @@ class IdleTransaction(FaultBehaviour):
         else:
             m["vacuum_blocked"] = NOT_MEASURED
             ctx.not_measured["vacuum_blocked"] = "the idle session had already ended, so vacuum was no longer blocked by it"
+        if m["vacuum_blocked"] is NOT_MEASURED:
+            # the count comes from the same probe: when that probe was not taken or said nothing,
+            # the declared measure is reported as not measured, for the same reason -- never omitted
+            m["dead_tuples_not_removable"] = NOT_MEASURED
+            ctx.not_measured["dead_tuples_not_removable"] = ctx.not_measured["vacuum_blocked"]
         m["bloat_alert_fired"] = NOT_MEASURED
         ctx.not_measured["bloat_alert_fired"] = (
             "no monitoring alert source is connected to the harness; its own dead-tuple ratio is evidence of "

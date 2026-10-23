@@ -182,3 +182,22 @@ def test_a_second_driver_for_the_same_fault_type_is_refused(monkeypatch):
         injectors.register("os_ssh", AnotherKill)
     assert injectors.register("os_ssh", OsSshProcessDriver) is OsSshProcessDriver   # again: harmless
     assert injectors.register("os_ssh", Unrelated) is Unrelated                     # other fault types: fine
+
+
+def test_the_report_names_no_fault_and_each_fault_supplies_its_own_section():
+    """Was: report.py carried the checkpoint, idle-transaction and corruption sections itself, so
+    a new fault meant editing the report. Each behaviour now registers its own section."""
+    from resilience_tests.analysis import report
+    from resilience_tests.control.faults.corruption import DataCorruption
+    from resilience_tests.control.faults.during import Checkpoint
+    from resilience_tests.control.faults.idle_transaction import IdleTransaction
+
+    assert {s.__func__ for s in report.SECTIONS} == {
+        DataCorruption.summary_lines.__func__, Checkpoint.summary_lines.__func__,
+        IdleTransaction.summary_lines.__func__}
+    source = Path(report.__file__).read_text()
+    for fact_key in ("checkpoint_injection", "idle_transaction", "data_corruption"):
+        assert fact_key not in source, f"report.py reads the {fact_key!r} fact itself"
+    # a section concerns only its own runs: none of them adds lines to an unrelated run
+    unrelated = {"facts": {"cycles": []}, "measured": {}}
+    assert all(s(unrelated) == [] for s in report.SECTIONS)
