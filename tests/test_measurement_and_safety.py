@@ -18,6 +18,7 @@ from resilience_tests.adapters.postgresql.adapter import checksum_failures_since
 from resilience_tests.analysis.predicates import NOT_MEASURED
 from resilience_tests.analysis.rto_decomposer import Baseline, decompose, first_write_after, write_recovery
 from resilience_tests.control.profile import load_profile
+from resilience_tests.execution.injectors import os_ssh as os_ssh_mod
 from resilience_tests.execution.injectors import process as process_mod
 from resilience_tests.execution.injectors.base import DriverNotAvailable
 from resilience_tests.execution.injectors.process import (
@@ -400,7 +401,8 @@ def test_revert_budget_is_smaller_than_the_timeout_wrapping_it():
 
 def test_revert_of_a_service_stuck_activating_stops_inside_its_budget(monkeypatch):
     monkeypatch.setattr(process_mod, "REVERT_TOTAL_BUDGET_S", 0.6)
-    monkeypatch.setattr(process_mod, "REVERT_SETTLE_POLL_S", 0.05)
+    # the settle loop lives in os_ssh.py: patching the name process.py re-exports changed nothing
+    monkeypatch.setattr(os_ssh_mod, "REVERT_SETTLE_POLL_S", 0.05)
     use_host(monkeypatch, process_mod, {"is-active": "activating"})   # never settles
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="activating"):

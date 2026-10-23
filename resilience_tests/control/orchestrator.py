@@ -701,9 +701,9 @@ class TestOrchestrator:
             self.not_measured["t_reconnect_s"] = why   # the same value under the Framework's name
         if d.components.get("mttd_s") is NOT_MEASURED:
             self.not_measured["mttd_s"] = (
-                "this fault leaves the engine no chance to log that it noticed -- a killed process "
-                "writes nothing. The replacement's own recovery-start line is reported separately "
-                "as recovery_started_s, which is a restart time, not a detection time")
+                "no line in the engine's log after the fault showed that it noticed the fault (a "
+                "killed process cannot write one). A recovery-start line, when there is one, is "
+                "reported separately as recovery_started_s: a restart time, not a detection time")
         if d.components.get("recovery_started_s") is NOT_MEASURED:
             self.not_measured["recovery_started_s"] = (
                 "no recovery-start line from this engine reached the harness during the run")

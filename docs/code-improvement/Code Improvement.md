@@ -15,7 +15,7 @@ orchestrator calls the same methods for every fault and contains no fault-specif
 Adding a fault no longer requires changing the orchestrator. The behaviour of existing tests
 is unchanged.
 
-![Recommended architecture](architecture-recommended.svg)
+![Code structure](code-structure.svg)
 
 *Figure, part 1: how the code is organised now. The orchestrator uses three groups of
 classes: fault classes, fault drivers and the database adapter. In each group the base class is
@@ -138,6 +138,18 @@ least 70% of their usual throughput, and their 99th-percentile latency must stay
 If a held fault has no duration in its test definition, the test is stopped **before** the
 fault is applied, so the fault cannot be left in place indefinitely.
 
+### Follow-up changes (after the review)
+
+| Change | Before | After |
+|---|---|---|
+| Report text for each fault | `analysis/report.py` contained the summary lines for the idle-transaction, checkpoint and corruption tests. | Each fault class supplies its own summary lines (`summary_lines`). The report contains no fault names. |
+| Settings and objects a fault needs | One adapter method chose what to read or create by checking the fault name. | One adapter method per purpose, for example `observe_idle_transaction_settings()` or `prepare_checkpoint_objects()`. The fault class calls the one it needs. |
+| Duplicate driver registration | A second driver for the same fault replaced the first without an error. | Rejected with an error that names both drivers. |
+| Name of the environment section | `fault.driver` in the test definition held the name of the environment section, not a driver. | Renamed to `fault.section`. The old name is still accepted. |
+| Tests with two faults | A second fault (`compound.fault_b`) was silently never applied. | The test is refused before anything is applied, with the reason. The design for multi-machine and two-fault tests is in README §13. |
+| Unreadable idle-session state (NL-M-05) | A failed read was treated as "session not ended", which is a guess. | Reported as "not measured", with the reason. |
+| Load rate | A test definition without `rate_tps` ran as fast as the machine allowed. | The catalog checks refuse it (Framework §7.5). The workload profiles are described in README §7. |
+
 ### Steps to add a new fault
 
 | Step | What to add |
@@ -153,11 +165,15 @@ The orchestrator, the safety components and the reporting are not modified.
 
 - **Comparison with previous results:** the results of 122 existing test runs were saved
   before the work and compared after each change. There were **0 differences** in
-  measurements and pass/fail results.
-- **Automated tests:** 427 → 440 passing. Each new test was first run without its fix, to
+  measurements and pass/fail results. The one intended difference after the follow-up
+  changes: NL-M-05 now reports `dead_tuples_not_removable` as "not measured" instead of
+  leaving it out when the idle session has already ended.
+- **Automated tests:** 427 → 452 passing (the 2 Elle tests need Java 21 on the machine). Each new test was first run without its fix, to
   confirm that it fails.
-- **Still to do:** run every test on the lab machines. The checks above use a simulated
-  database.
+- **Lab runs:** all 12 tests that the lab can run passed on the real machines with the
+  latest code (23 Oct, new harness VM). For every test, every pass criterion was evaluated on
+  a measured value, no committed transaction was lost, and the integrity check was clean.
+  NL-C-04 is skipped, because the lab has no separate disk for the write-ahead log.
 
 ---
 
@@ -167,7 +183,6 @@ The orchestrator, the safety components and the reporting are not modified.
 
 | Item | Reason |
 |---|---|
-| Run every test on the lab machines | The orchestrator changed, so every test, including those of the other owner, must pass on the real machines. |
 | Rebuild NL-N-07 using the new structure | It was written for the previous code. It will be the first test to use the new support for held faults. |
 
 ### Decisions needed
@@ -182,10 +197,8 @@ The orchestrator, the safety components and the reporting are not modified.
 
 | Item | Details |
 |---|---|
-| Tests using more than one machine | Noisy-neighbour tests need a second VM to generate load; cluster tests need a standby server. A test can currently target only one machine. |
-| Two faults in one test | Some cluster tests apply two faults together. The test definition supports this, but the orchestrator cannot run it yet. |
-| Smaller database interface | The database adapter's base class has 46 methods, which a second database type would have to implement. Splitting them into groups would make that easier. |
+| Tests using more than one machine | Noisy-neighbour tests need a second VM to generate load; cluster tests need a standby server. A test can currently target only one machine. Design: README §13. |
+| Two faults in one test | Some cluster tests apply two faults together. The test definition supports this; the orchestrator refuses such a test until it is built. Design: README §13. |
+| Smaller database interface | The database adapter's base class has 49 methods, which a second database type would have to implement. Splitting them into groups would make that easier. |
 | Simplify the orchestrator's validate phase | About 80 lines of result calculations can move to the analysis module. |
-| Clearer naming | In the test definition, `fault.driver` contains the name of the environment section, not the driver. Renaming it would avoid confusion. |
-| Duplicate-name check for drivers | Fault classes reject duplicate names; the driver registration does not yet. |
 | One unreliable test | One existing test fails about once in six runs on a heavily loaded machine. |

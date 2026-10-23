@@ -132,6 +132,14 @@ class Workload(_Model):
     # the operation history records what was actually read (Arch §10.3). `none`: no history.
     history: Literal["none", "list_append"] = "none"
 
+    @model_validator(mode="after")
+    def _declared_rate(self) -> Workload:
+        # Framework §7.5: the workload is a declared parameter of every scenario, never chosen at
+        # execution time. Without a rate the load would be "as fast as this machine can go".
+        if self.rate_tps is None and self.profile != "idle":
+            raise ValueError(f"workload.rate_tps must be declared for profile {self.profile!r} (Framework §7.5)")
+        return self
+
 
 # A database state the fault must land inside (Framework §10.2 NL-C-02 "while the checkpointer
 # is active", NL-C-03 "during a 10M-row INSERT", NL-C-06 "mid-build"; Framework §10.7 NL-M-03

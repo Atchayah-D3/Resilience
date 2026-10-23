@@ -299,6 +299,45 @@ said. The status becomes `error` and carries the repair command.
 
 ## 7. Measurements
 
+### Workload profiles (§7.1, §7.5)
+
+The same fault has different effects on an idle database and on a busy one, so every scenario
+declares its load in the `workload:` section of its file, and the harness never chooses it at
+run time (§7.5). The catalog checks refuse a scenario that does not state
+`rate_tps`, except for the `idle` profile.
+
+| Field | Meaning | Example (NL-C-01) |
+|---|---|---|
+| `profile` | Which kind of load (table below). | `oltp_write_heavy` |
+| `rate_tps` | Transactions started per second, across all connections together. | `200` |
+| `concurrency` | Number of connections, each sending one transaction at a time. | `64` |
+| `transaction_markers` | Every transaction carries a marker id, so lost commits can be counted (RPO). | `true` |
+| `history` | `list_append` also records every read and write for the Elle checker (NL-C-03). | `none` |
+
+How long the load runs is not part of `workload:`. The load runs for the whole test: the
+baseline lasts `steady_state.duration_s` (120 s), and the load continues through the fault and
+the recovery.
+
+The Framework names six profiles (§7.1). Two are built:
+
+| Profile | What each transaction does | Used by | Built |
+|---|---|---|---|
+| `oltp_write_heavy` | `BEGIN; INSERT marker; COMMIT` | NL-C-01..04, NL-C-06, NL-I-01, NL-I-02, NL-M-06, NL-M-07, NL-R-04 | yes |
+| `mixed` | the marker insert, plus an UPDATE or DELETE of an existing row, so dead rows build up for the vacuum and bloat checks | NL-C-05, NL-M-03, NL-M-05 | yes |
+| `idle` | no load | — | no |
+| `oltp_read` | read-only queries | — | no |
+| `bulk_load` | large COPY or INSERT batches | — | no |
+| `long_analytic` | long-running analytic queries | — (NL-N-07 will need it) | no |
+
+A scenario that asks for a profile that is not built is refused at the init phase ("workload
+profile ... is not built yet"), never run with a different load.
+
+**The load values are set for the lab VM, not taken from the Framework.** The Framework fixes
+only one rate: NL-M-07 "at 1000 TPS" (§10.7). The other values (200 TPS offered,
+`tps_min` 150, p99 at most 300 ms) were chosen so the current lab VM runs them comfortably, and
+they need review when the lab hardware changes. Example from the 23 Oct runs: offered 200 TPS,
+measured baseline 194–200 TPS, p99 3–103 ms.
+
 ### RPO — the marker protocol (§6.4, arch §6.2)
 
 Every transaction follows four steps, in this order:
