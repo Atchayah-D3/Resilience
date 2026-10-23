@@ -37,7 +37,9 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from resilience_tests.control.profile import Node
+from catalog.schema import Fault, Repeat
+from resilience_tests.adapters.base import BaseDatabaseAdapter
+from resilience_tests.control.profile import EnvProfile, Node
 from resilience_tests.execution.injectors.base import DriverNotAvailable, FaultInjector, FaultNotLanded, register
 from resilience_tests.execution.injectors.os_ssh import (
     REVERT_TOTAL_BUDGET_S,
@@ -75,6 +77,18 @@ class OsSshCorruptionDriver(FaultInjector):
 
     fault_types = frozenset({"data_corruption"})
     driver_name = "os_ssh"
+
+    def __init__(self, profile: EnvProfile, fault_type: str) -> None:
+        super().__init__(profile, fault_type)
+        # what kind of relation the fault damages (catalog fault.relation_kind; absent = heap)
+        self.corruption_kind: str = "heap"
+        # the page preflight located, which inject damages
+        self._target: dict[str, Any] | None = None
+
+    def configure(self, fault: Fault, repeat: Repeat | None, adapter: BaseDatabaseAdapter | None) -> None:
+        super().configure(fault, repeat, adapter)
+        if fault.relation_kind is not None:
+            self.corruption_kind = fault.relation_kind
 
     def _tool(self, node: Node, name: str) -> str:
         return q(f"{node.pg_bin}/{name}")
@@ -149,7 +163,7 @@ class OsSshCorruptionDriver(FaultInjector):
         return cls._page_start(target) + int(target["byte_in_page"])
 
     async def inject(self, node: Node) -> dict[str, Any]:
-        target = getattr(self, "_target", None)
+        target = self._target
         if target is None:
             raise DriverNotAvailable("data_corruption needs preflight to have located its target")
         path = f"{node.pgdata.rstrip('/')}/{target['relation_path']}"

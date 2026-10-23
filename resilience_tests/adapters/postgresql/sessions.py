@@ -6,11 +6,19 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
 
+from resilience_tests.adapters.base import SessionFaultSupport
 from resilience_tests.execution.remote import RemoteHost
+
+if TYPE_CHECKING:
+    # what this mixin uses from the adapter's core class (host.py)
+    from resilience_tests.adapters.postgresql.host import PostgreSQLCore
+else:
+    PostgreSQLCore = object
 
 # NL-R-04: flood sessions carry this application_name, so a revert -- even from a kill switch
 # in another process -- can find and terminate exactly them and nothing else.
@@ -29,9 +37,54 @@ _DEAD_NOT_REMOVABLE_RE = re.compile(r"(\d+) are dead but not yet removable")
 _REMOVABLE_CUTOFF_RE = re.compile(r"removable cutoff: (\d+)")
 
 
-class SessionsMixin:
+def parse_pg_interval_s(val: str | None) -> float:
+    """Parse PostgreSQL interval strings such as '30s', '1min', '2h', '500ms', '0' into seconds."""
+    if not val:
+        return 0.0
+    val = str(val).strip().lower()
+    if val in ("0", "disabled", "off", "none"):
+        return 0.0
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)?$", val)
+    if not m:
+        return 0.0
+    num = float(m.group(1))
+    unit = m.group(2) or "s"
+    if unit in ("ms", "millisecond", "milliseconds"):
+        return num / 1000.0
+    elif unit in ("s", "sec", "second", "seconds"):
+        return num
+    elif unit in ("min", "m", "minute", "minutes"):
+        return num * 60.0
+    elif unit in ("h", "hr", "hour", "hours"):
+        return num * 3600.0
+    elif unit in ("d", "day", "days"):
+        return num * 86400.0
+    return num
+
+
+class SessionsMixin(SessionFaultSupport, PostgreSQLCore):
     """Idle-transaction and connection-flood methods of PostgreSQLAdapter. Mixed into the class in
-    adapter.py; uses the core's `_connect` and `_psql_as_os_user`."""
+    adapter.py; uses the core's `node`, `_connect` and `_psql_as_os_user` (host.py)."""
+
+    idle_timeout_sqlstates = ("25P03",)  # idle_in_transaction_session_timeout
+
+    # the sessions a fault holds open (none until one is)
+    _idle_conn: asyncpg.Connection | None = None
+    _idle_pid: int | None = None
+    _idle_conn_error: str | None = None
+    _holding_conns: Sequence[asyncpg.Connection] = ()
+
+    async def observe_idle_transaction_settings(self) -> dict[str, str]:
+        """Read only -- nothing is written: the server's own timeout (NL-M-05)."""
+        conn = await self._connect(timeout_s=10.0)
+        try:
+            return {"idle_in_transaction_session_timeout": str(await conn.fetchval("SHOW idle_in_transaction_session_timeout"))}
+        finally:
+            await conn.close()
+
+    def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
+        return parse_pg_interval_s(observed.get("idle_in_transaction_session_timeout"))
+
 
     async def inject_idle_transaction(self) -> dict[str, Any]:
         """Inject an open idle-in-transaction holding back the vacuum horizon (NL-M-05).
@@ -100,7 +153,7 @@ class SessionsMixin:
         """Check status of the idle-in-transaction backend (NL-M-05): still open, or gone with
         the harness's session closed. Says only WHETHER it ended; why it ended is judged by the
         orchestrator from `termination_sqlstate` here and the server's own log line."""
-        target_pid = pid or getattr(self, "_idle_pid", None)
+        target_pid = pid or self._idle_pid
         if target_pid is None:
             # No session was ever established. "The backend is absent" must never be read as
             # "the engine enforced idle_in_transaction_session_timeout" -- that is the
@@ -152,7 +205,7 @@ class SessionsMixin:
 
         # Backend is not present in pg_stat_activity. Now probe the held session to confirm
         # whether the server terminated it (Path A), keeping the error code it was closed with.
-        conn = getattr(self, "_idle_conn", None)
+        conn = self._idle_conn
         conn_closed = False
         sqlstate = None
         if conn is not None:
@@ -194,8 +247,8 @@ class SessionsMixin:
         backends carrying IDLE_SESSION_APPLICATION_NAME and nothing else -- never every idle
         session on the cluster, and never a signal to an operating-system PID that may since
         have been reused."""
-        pid = getattr(self, "_idle_pid", None)
-        conn = getattr(self, "_idle_conn", None)
+        pid = self._idle_pid
+        conn = self._idle_conn
         detail: dict[str, Any] = {"pid": pid}
         if conn is not None:
             try:
@@ -303,11 +356,12 @@ class SessionsMixin:
         attempted = max(10, int(max_conn * 1.5))
         explicit: list[str] = []      # SQLSTATE 53300: the server said why it refused
         other: list[str] = []         # timeouts, resets: a refusal nobody explained
-        self._holding_conns: list[asyncpg.Connection] = []
+        holding: list[asyncpg.Connection] = []
+        self._holding_conns = holding
 
         async def one() -> None:
             try:
-                self._holding_conns.append(await self._connect(
+                holding.append(await self._connect(
                     self.node.client, timeout_s=FLOOD_CONNECT_TIMEOUT_S, command_timeout=None,
                     server_settings={"application_name": FLOOD_APPLICATION_NAME}))
             except asyncpg.TooManyConnectionsError as exc:
@@ -377,7 +431,7 @@ class SessionsMixin:
 
     async def _release_flood(self) -> int:
         released = 0
-        for c in getattr(self, "_holding_conns", []):
+        for c in self._holding_conns:
             try:
                 await c.close(timeout=5.0)
                 released += 1

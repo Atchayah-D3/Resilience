@@ -79,6 +79,16 @@ class DataCorruption(FaultBehaviour):
                 ]
         return lines
 
+    async def after_inject(self, detail: dict[str, Any]) -> None:
+        exclusions = detail.get("integrity_exclusions")
+        if exclusions:
+            # the deliberately damaged relation is checked on its own; the whole-database check
+            # must still answer "is everything ELSE intact?"
+            self.ctx.adapter.exclude_from_integrity_check(exclusions)
+            self.ctx.disclosures.append(
+                f"The whole-database integrity check excluded the deliberately corrupted relation(s) "
+                f"{', '.join(exclusions)}; they were checked on their own.")
+
     @property
     def _corrupts_index(self) -> bool:
         return self.ctx.scenario.fault.relation_kind == "btree_index"

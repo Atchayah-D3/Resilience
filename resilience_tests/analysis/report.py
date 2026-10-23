@@ -1,6 +1,6 @@
-"""Run outputs (Arch §10.4). Phase 1 requires only the results file (Arch §16); the JUnit XML
-CI gate comes from pytest --junitxml; the HTML report, MinIO evidence bundle and trend store
-arrive with Phases 2 and 6.
+"""Run outputs (Arch §10.4): results.json and its plain-text summary.txt. The JUnit XML CI gate
+and the HTML pages are built from these by resilience_tests/reporting; the MinIO evidence
+bundle and the trend store arrive with Phases 2 and 6 (Arch §16).
 
 The evidence directory (Arch §10.4 "Audit: probe stream, logs, metric snapshot, amcheck
 output, marker journals") is the run directory on the driver host.
@@ -10,21 +10,21 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 RESULTS_FILE = "results.json"
 SUMMARY_FILE = "summary.txt"
 
-# Sections that belong to one fault or `during` operation (e.g. the checkpoint evidence of
-# NL-C-02). Each behaviour class in control/faults registers its own `summary_lines` when it is
-# registered, and returns no lines for a run it does not concern -- so this module never names a
-# fault, and a new fault adds its section without editing it.
-SECTIONS: list[Callable[[dict[str, Any]], list[str]]] = []
+# A section that belongs to one fault or `during` operation (e.g. the checkpoint evidence of
+# NL-C-02): lines built from the results alone, none for a run it does not concern. The caller
+# passes them in (control/faults: summary_sections), so this module never names a fault and a new
+# fault adds its section without editing it.
+Section = Callable[[dict[str, Any]], list[str]]
 
 
-def write_results(run_dir: Path, results: dict[str, Any]) -> Path:
+def write_results(run_dir: Path, results: dict[str, Any], *, sections: Sequence[Section]) -> Path:
     path = run_dir / RESULTS_FILE
     tmp = path.with_suffix(".tmp")
     with tmp.open("w") as fh:
@@ -32,11 +32,11 @@ def write_results(run_dir: Path, results: dict[str, Any]) -> Path:
         fh.flush()
         os.fsync(fh.fileno())
     tmp.replace(path)
-    (run_dir / SUMMARY_FILE).write_text(render_summary(results))
+    (run_dir / SUMMARY_FILE).write_text(render_summary(results, sections=sections))
     return path
 
 
-def render_summary(r: dict[str, Any]) -> str:
+def render_summary(r: dict[str, Any], *, sections: Sequence[Section]) -> str:
     lines = [
         f"{r['scenario']['id']}  {r['scenario']['name']}",
         f"run {r['run_id']}  env {r['environment']['profile']} ({r['environment']['class']})  node {r['target']['node']}",
@@ -89,7 +89,7 @@ def render_summary(r: dict[str, Any]) -> str:
              f"  valid: {elle.get('valid')}  anomaly types: {elle.get('anomalies_count')} "
              f"{elle.get('anomaly_types') or ''}"),
         ]
-    for section in SECTIONS:
+    for section in sections:
         lines += section(r)
     if r.get("measured"):
         rendered = []

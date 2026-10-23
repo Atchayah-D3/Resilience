@@ -31,6 +31,7 @@ from resilience_tests.adapters.base import (
     register_adapter,
 )
 from resilience_tests.analysis.report import render_summary
+from resilience_tests.control.faults import summary_sections
 from resilience_tests.control.matrix import RunPlanItem
 from resilience_tests.control.orchestrator import RunOptions, TestOrchestrator
 from resilience_tests.execution.injectors.base import FaultInjector
@@ -160,7 +161,7 @@ def test_nl_c_02_arms_the_kill_before_the_checkpoint_starts(env, monkeypatch):
     assert order == ["arm", "change data", "checkpoint", "kill"]
     assert results["facts"]["checkpoint_pages_changed"]["rows_updated"] == 67108
     from resilience_tests.analysis.report import render_summary
-    assert "data changed just before the checkpoint: 67108 rows" in render_summary(results)
+    assert "data changed just before the checkpoint: 67108 rows" in render_summary(results, sections=summary_sections())
 
 
 def test_nl_c_02_aborts_if_the_data_for_the_checkpoint_cannot_be_prepared(env, monkeypatch):
@@ -295,7 +296,7 @@ def test_nl_c_02_summary_report_formatting():
         },
         "measured": {"checkpoint_in_flight_at_kill": True, "corruption_count": 0},
     }
-    summary = render_summary(sample_results)
+    summary = render_summary(sample_results, sections=summary_sections())
     assert "checkpoint fault injection (NL-C-02):" in summary
     assert "checkpointer seen active before kill: True" in summary
     assert "checkpointer pid: 48102" in summary
@@ -319,7 +320,7 @@ def test_nl_c_02_summary_report_formatting():
             }
         },
     }
-    summary_null = render_summary(sample_null_events)
+    summary_null = render_summary(sample_null_events, sections=summary_sections())
     assert "wait event: none (checkpointer running, not waiting)" in summary_null
     assert "wait event: active" not in summary_null  # Fallback word 'active' must NEVER be printed
 

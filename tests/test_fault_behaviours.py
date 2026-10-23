@@ -16,6 +16,7 @@ from catalog.schema import FaultDuring, FaultType
 from resilience_tests.control import faults
 from resilience_tests.control.faults.base import _DURING, _FAULTS
 from resilience_tests.execution.injectors.process import OsSshProcessDriver
+from tests.test_orchestrator import env  # noqa: F401  (env is a fixture)
 
 FORMER_OUTAGE_FAULTS = {"process_kill", "service_restart", "host_power_loss"}
 FORMER_UNATTENDED_FAULTS = {"process_kill", "service_restart", "config_reload", "connection_exhaustion",
@@ -186,18 +187,139 @@ def test_a_second_driver_for_the_same_fault_type_is_refused(monkeypatch):
 
 def test_the_report_names_no_fault_and_each_fault_supplies_its_own_section():
     """Was: report.py carried the checkpoint, idle-transaction and corruption sections itself, so
-    a new fault meant editing the report. Each behaviour now registers its own section."""
+    a new fault meant editing the report. Each behaviour supplies its own section, and the report
+    is handed them when it is written -- it keeps no list that importing a module fills in."""
     from resilience_tests.analysis import report
     from resilience_tests.control.faults.corruption import DataCorruption
     from resilience_tests.control.faults.during import Checkpoint
     from resilience_tests.control.faults.idle_transaction import IdleTransaction
 
-    assert {s.__func__ for s in report.SECTIONS} == {
-        DataCorruption.summary_lines.__func__, Checkpoint.summary_lines.__func__,
-        IdleTransaction.summary_lines.__func__}
+    sections = faults.summary_sections()
+    assert [s.__func__ for s in sections] == [
+        DataCorruption.summary_lines.__func__, IdleTransaction.summary_lines.__func__,
+        Checkpoint.summary_lines.__func__]
     source = Path(report.__file__).read_text()
     for fact_key in ("checkpoint_injection", "idle_transaction", "data_corruption"):
         assert fact_key not in source, f"report.py reads the {fact_key!r} fact itself"
+    imported = {n.module for n in ast.walk(ast.parse(source)) if isinstance(n, ast.ImportFrom)}
+    assert not {m for m in imported if m and m.startswith("resilience_tests.control")}, \
+        "analysis/report.py depends on the control layer"
+    assert not hasattr(report, "SECTIONS")
     # a section concerns only its own runs: none of them adds lines to an unrelated run
     unrelated = {"facts": {"cycles": []}, "measured": {}}
-    assert all(s(unrelated) == [] for s in report.SECTIONS)
+    assert all(s(unrelated) == [] for s in sections)
+
+
+def test_the_sections_follow_the_registry_not_import_side_effects(monkeypatch):
+    """A behaviour registered later (or replaced in a test) is reported from that moment on;
+    nothing is appended to a shared list that would outlive it."""
+    class Extra(faults.FaultBehaviour):
+        fault_type = "clock_skew"
+
+        @classmethod
+        def summary_lines(cls, r):
+            return ["clock"]
+
+    monkeypatch.setattr(faults.base, "_FAULTS", dict(_FAULTS))
+    faults.base.register_fault(Extra)
+    assert any(s.__func__ is Extra.summary_lines.__func__ for s in faults.summary_sections())
+    monkeypatch.undo()
+    assert all(s.__func__ is not Extra.summary_lines.__func__ for s in faults.summary_sections())
+
+
+# --- what is not built refuses before anything is applied ---------------------------------
+
+
+def test_every_fault_type_a_driver_serves_has_a_behaviour():
+    """Was: only `registered behaviours are catalog fault types` was checked. A driver added
+    without a behaviour would inject a fault whose recovery nobody defined."""
+    from resilience_tests.execution.injectors import base as injectors
+
+    served = {t for classes in injectors._REGISTRY.values() for cls in classes for t in cls.fault_types}
+    assert served <= set(_FAULTS), f"served by a driver but no behaviour: {sorted(served - set(_FAULTS))}"
+
+
+def _unbuilt_fault_scenario():
+    from tests.test_orchestrator import scenario
+    sc = scenario("NL-C-01")
+    return sc.model_copy(update={"fault": sc.fault.model_copy(update={"type": "clock_skew"})})
+
+
+def test_a_fault_type_without_a_behaviour_is_refused_in_init_before_any_injection(env):
+    """Was: the run fell back to the default behaviour, injected the fault, and refused only in
+    the recovery phase -- with the fault already applied."""
+    from resilience_tests.control.killswitch import ledger_for
+    from resilience_tests.control.matrix import RunPlanItem
+    from resilience_tests.control.orchestrator import RunOptions, TestOrchestrator
+    from tests.test_orchestrator import FakeFault
+
+    item = RunPlanItem(scenario=_unbuilt_fault_scenario(), env_class=env.env_class, role="standalone",
+                       node=env.nodes[0])
+    results = asyncio.run(TestOrchestrator(item, env, RunOptions()).run())
+    assert results["status"] == "aborted"
+    assert "fault type 'clock_skew' is not built yet" in results["error"]
+    assert ledger_for(env).entries() == [] and FakeFault.reverts == []
+    ran = {p["phase"]: p["outcome"] for p in results["phases"]}
+    assert ran["init"] == "aborted" and "fault_inject" not in ran
+
+
+def test_the_run_plan_skips_a_fault_type_without_a_behaviour(env):
+    from catalog.schema import Catalog
+    from resilience_tests.control.matrix import expand
+
+    plan, skipped = expand(Catalog(scenarios={"NL-C-01": _unbuilt_fault_scenario()}), env,
+                           reference_env_class=env.env_class)
+    assert plan == [] and len(skipped) == 1 and "is not built yet" in skipped[0].reason
+
+
+# --- the orchestrator knows no fault's detail ---------------------------------------------
+
+
+def test_the_orchestrator_reads_no_fault_specific_detail():
+    """Was: the orchestrator read `landed` (targeted kill), set the adapter's
+    `integrity_exclusions` (corruption), stored `checkpoint` evidence and listed the targeted
+    kill's per-cycle keys. Each now belongs to the fault or `during` behaviour that produces it."""
+    import resilience_tests.control.orchestrator as orch
+
+    fault_keys = {"landed", "kill_target", "target_pid", "death_confirmed_s", "postmaster_pid",
+                  "postmaster_survived", "integrity_exclusions", "checkpoint", "relation_kind"}
+    tree = ast.parse(Path(orch.__file__).read_text())
+    found = sorted({(n.lineno, n.value) for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value in fault_keys})
+    attrs = sorted({(n.lineno, n.attr) for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+                    and n.attr in ("integrity_exclusions", "kills_landed", "kill_target")})
+    assert not found and not attrs, f"orchestrator.py reads fault-specific detail: {found + attrs}"
+
+
+def test_run_state_is_declared_not_created_on_first_use():
+    """Was: the orchestrator created `_cycle_entries` and `_inject_detail` with getattr defaults,
+    and the adapter mixins did the same. State is declared where its owner is defined; a
+    getattr/hasattr on `self` with a literal name is that pattern coming back."""
+    root = Path(faults.__file__).parents[2]   # resilience_tests/
+    offending = []
+    for path in sorted(root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("getattr", "hasattr")
+                    and len(node.args) >= 2 and isinstance(node.args[0], ast.Name) and node.args[0].id == "self"
+                    and isinstance(node.args[1], ast.Constant)):
+                offending.append(f"{path.relative_to(root)}:{node.lineno} {node.func.id}(self, {node.args[1].value!r})")
+    assert not offending, offending
+
+
+def test_reverting_an_injection_the_ledger_does_not_hold_names_it():
+    """Was: a bare StopIteration from next() surfaced as an obscure error."""
+    run = SimpleNamespace(scenario=SimpleNamespace(fault=SimpleNamespace(type="process_kill", during=None)),
+                          facts={"injection_id": "inj-42"}, injector=SimpleNamespace(),
+                          ledger=SimpleNamespace(outstanding=lambda: [], path="/runs/injection-ledger.jsonl"))
+    with pytest.raises(RuntimeError, match="injection 'inj-42' of this run is not outstanding in the ledger"):
+        asyncio.run(faults.fault_behaviour(run).ctx.revert_fault())
+
+
+def test_an_engine_that_cannot_report_configuration_deviations_is_disclosed(env, monkeypatch):
+    from tests.test_orchestrator import OutageAdapter, run
+
+    async def cannot_tell(self):
+        return None
+    monkeypatch.setattr(OutageAdapter, "config_deviations", cannot_tell)
+    results = run(env, "NL-C-01")
+    assert results["facts"]["config_deviations"] is None
+    assert any("cannot report configuration deviations" in d for d in results["disclosures"])

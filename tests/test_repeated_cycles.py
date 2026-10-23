@@ -382,7 +382,7 @@ def test_corruption_after_the_cycles_fails_the_run(env, footprints, monkeypatch)
 def test_the_summary_shows_every_cycle_not_just_the_ratio(env, footprints):
     from resilience_tests.analysis.report import render_summary
 
-    text = render_summary(run_cycles(env))
+    text = render_summary(run_cycles(env), sections=[])
     assert "per cycle (T0 -> first accepted write)" in text
     assert text.count("  cycle ") == 3
     assert "s per cycle" in text and "bytes per live row" in text

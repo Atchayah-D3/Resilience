@@ -11,6 +11,10 @@ class ProcessKill(FaultBehaviour):
     fault_type = "process_kill"
     expects_outage = True
     recovers_unattended = True
+    # a repeated kill (NL-C-05, NL-M-03): which process each cycle hit, whether its death was
+    # confirmed, and any attempts that missed (a targeted kill whose process ended first)
+    cycle_evidence_keys = ("target_pid", "target", "landed", "death_confirmed_s", "postmaster_pid",
+                           "postmaster_survived", "missed_attempts")
 
 
 @register_fault

@@ -202,8 +202,13 @@ def test_recovery_still_waits_out_the_bound_when_writes_never_return(env, monkey
 
 
 def test_a_baseline_that_holds_the_slo_still_ends_recovery_on_the_slo(env):
+    # Room for a loaded machine, where the fake engine's latency is noisier: an 8 s baseline so
+    # it holds the SLO for the sustain period, and a 40 s recovery bound so its latency can
+    # settle back under 1.5x baseline. The phase still ends the moment the SLO is held, and a
+    # run that never returns to it still fails.
+    env = env.model_copy(update={"phase_timeouts_s": dict(env.phase_timeouts_s, recovery=40.0)})
     sc = scenario("NL-C-01")
-    sc = sc.model_copy(update={"steady_state": sc.steady_state.model_copy(update={"duration_s": 4})})
+    sc = sc.model_copy(update={"steady_state": sc.steady_state.model_copy(update={"duration_s": 8})})
     _, results = run_scenario(env, sc)
     assert results["facts"]["baseline_slo_check"]["sustained_window_found"] is True
     rec = recovery_record(results)

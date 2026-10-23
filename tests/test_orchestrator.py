@@ -221,6 +221,13 @@ class FakeFault(FaultInjector):
     lands = True
     reverts: list[dict[str, Any]] = []
 
+    def __init__(self, profile, fault_type):
+        super().__init__(profile, fault_type)
+        self.kill_target = None
+
+    def aim_at(self, target):
+        self.kill_target = target   # as the process driver: a targeted kill hits only this process
+
     async def preflight(self, node):
         return {"auto_conf_prior": "1s"} if self.fault_type == "config_reload" else {"ok": True}
 
@@ -629,7 +636,7 @@ def test_summary_shows_the_cleanup_problem(env, monkeypatch):
     from resilience_tests.analysis.report import render_summary
 
     failing_revert(monkeypatch)
-    summary = render_summary(run(env, "NL-C-01"))
+    summary = render_summary(run(env, "NL-C-01"), sections=[])
     assert "STATUS: ERROR" in summary and "killswitch" in summary
 
 

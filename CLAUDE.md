@@ -26,10 +26,10 @@ measures what the failure cost: transactions lost (RPO), time to recover (RTO), 
 | `envs/*.yaml` | Machines, ports, paths, drivers, phase bounds, safety allowlist, disclosures, `infra` |
 | `resilience_tests/control/orchestrator.py` | The 9 phases: reset, init, baseline, pre_fault, fault_inject, recovery, validate, report, cleanup |
 | `resilience_tests/control/faults/` | Per-fault and per-`during` behaviour the phases call (no fault-type branches in the orchestrator); behaviours see the run only through `context.py`; held faults subclass `HeldFault` |
-| `resilience_tests/adapters/postgresql/` | The ONLY place that knows PostgreSQL (`adapter.py` core + corruption/operations/sessions mixins) |
+| `resilience_tests/adapters/postgresql/` | All database-session knowledge of PostgreSQL (the OS/SSH drivers also run PostgreSQL tools; see the review note in `docs/code-improvement/`) (`adapter.py` core + corruption/operations/sessions mixins, one per interface group in `adapters/base.py`; `host.py` declares what the mixins use from the core) |
 | `resilience_tests/execution/injectors/process.py` | os_ssh driver: kill, restart, reload, idle txn, connection flood (one class per fault; shared helpers in `os_ssh.py`) |
 | `resilience_tests/execution/workload/driver.py` | asyncpg marker workload (+ Elle list-append mode) |
-| `resilience_tests/analysis/` | RTO decomposer, hold-window load ratios, predicates/verdict, report, Elle checker |
+| `resilience_tests/analysis/` | RTO decomposer, repeated-fault cycles, hold-window load ratios, predicates/verdict, report, Elle checker |
 | `tests/` | Unit tests with fake engines -- plumbing, not scenarios |
 | `vendor/elle/` | `setup_elle.sh` installs the pinned elle-cli jar (Java 21+) |
 | `specs/` | Spec Kit features (one per scenario or shared change) |
@@ -42,6 +42,7 @@ Behaviour comes only from catalog fields:
   (`checkpoint` NL-C-02, `large_transaction` NL-C-03, `concurrent_index_build` NL-C-06) and
   confirms it from the engine before injecting.
 - `fault.duration` -> held faults (NL-R-04 flood) hold for this many seconds.
+- A fault type with no behaviour in `control/faults/` is not built: skipped by the run plan and refused in init.
 - `workload.history: list_append` -> real Elle-checkable history (NL-C-03).
 - `requires` (engine capabilities) / `needs_infra` (environment) -> skipped with a reason.
 - Measures such as `fault_confirmed`, `operation_in_progress_at_fault` prove the fault landed.

@@ -100,6 +100,9 @@ class FakeAdapter(BaseDatabaseAdapter):
     async def server_version(self) -> str:
         return "fake-engine 1.0"
 
+    async def config_deviations(self) -> dict[str, str]:
+        return {}   # this engine reports its configuration, and nothing deviates
+
 
 def run_workload(adapter: FakeAdapter, seconds: float = 1.0):
     async def go():

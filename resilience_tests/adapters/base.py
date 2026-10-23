@@ -111,11 +111,21 @@ class DatabaseSession(ABC):
     def is_closed(self) -> bool: ...
 
 
-class BaseDatabaseAdapter(ABC):
-    """Per-engine implementation. Registered by engine name; selected by the env profile."""
+class CoreAdapter(ABC):
+    """What every engine provides: sessions for the workload and probes, the marker protocol's
+    state, and the evidence every run records and gates on (settings, integrity, logs).
+
+    A default here, and in the fault-support interfaces below, never returns a value that reads
+    as an observation. It either refuses (NotImplementedError), or returns an explicit "cannot
+    tell" (None, `supported: False`, `in_progress: False` with a note) that its caller turns
+    into NOT_MEASURED or an abort -- an engine that has not implemented something can never
+    make a run pass on an answer nobody measured."""
 
     engine: ClassVar[str]
     capabilities: ClassVar[frozenset[Capability]]
+    # Roles or privileges the harness granted itself on the target in prepare_harness_state;
+    # disclosed with every run (they persist after it).
+    harness_grants: Sequence[str] = ()
 
     def __init__(self, node: Node) -> None:
         self.node = node
@@ -187,78 +197,29 @@ class BaseDatabaseAdapter(ABC):
         """Structural and checksum verification, as far as the engine supports it. Counters
         are reported relative to `mark_integrity_baseline` when it was called."""
 
-    async def trigger_checkpoint_and_await_active(self, timeout_s: float = 10.0) -> dict[str, Any]:
-        """Trigger a checkpoint under the current workload and wait until the checkpointer is
-        actively writing/syncing buffers (not idle), returning checkpointer evidence (PID, wait
-        event, active state).
+    # Relations deliberately damaged by the fault, left out of the run's whole-database
+    # integrity check so that check still answers "is everything ELSE intact?". The damaged
+    # relation is checked on its own (CorruptionSupport.amcheck_relation), where a finding is
+    # the expected result.
+    integrity_exclusions: tuple[str, ...] = ()
 
-        Used by NL-C-02 to guarantee fault injection lands precisely while the checkpointer
-        is active, replacing arbitrary sleep guessing with deterministic state synchronization.
+    def exclude_from_integrity_check(self, relations: Sequence[str]) -> None:
+        """Leave these relations out of every later `integrity_check` of this adapter."""
+        self.integrity_exclusions = tuple(relations)
 
-        Default: returns checkpointer_active=False, which causes the orchestrator to abort
-        (fail closed). Subclasses must override with engine-specific synchronization."""
-        return {"checkpointer_active": False, "method": "default (not implemented)"}
-
-    async def checkpoint_in_flight_at_kill(self, log_lines: Sequence[str]) -> dict[str, Any]:
-        """Whether the checkpoint started by `trigger_checkpoint_and_await_active` was still
-        unfinished when the process was killed, judged from what the REPLACEMENT process logged
-        as it recovered (`log_lines`: the engine's log lines received after T0).
-
-        Returns `in_flight`: True (proven unfinished), False (proven finished before the kill --
-        the fault did not land) or None (no evidence either way). Default: None."""
-        return {"in_flight": None, "note": "this engine cannot show where crash recovery started"}
-
-    async def inject_idle_transaction(self) -> dict[str, Any]:
-        """Inject an open idle-in-transaction holding back the vacuum xmin horizon (NL-M-05).
-        Default returns supported=False; subclasses must override."""
-        return {"supported": False, "method": "default (not implemented)"}
-
-    async def check_idle_transaction(self, pid: int | None = None) -> dict[str, Any]:
-        """Check status of the idle-in-transaction backend: whether it is gone and the harness's
-        own session closed (`terminated_by_timeout`), or still open and holding xmin (NL-M-05).
-        When the closed session reported why, its error code is `termination_sqlstate`."""
-        return {"terminated_by_timeout": False, "still_idle": False}
-
-    def idle_timeout_log_patterns(self) -> tuple[str, ...]:
-        """Regexes matching the line this engine logs when it ends a session because of its
-        idle-in-transaction timeout. Evidence of WHY a session ended (NL-M-05 path A)."""
-        return ()
-
-    idle_timeout_sqlstates: tuple[str, ...] = ()  # error codes with the same meaning
-
-    async def probe_vacuum_horizon(self) -> dict[str, Any]:
-        """Run the engine's vacuum on the churn table while the idle session is still open and
-        report whether it found dead tuples it was NOT ALLOWED to remove (`dead_not_removable`)
-        and the cutoff it used (`removable_cutoff`). This is direct evidence that the vacuum
-        horizon is pinned. Default: not supported."""
-        return {"supported": False}
-
-    async def close_idle_transaction(self) -> dict[str, Any]:
-        """Cleanly terminate or rollback any active idle-in-transaction connection injected
-        during fault testing (NL-M-05). Must be idempotent."""
+    async def quick_integrity_check(self) -> dict[str, Any]:
+        """A fast inter-cycle checksum check to localize corruptions to the cycle that caused them.
+        {} when the engine has no quick check: no inter-cycle evidence, nothing gated on it."""
         return {}
 
-    async def evaluate_vacuum_bloat(self) -> dict[str, Any]:
-        """Dead-tuple counters on the churn table, as context for NL-M-05. Default: none."""
-        return {}
+    # Read -- never write -- the engine's configuration, so the run can say what it was
+    # measured against.
 
-    # Read -- never write -- the engine settings that decide how a fault plays out, so the run
-    # can say what it was measured against. The fault (or `during`) behaviour that depends on
-    # them asks for them; the adapter never chooses by fault type. Default: nothing to observe.
-
-    async def observe_idle_transaction_settings(self) -> dict[str, str]:
-        """The setting that decides whether an idle-in-transaction session is ended (NL-M-05)."""
-        return {}
-
-    async def observe_autovacuum_settings(self) -> dict[str, str]:
-        """The settings that decide whether and when autovacuum workers run (NL-M-03)."""
-        return {}
-
-    async def config_deviations(self) -> dict[str, str]:
-        """Detect any configuration deviations currently active on the database that diverge
-        from standard baseline (e.g. settings in postgresql.auto.conf).
-        Default: returns empty dict."""
-        return {}
+    async def config_deviations(self) -> dict[str, str] | None:
+        """Configuration currently active on the database that diverges from the deployment's
+        own files (e.g. settings in postgresql.auto.conf): {} when there is none, None when the
+        engine cannot tell -- which is disclosed, never reported as "none"."""
+        return None
 
     @abstractmethod
     async def server_version(self) -> str: ...
@@ -279,12 +240,171 @@ class BaseDatabaseAdapter(ABC):
         (e.g. crash recovery after an unclean stop). Reported as `recovery_started_s`."""
         return ()
 
-    # --- data-file corruption (fault type data_corruption, Framework NL-I) -------------------
 
-    # Relations deliberately corrupted by the fault, left out of the run's whole-database
-    # integrity check so that check still answers "is everything ELSE intact?". The corrupted
-    # relation is checked on its own (amcheck_relation), where a finding is the expected result.
-    integrity_exclusions: tuple[str, ...] = ()
+class SessionFaultSupport:
+    """Faults held in the database's own sessions: a session left idle in a transaction
+    (NL-M-05) and a connection flood (NL-R-04)."""
+
+    async def observe_idle_transaction_settings(self) -> dict[str, str]:
+        """The setting that decides whether an idle-in-transaction session is ended (NL-M-05)."""
+        return {}
+
+    def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
+        """The engine's idle-in-transaction timeout in seconds, from the settings
+        `observe_idle_transaction_settings` returned; 0.0 when it is disabled or unknown."""
+        return 0.0
+
+    async def inject_idle_transaction(self) -> dict[str, Any]:
+        """Inject an open idle-in-transaction holding back the vacuum xmin horizon (NL-M-05).
+        An engine that does not implement it refuses: the fault is then not applied."""
+        raise NotImplementedError(f"{type(self).__name__} cannot hold a session idle in a transaction")
+
+    async def check_idle_transaction(self, pid: int | None = None) -> dict[str, Any]:
+        """Check status of the idle-in-transaction backend: whether it is gone and the harness's
+        own session closed (`terminated_by_timeout`), or still open and holding xmin (NL-M-05).
+        When the closed session reported why, its error code is `termination_sqlstate`. An
+        engine that cannot tell refuses, so the outcome is NOT_MEASURED, never a guess."""
+        raise NotImplementedError(f"{type(self).__name__} cannot report the state of an idle-in-transaction session")
+
+    def idle_timeout_log_patterns(self) -> tuple[str, ...]:
+        """Regexes matching the line this engine logs when it ends a session because of its
+        idle-in-transaction timeout. Evidence of WHY a session ended (NL-M-05 path A)."""
+        return ()
+
+    idle_timeout_sqlstates: tuple[str, ...] = ()  # error codes with the same meaning
+
+    async def probe_vacuum_horizon(self) -> dict[str, Any]:
+        """Run the engine's vacuum on the churn table while the idle session is still open and
+        report whether it found dead tuples it was NOT ALLOWED to remove (`dead_not_removable`)
+        and the cutoff it used (`removable_cutoff`). This is direct evidence that the vacuum
+        horizon is pinned. Default: not supported."""
+        return {"supported": False}
+
+    async def close_idle_transaction(self) -> dict[str, Any]:
+        """Cleanly terminate or rollback any active idle-in-transaction connection injected
+        during fault testing (NL-M-05). Must be idempotent. An engine that cannot hold one has
+        nothing to close: {}."""
+        return {}
+
+    async def evaluate_vacuum_bloat(self) -> dict[str, Any]:
+        """Dead-tuple counters on the churn table, as context for NL-M-05. Default: none."""
+        return {}
+
+    async def exhaust_connections(self, hold_s: float) -> dict[str, Any]:
+        """NL-R-04: open max_connections + 50% sessions, hold them for `hold_s`, release them,
+        and confirm a new session is accepted afterwards. An engine that does not implement it
+        refuses: an empty answer would read as a flood that was applied."""
+        raise NotImplementedError(f"{type(self).__name__} cannot flood its connections")
+
+    async def revert_exhaust_connections(self) -> dict[str, Any]:
+        """Terminate any flood session still open on the server, wherever it came from --
+        including a harness process that died mid-hold. Must work from a fresh adapter (the
+        kill switch has no other). An engine that cannot flood has nothing to release: {}."""
+        return {}
+
+
+class OperationSupport:
+    """Operations a fault must land inside (`fault.during`): a checkpoint (NL-C-02), a large
+    transaction (NL-C-03), a concurrent index build (NL-C-06), an autovacuum worker (NL-M-03).
+
+    `start_*` launches the operation on its own session and returns only once the engine
+    itself reports it in progress: {"in_progress": True, ...}. Anything else -- including an
+    engine that does not implement it -- aborts the run before the fault: a kill that missed
+    the operation would test nothing and must never be reported as a pass."""
+
+    # Create what a `during` operation needs, in init, before the baseline is measured. The
+    # `during` behaviour asks for its own objects. Default: nothing.
+
+    async def prepare_checkpoint_objects(self) -> dict[str, Any]:
+        """A table whose pages the checkpoint will be writing when the fault lands."""
+        return {}
+
+    async def prepare_index_build_objects(self) -> dict[str, Any]:
+        """A table to build an index on."""
+        return {}
+
+    async def prepare_autovacuum_objects(self) -> dict[str, Any]:
+        """A table an autovacuum worker will be vacuuming."""
+        return {}
+
+    async def observe_autovacuum_settings(self) -> dict[str, str]:
+        """The settings that decide whether and when autovacuum workers run (NL-M-03)."""
+        return {}
+
+    async def trigger_checkpoint_and_await_active(self, timeout_s: float = 10.0) -> dict[str, Any]:
+        """Trigger a checkpoint under the current workload and wait until the checkpointer is
+        actively writing/syncing buffers (not idle), returning checkpointer evidence (PID, wait
+        event, active state).
+
+        Used by NL-C-02 to guarantee fault injection lands precisely while the checkpointer
+        is active, replacing arbitrary sleep guessing with deterministic state synchronization.
+
+        An engine that does not implement it refuses; the run is then aborted before the
+        fault (Arch §8: anything not built refuses)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot synchronise with a running checkpoint")
+
+    async def checkpoint_in_flight_at_kill(self, log_lines: Sequence[str]) -> dict[str, Any]:
+        """Whether the checkpoint started by `trigger_checkpoint_and_await_active` was still
+        unfinished when the process was killed, judged from what the REPLACEMENT process logged
+        as it recovered (`log_lines`: the engine's log lines received after T0).
+
+        Returns `in_flight`: True (proven unfinished), False (proven finished before the kill --
+        the fault did not land) or None (no evidence either way). Default: None."""
+        return {"in_flight": None, "note": "this engine cannot show where crash recovery started"}
+
+    async def change_pages_before_checkpoint(self) -> dict[str, Any]:
+        """Leave a known amount of changed-but-unwritten data in memory right before the
+        checkpoint of `during: checkpoint`, so the checkpoint lasts long enough for the kill to
+        land inside it. Default: not supported -- the run proceeds without it and the
+        after-the-fact proof still decides whether the kill landed in time."""
+        return {"supported": False}
+
+    async def start_autovacuum_worker(self) -> dict[str, Any]:
+        """NL-M-03: give autovacuum real work, then wait for one of THIS instance's autovacuum
+        workers to be running and return it as a kill target:
+        {"in_progress": True, "kill_target": {"pid", "parent_pid", "title_marker", ...}}."""
+        return {"in_progress": False, "note": "not implemented by this engine"}
+
+    async def verify_autovacuum_resumed(self) -> dict[str, Any]:
+        """After the final recovery: {"autovacuum_worker_respawned", "relations_eligible",
+        "relations_left_unvacuumed" (None when no relation became eligible), ...}. Evidence
+        must post-date the last crash recovery."""
+        return {}
+
+    async def start_large_transaction(self) -> dict[str, Any]:
+        """Begin the large uncommitted transaction of NL-C-03 (Framework §10.2: a 10M-row
+        INSERT) and return once it has demonstrably written part of its rows."""
+        return {"in_progress": False, "note": "not implemented by this engine"}
+
+    async def verify_large_transaction(self) -> dict[str, Any]:
+        """After recovery: {"rows_visible", "parent_rows_visible", "fk_violations"} -- every
+        one must be 0 for a transaction that never committed."""
+        return {}
+
+    async def start_concurrent_index_build(self) -> dict[str, Any]:
+        """Begin the online index build of NL-C-06 and return once the engine reports the
+        build phase in progress."""
+        return {"in_progress": False, "note": "not implemented by this engine"}
+
+    async def verify_concurrent_index(self) -> dict[str, Any]:
+        """After recovery: {"index_left_invalid", "table_readable", "rebuild_succeeds"}."""
+        return {}
+
+    async def abandon_background_operation(self) -> dict[str, Any]:
+        """Close whatever session `start_*` left open (it was killed with the server).
+        Idempotent; never raises."""
+        return {}
+
+    async def cleanup_scenario_objects(self) -> dict[str, Any]:
+        """Remove objects a `during` operation created (an invalid index, aborted bulk rows),
+        so the next run starts clean. Idempotent."""
+        return {}
+
+
+class CorruptionSupport:
+    """Data-file corruption (fault type data_corruption, Framework NL-I): the harness-owned
+    target relation, the byte to damage, and reading the damaged relation back."""
+
     # Error codes this engine raises when a read finds a corrupted page.
     corruption_sqlstates: tuple[str, ...] = ()
 
@@ -338,96 +458,12 @@ class BaseDatabaseAdapter(ABC):
         corrupted page. Used to show no OTHER relation was damaged."""
         return []
 
-    def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
-        """The engine's idle-in-transaction timeout in seconds, from the settings
-        `observe_idle_transaction_settings` returned; 0.0 when it is disabled or unknown."""
-        return 0.0
 
-    # --- operations a fault must land inside (fault.during) ---------------------------
-    #
-    # `start_*` launches the operation on its own session and returns only once the engine
-    # itself reports it in progress: {"in_progress": True, ...}. Anything else -- including
-    # an engine that does not implement it -- aborts the run before the fault: a kill that
-    # missed the operation would test nothing and must never be reported as a pass.
-
-    # Create what a `during` operation needs, in init, before the baseline is measured. The
-    # `during` behaviour asks for its own objects. Default: nothing.
-
-    async def prepare_checkpoint_objects(self) -> dict[str, Any]:
-        """A table whose pages the checkpoint will be writing when the fault lands."""
-        return {}
-
-    async def prepare_index_build_objects(self) -> dict[str, Any]:
-        """A table to build an index on."""
-        return {}
-
-    async def prepare_autovacuum_objects(self) -> dict[str, Any]:
-        """A table an autovacuum worker will be vacuuming."""
-        return {}
-
-    async def start_autovacuum_worker(self) -> dict[str, Any]:
-        """NL-M-03: give autovacuum real work, then wait for one of THIS instance's autovacuum
-        workers to be running and return it as a kill target:
-        {"in_progress": True, "kill_target": {"pid", "parent_pid", "title_marker", ...}}."""
-        return {"in_progress": False, "note": "not implemented by this engine"}
-
-    async def verify_autovacuum_resumed(self) -> dict[str, Any]:
-        """After the final recovery: {"autovacuum_worker_respawned", "relations_eligible",
-        "relations_left_unvacuumed" (None when no relation became eligible), ...}. Evidence
-        must post-date the last crash recovery."""
-        return {}
-
-    async def change_pages_before_checkpoint(self) -> dict[str, Any]:
-        """Leave a known amount of changed-but-unwritten data in memory right before the
-        checkpoint of `during: checkpoint`, so the checkpoint lasts long enough for the kill to
-        land inside it. Default: not supported -- the run proceeds without it and the
-        after-the-fact proof still decides whether the kill landed in time."""
-        return {"supported": False}
-
-    async def start_large_transaction(self) -> dict[str, Any]:
-        """Begin the large uncommitted transaction of NL-C-03 (Framework §10.2: a 10M-row
-        INSERT) and return once it has demonstrably written part of its rows."""
-        return {"in_progress": False, "note": "not implemented by this engine"}
-
-    async def verify_large_transaction(self) -> dict[str, Any]:
-        """After recovery: {"rows_visible", "parent_rows_visible", "fk_violations"} -- every
-        one must be 0 for a transaction that never committed."""
-        return {}
-
-    async def start_concurrent_index_build(self) -> dict[str, Any]:
-        """Begin the online index build of NL-C-06 and return once the engine reports the
-        build phase in progress."""
-        return {"in_progress": False, "note": "not implemented by this engine"}
-
-    async def verify_concurrent_index(self) -> dict[str, Any]:
-        """After recovery: {"index_left_invalid", "table_readable", "rebuild_succeeds"}."""
-        return {}
-
-    async def abandon_background_operation(self) -> dict[str, Any]:
-        """Close whatever session `start_*` left open (it was killed with the server).
-        Idempotent; never raises."""
-        return {}
-
-    async def cleanup_scenario_objects(self) -> dict[str, Any]:
-        """Remove objects a `during` operation created (an invalid index, aborted bulk rows),
-        so the next run starts clean. Idempotent."""
-        return {}
-
-    async def quick_integrity_check(self) -> dict[str, Any]:
-        """A fast inter-cycle checksum check to localize corruptions to the cycle that caused them.
-        Default: returns empty dict."""
-        return {}
-
-    async def exhaust_connections(self, hold_s: float) -> dict[str, Any]:
-        """NL-R-04: open max_connections + 50% sessions, hold them for `hold_s`, release them,
-        and confirm a new session is accepted afterwards. Default: returns empty dict."""
-        return {}
-
-    async def revert_exhaust_connections(self) -> dict[str, Any]:
-        """Terminate any flood session still open on the server, wherever it came from --
-        including a harness process that died mid-hold. Must work from a fresh adapter (the
-        kill switch has no other). Default: returns empty dict."""
-        return {}
+class BaseDatabaseAdapter(CoreAdapter, SessionFaultSupport, OperationSupport, CorruptionSupport):
+    """Per-engine implementation: the core plus every fault-support interface, which is what
+    the harness types against. Registered by engine name; selected by the env profile. An
+    engine overrides what it supports; everything else keeps the interfaces' defaults, which
+    refuse or say they cannot tell."""
 
 
 

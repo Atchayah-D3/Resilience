@@ -112,13 +112,14 @@ stops a half-finished run from looking perfect.
 
 | File | Job |
 |---|---|
-| `adapters/base.py` | The interface an engine must implement, and the capabilities an engine can declare. |
-| `adapters/postgresql/` | The only package that knows PostgreSQL. `adapter.py` holds the core (connections, SQL, error meanings, `pg_amcheck`, checksum counters); `corruption.py`, `operations.py` and `sessions.py` add the methods particular faults need. |
+| `adapters/base.py` | The interface an engine must implement, grouped by topic (the core, and one support interface per kind of fault), and the capabilities an engine can declare. |
+| `adapters/postgresql/` | The only package that knows PostgreSQL. `adapter.py` holds the core (connections, SQL, error meanings, `pg_amcheck`, checksum counters); `corruption.py`, `operations.py` and `sessions.py` each implement one fault-support interface; `host.py` declares what they use from the core. |
 | `adapters/target_resolver.py` | Turns a test’s allowed roles into the actual machines in the file. |
 | `observability/event_stream.py` | The append-only record: one JSON line per event into `events.jsonl`. |
 | `observability/alerts.py` | Asks the environment's monitoring whether an alert fired (`alerting.source` in the profile). Only `none` exists: "alerted" measures are then NOT_MEASURED with the reason. |
 | `analysis/degradation.py` | For a fault held under load: TPS and p99 during the hold over the baseline (`oltp_tps_ratio`, `oltp_p99_ratio`). |
 | `analysis/rto_decomposer.py` | Everything time-related: when service stopped, when writes returned, when throughput truly recovered, and the breakdown. |
+| `analysis/cycles.py` | For a repeated fault: each cycle's recovery against the replay work it faced, the trend across cycles, errors per cycle, and on-disk growth. |
 | `analysis/predicates.py` | Evaluates one rule, such as `rpo_txn == 0`, against the measured values. |
 | `analysis/threshold_eval.py` | Applies every rule and produces the verdict, with a reason recorded for each rule. |
 | `analysis/report.py` | Writes `results.json` and `summary.txt`. |
@@ -235,6 +236,11 @@ possible.
 Recovery must be unattended: on the target, the service manager notices the death, starts the
 database again, and the database replays its log and reopens. **T1 equals T0**, because no
 harness action was needed.
+
+**A fault the harness holds and then removes** (contention and pressure, Framework §10.6) —
+held for `fault.duration` and released while still in the fault_inject phase; the release is
+**T1**. Recovery only watches what follows it, so the recovery phase's duration does not
+include the hold.
 
 **Power loss** — the harness switches the power back on, and that instant is **T1**, later than
 T0 by however long the scenario keeps the machine dark. The harness restores power and nothing
@@ -546,21 +552,46 @@ Hooks a behaviour may override, in the order the phases call them (each defaults
 a named adapter method, never written), `samplers()` (extra background measurements, started
 and stopped with the run's probes),
 `baseline_started()` / `baseline_ended()`, `before_inject()` / `after_inject(detail)`,
-`begin_recovery()`, `recovery_hold_s()`, `measure_client_impact()`, `before_integrity_check()`,
-`measure()`; `phase_extension_s(phase)` adds a hold to that phase's profile bound, and
-`slo_clock_from_t1()` measures time back to SLO from T1. Its section of `summary.txt` comes from
-the classmethod `summary_lines(results)`, registered with the behaviour; `analysis/report.py`
-names no fault. A `fault.during` behaviour has the same `observe_settings()` and
-`summary_lines()`, plus `create_objects()` for what the operation needs. A fault the harness holds and then
-releases (contention, pressure: Framework §10.6) subclasses `HeldFault`: its driver applies the
-fault in `inject`, the recovery phase holds it for `fault.duration` with the workload measured
-in its own window (`on_hold_start` / `on_hold_end` for snapshots), releases it through the
-driver's `revert` (T1), and `oltp_tps_ratio` / `oltp_p99_ratio` are measured for it.
+`hold_and_release()` (fault_inject: a fault the harness holds and removes itself),
+`begin_recovery()`, `recovery_soak_s()` (a fixed time to observe instead of waiting for the SLO,
+for a recovery that is the engine's own doing, e.g. NL-M-05's timeout), `measure_client_impact()`,
+`before_integrity_check()`, `measure()`; `phase_extension_s(phase)` adds a hold to that phase's
+profile bound, `slo_clock_from_t1()` measures time back to SLO from T1, and `cycle_evidence_keys`
+names the injection-detail keys kept in each cycle's row of a repeated scenario. Its section of
+`summary.txt` comes from the classmethod `summary_lines(results)`; the orchestrator hands every
+registered section to `analysis/report.py` (`summary_sections()`), which names no fault.
+
+A `fault.during` behaviour has the same `observe_settings()` and `summary_lines()`, plus
+`create_objects()` for what the operation needs, `establish()` (bring the target into the state
+the fault must land inside, just before each attempt; it returns evidence recorded with the
+injection) and `after_inject(detail)`.
+
+A fault the harness holds and then releases (contention, pressure: Framework §10.6) subclasses
+`HeldFault`: its driver applies the fault in `inject`; still in the fault_inject phase,
+`hold_and_release()` holds it for `fault.duration` with the workload measured in its own window
+(`on_hold_start` / `on_hold_end` for snapshots) and releases it through the driver's `revert`
+(T1). The recovery phase then only watches the return to SLO from T1, so each phase's duration
+means what its name says; `oltp_tps_ratio` / `oltp_p99_ratio` are measured for it.
+
+A fault type with no registered behaviour is not built: the run plan skips it and init refuses
+it, with the reason, before anything is applied (`control/matrix.py: not_built_reason`).
+
+**A driver** keeps its own settings: it overrides `configure()` to take what it needs from the
+scenario (a hold duration, a repeat plan, a relation kind). The base class only aims a fault at
+a single process if the driver overrides `aim_at()`; otherwise it refuses.
 
 **A second database engine** — implement `BaseDatabaseAdapter`, declare its capabilities, and
-`register_adapter()` it against the engine name in the profile. A capability the engine lacks
-makes the affected measurement NOT_APPLICABLE rather than zero. `tests/test_adapter_seam.py`
-shows the whole interface exercised by a fake engine.
+`register_adapter()` it against the engine name in the profile. The interface is grouped by
+topic in `adapters/base.py`: `CoreAdapter` (what every engine provides: sessions, markers,
+settings, integrity, logs) and one support interface per kind of fault (`SessionFaultSupport`,
+`OperationSupport`, `CorruptionSupport`). An engine overrides what it supports; every default it
+leaves either refuses (`NotImplementedError`) or says it cannot tell (None, `supported: False`),
+so an unbuilt feature can never pass on an invented answer. A capability the engine lacks makes
+the affected measurement NOT_APPLICABLE rather than zero. The PostgreSQL adapter implements each
+group in its own file (`sessions.py`, `operations.py`, `corruption.py`), mixed into the core
+class in `adapter.py`; what those files use from the core is declared in `host.py`.
+`tests/test_adapter_seam.py` shows the whole interface exercised by a fake engine, and
+`tests/test_adapter_structure.py` keeps the grouping honest.
 
 **A new environment** — one YAML in `envs/`. The model rejects a profile whose harness machine is
 also a target, or that leaves any phase unbounded.

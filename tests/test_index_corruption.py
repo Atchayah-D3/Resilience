@@ -400,6 +400,11 @@ class IndexCorruptionFault(FakeFault):
     fault_types = frozenset({"data_corruption"})
     kinds: list[str] = []
 
+    def configure(self, fault, repeat, adapter):
+        # as OsSshCorruptionDriver: the driver keeps the relation kind it was configured with
+        super().configure(fault, repeat, adapter)
+        self.corruption_kind = fault.relation_kind or "heap"
+
     async def preflight(self, node):
         IndexCorruptionFault.kinds.append(self.corruption_kind)
         return {"target": dict(TARGET)}
@@ -495,7 +500,8 @@ def test_a_detected_and_restored_index_passes(env, damaged):
 def test_the_summary_shows_the_plan_the_new_file_and_the_block_amcheck_named(env, damaged):
     from resilience_tests.analysis.report import render_summary
 
-    text = render_summary(run_nli02(env))
+    from resilience_tests.control.faults import summary_sections
+    text = render_summary(run_nli02(env), sections=summary_sections())
     assert "pg_amcheck on the damaged relation: detected=True, names the injected block=True" in text
     assert "reads through the index: used_index=True plan=Index Scan XX001; used_index=True plan=Index Scan XX001" in text
     assert f"file {PATH} -> {REBUILT_PATH} (new storage=True)" in text

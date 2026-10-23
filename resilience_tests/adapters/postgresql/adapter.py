@@ -30,6 +30,7 @@ from resilience_tests.adapters.postgresql.corruption import (  # noqa: F401  (re
 )
 from resilience_tests.adapters.postgresql.operations import (  # noqa: F401  (re-exported)
     AVAC_ANY_WORKER_SQL,
+    AVAC_SETTINGS,
     AVAC_MAKE_DEAD,
     AVAC_RELATIONS_SQL,
     AVAC_TABLE,
@@ -41,6 +42,7 @@ from resilience_tests.adapters.postgresql.operations import (  # noqa: F401  (re
 from resilience_tests.adapters.postgresql.sessions import (  # noqa: F401  (re-exported)
     IDLE_SESSION_APPLICATION_NAME,
     SessionsMixin,
+    parse_pg_interval_s,
 )
 from resilience_tests.control.profile import DbEndpoint, Node
 from resilience_tests.execution.remote import RemoteHost, as_user
@@ -134,11 +136,6 @@ ELLE_APPEND = ("INSERT INTO resilience.elle_lists AS l (k, v) VALUES ($1, ARRAY[
 LEGACY_CIC_INDEX = "resilience.idx_nlc06_concurrent"
 
 
-AVAC_SETTINGS = ("autovacuum", "track_counts", "autovacuum_naptime", "autovacuum_max_workers",
-                 "autovacuum_vacuum_cost_delay", "autovacuum_vacuum_cost_limit",
-                 "autovacuum_vacuum_threshold", "autovacuum_vacuum_scale_factor",
-                 "restart_after_crash", "update_process_title")
-
 DURABILITY_SETTINGS = ["data_checksums", "fsync", "synchronous_commit", "full_page_writes",
                        "wal_sync_method", "server_version"]
 
@@ -216,31 +213,6 @@ def checksum_failures_since(baseline: ChecksumStats | None, now: ChecksumStats) 
         else:
             total += failures - before[0]
     return total
-
-
-def parse_pg_interval_s(val: str | None) -> float:
-    """Parse PostgreSQL interval strings such as '30s', '1min', '2h', '500ms', '0' into seconds."""
-    if not val:
-        return 0.0
-    val = str(val).strip().lower()
-    if val in ("0", "disabled", "off", "none"):
-        return 0.0
-    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)?$", val)
-    if not m:
-        return 0.0
-    num = float(m.group(1))
-    unit = m.group(2) or "s"
-    if unit in ("ms", "millisecond", "milliseconds"):
-        return num / 1000.0
-    elif unit in ("s", "sec", "second", "seconds"):
-        return num
-    elif unit in ("min", "m", "minute", "minutes"):
-        return num * 60.0
-    elif unit in ("h", "hr", "hour", "hours"):
-        return num * 3600.0
-    elif unit in ("d", "day", "days"):
-        return num * 86400.0
-    return num
 
 
 class PostgreSQLSession(DatabaseSession):
@@ -374,7 +346,7 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, BaseDat
         # PostgreSQL 15+ restricts CHECKPOINT to superusers and members of 'pg_checkpoint',
         # and pg_stat_activity detailed monitoring to 'pg_read_all_stats'. The grant persists
         # (it is not revoked at cleanup), so it is recorded for the report's disclosures.
-        self.harness_grants: list[str] = []
+        self.harness_grants = []
         try:
             async with RemoteHost(self.node.ssh) as host:
                 grant_cmd = (
@@ -407,9 +379,6 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, BaseDat
         finally:
             await conn.close()
 
-    corruption_sqlstates = ("XX001",)  # data_corrupted
-
-
     async def amcheck_relation(self, relation: str, timeout_s: float, *,
                                heapallindexed: bool = False) -> dict[str, Any]:
         """pg_amcheck on the one relation (Arch §10.1 names it for NL-I-01). A checksum failure
@@ -435,13 +404,6 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, BaseDat
         pages = [{"block": int(b), "relation_path": p} for b, p in _INVALID_PAGE_RE.findall(output)]
         return {"detected": detected, "exit_status": result.exit_status, "corrupt_pages": pages,
                 "output": output[:2000], "command": command}
-
-
-    def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
-        return parse_pg_interval_s(observed.get("idle_in_transaction_session_timeout"))
-
-    # ------------------------------------------------------------------ fault.during
-
 
     async def redo_distance_bytes(self) -> int | None:
         try:
@@ -547,33 +509,6 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, BaseDat
     def integrity_databases(self) -> list[str]:
         return list(self.node.integrity_databases or [self.node.db.dbname])
 
-    # Both idle states of the checkpointer process. The poll loop must wait until the
-    # checkpointer leaves ALL of these before declaring it "active". CheckpointerMain is the
-    # main-loop sleep when no checkpoint is pending; CheckpointDelay is the inter-checkpoint
-    # sleep. Either one means the checkpointer is NOT flushing dirty buffers.
-    _CHECKPOINTER_IDLE_EVENTS = frozenset({"CheckpointerMain", "CheckpointDelay"})
-
-    # Wait events that positively confirm the checkpointer is doing checkpoint I/O.
-    # We require one of these rather than merely "not idle", so a transient NULL or an
-    # unrecognised future event does not produce a false positive.
-    _CHECKPOINTER_ACTIVE_EVENTS = frozenset({
-        "CheckpointWriteDelay",   # Timeout: throttling between buffer writes
-        "CheckpointSync",         # IO: syncing relation files to storage (older PG)
-        "DataFileSync",           # IO: syncing relation files to storage (PG 10+)
-        "DataFileWrite",          # IO: writing data pages
-        "WalSync",                # IO: flushing WAL during checkpoint
-        "WALSync",                # IO: capitalization variation
-        "SlruWrite",              # IO: writing SLRU pages
-        "SlruSync",               # IO: syncing SLRU pages
-        "SLRUSync",               # IO: capitalization variation
-        "ControlFileWrite",       # IO: writing control file
-        "ControlFileSync",        # IO: syncing control file
-        "ControlFileSyncUpdate",  # IO: updating control file
-        "BufFileWrite",           # IO: writing temp buffers (rare during checkpoint)
-    })
-    _CHECKPOINTER_ACTIVE_TYPES = frozenset({"IO", "Timeout"})
-
-
     async def integrity_check(self, timeout_s: float) -> IntegrityResult:
         """pg_amcheck --heapallindexed over the configured databases (Arch §10.1, Framework
         NL-I-07). Runs as the cluster's OS user over SSH, so the harness role needs no
@@ -621,28 +556,6 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, BaseDat
                     "excluded_relations": list(self.integrity_exclusions),
                     "checksum_baseline_taken": baseline is not None},
         )
-
-
-    idle_timeout_sqlstates = ("25P03",)  # idle_in_transaction_session_timeout
-
-
-    async def observe_autovacuum_settings(self) -> dict[str, str]:
-        """Read only -- nothing is written (NL-M-03)."""
-        conn = await self._connect(timeout_s=10.0)
-        try:
-            rows = await conn.fetch("SELECT name, setting || coalesce(unit, '') AS v FROM pg_settings "
-                                    "WHERE name = ANY($1::text[])", list(AVAC_SETTINGS))
-            return {r["name"]: r["v"] for r in rows}
-        finally:
-            await conn.close()
-
-    async def observe_idle_transaction_settings(self) -> dict[str, str]:
-        """Read only -- nothing is written: the server's own timeout (NL-M-05)."""
-        conn = await self._connect(timeout_s=10.0)
-        try:
-            return {"idle_in_transaction_session_timeout": str(await conn.fetchval("SHOW idle_in_transaction_session_timeout"))}
-        finally:
-            await conn.close()
 
     async def config_deviations(self) -> dict[str, str]:
         """Detect any parameters set in postgresql.auto.conf (ALTER SYSTEM deviations)."""

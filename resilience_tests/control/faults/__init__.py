@@ -14,4 +14,6 @@ from resilience_tests.control.faults.base import (  # noqa: F401
     PhaseAbort,
     during_behaviour,
     fault_behaviour,
+    has_fault_behaviour,
+    summary_sections,
 )

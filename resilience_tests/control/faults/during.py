@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 from resilience_tests.analysis.predicates import NOT_MEASURED
 from resilience_tests.control.faults.base import DuringBehaviour, PhaseAbort, register_during
+from resilience_tests.control.faults.context import RunContext
 
 
 @register_during
@@ -56,7 +57,7 @@ class Checkpoint(DuringBehaviour):
                 lines.append(f"  io writes delta (pg_stat_io): {cp['io_writes_during_cp']}")
         return lines
 
-    async def establish(self) -> tuple[dict[str, Any], Any]:
+    async def establish(self) -> dict[str, Any]:
         # The kill must land while the checkpoint is still running. Everything the kill
         # needs (SSH session, postmaster identity) is prepared BEFORE the checkpoint
         # starts, so once the checkpointer is seen working the kill is a single command.
@@ -89,7 +90,7 @@ class Checkpoint(DuringBehaviour):
         if not active:
             await ctx.disarm_fault()
             raise PhaseAbort(f"checkpointer was not active: {checkpoint_detail.get('error', 'wait event indicates idle checkpointer')}")
-        return checkpoint_detail, None
+        return {"checkpoint": checkpoint_detail}
 
     async def verify(self, events: list[Any]) -> tuple[dict[str, Any], str | None]:
         # Proven from where crash recovery started, not from what was seen before the kill:
@@ -147,8 +148,6 @@ class _InterruptedOperation(DuringBehaviour):
                 m[name] = NOT_MEASURED
                 ctx.not_measured[name] = (error or result.get(f"{key}_why")
                                           or f"the engine did not report {key}")
-        if "kills_landed" in ctx.scenario.measure:
-            m["kills_landed"] = ctx.kills_landed
         return m, None
 
     async def cleanup(self) -> None:
@@ -168,7 +167,7 @@ class _StartedOperation(_InterruptedOperation):
     async def _start(self) -> dict[str, Any]:
         raise NotImplementedError
 
-    async def establish(self) -> tuple[dict[str, Any], Any]:
+    async def establish(self) -> dict[str, Any]:
         ctx = self.ctx
         during_detail = await self._start()
         ctx.facts["during"] = {"operation": self.during, **during_detail}
@@ -176,7 +175,7 @@ class _StartedOperation(_InterruptedOperation):
             await ctx.adapter.abandon_background_operation()
             raise PhaseAbort(f"{self.during} was not in progress at the fault: "
                          f"{during_detail.get('note', 'not confirmed')}")
-        return {}, None
+        return {}
 
 
 @register_during
@@ -217,6 +216,14 @@ class AutovacuumWorker(_InterruptedOperation):
                 "relations_eligible": "relations_eligible",
                 "relations_left_unvacuumed": "relations_left_unvacuumed"}
 
+    def __init__(self, ctx: RunContext) -> None:
+        super().__init__(ctx)
+        self.kills_landed = 0   # kills confirmed on the targeted worker; a miss never counts
+
+    async def after_inject(self, detail: dict[str, Any]) -> None:
+        if detail.get("landed"):
+            self.kills_landed += 1
+
     async def create_objects(self) -> dict[str, Any]:
         return await self.ctx.adapter.prepare_autovacuum_objects()
 
@@ -237,7 +244,7 @@ class AutovacuumWorker(_InterruptedOperation):
             + (f" The harness-owned table it vacuums carries its own storage options {options}, "
                "so its vacuum lasts long enough to be killed; no global setting is changed." if options else ""))
 
-    async def establish(self) -> tuple[dict[str, Any], Any]:
+    async def establish(self) -> dict[str, Any]:
         # Give autovacuum work AFTER the latest recovery, wait for a worker of this instance
         # to be vacuuming it, and hand the injector exactly that process (it re-checks the
         # parent and title before killing).
@@ -249,7 +256,13 @@ class AutovacuumWorker(_InterruptedOperation):
             raise PhaseAbort(f"{self.during} was not in progress at the fault: "
                          f"{during_detail.get('note', 'not confirmed')}")
         ctx.aim_fault_at(during_detail["kill_target"])
-        return {}, None
+        return {}
 
     async def _verify_with_adapter(self) -> dict[str, Any]:
         return await self.ctx.adapter.verify_autovacuum_resumed()
+
+    async def verify(self, events: list[Any]) -> tuple[dict[str, Any], str | None]:
+        m, not_landed = await super().verify(events)
+        if "kills_landed" in self.ctx.scenario.measure:
+            m["kills_landed"] = self.kills_landed
+        return m, not_landed

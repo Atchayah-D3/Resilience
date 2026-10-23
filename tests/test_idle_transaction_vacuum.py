@@ -28,6 +28,7 @@ from resilience_tests.adapters.base import (
 )
 from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
 from resilience_tests.analysis.report import render_summary
+from resilience_tests.control.faults import summary_sections
 from resilience_tests.control.faults import FaultBehaviour
 from resilience_tests.control.faults.service import ProcessKill
 from resilience_tests.control.matrix import RunPlanItem
@@ -273,7 +274,7 @@ def test_nl_m_05_summary_report_rendering(env):
         node=env.nodes[0],
     )
     results = asyncio.run(TestOrchestrator(item, env, RunOptions()).run())
-    summary = render_summary(results)
+    summary = render_summary(results, sections=summary_sections())
 
     assert "idle-in-transaction vacuum blocking (NL-M-05):" in summary
     assert "idle backend pid: 8888" in summary

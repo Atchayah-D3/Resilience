@@ -17,9 +17,11 @@ from resilience_tests.observability.alerts import alert_source_for
 if TYPE_CHECKING:
     from catalog.schema import Scenario
     from resilience_tests.adapters.base import BaseDatabaseAdapter
+    from resilience_tests.control.ledger import LedgerEntry
     from resilience_tests.control.orchestrator import TestOrchestrator
     from resilience_tests.control.profile import Node
-    from resilience_tests.observability.event_stream import EventStream
+    from resilience_tests.execution.workload.driver import MeasuredWindow
+    from resilience_tests.observability.event_stream import Event, EventStream
 
 
 class RunContext:
@@ -58,11 +60,7 @@ class RunContext:
         return self._run.disclosures
 
     @property
-    def kills_landed(self) -> int:
-        return self._run.kills_landed
-
-    @property
-    def baseline(self) -> Any:
+    def baseline(self) -> MeasuredWindow | None:
         """The undisturbed load (MeasuredWindow), once the baseline phase has measured it."""
         return self._run.baseline
 
@@ -84,7 +82,7 @@ class RunContext:
         assert self._run.workload is not None
         self._run.workload.begin_window()
 
-    def close_load_window(self) -> Any:
+    def close_load_window(self) -> MeasuredWindow:
         """End it: the MeasuredWindow (every commit counted, p99 over every latency)."""
         assert self._run.workload is not None
         return self._run.workload.end_window()
@@ -114,7 +112,7 @@ class RunContext:
         """T1: the moment recovery may begin (Arch §7.2)."""
         self._run.t1_ns = t1_ns
 
-    def events(self) -> list[Any]:
+    def events(self) -> list[Event]:
         """Every event recorded so far, the server's log lines included."""
         assert self._run.stream is not None
         return self._run.stream.events()
@@ -135,17 +133,23 @@ class RunContext:
         await self._run.injector.disarm()
 
     def aim_fault_at(self, target: dict[str, Any]) -> None:
-        """A single process the fault must hit instead of the whole service (FaultInjector.kill_target)."""
+        """A single process the fault must hit instead of the whole service (FaultInjector.aim_at)."""
         assert self._run.injector is not None
         self._run.injector.aim_at(target)
 
-    async def revert_fault(self) -> tuple[Any, dict[str, Any]]:
+    async def revert_fault(self) -> tuple[LedgerEntry, dict[str, Any]]:
         """Undo this run's injection now (its ledger entry stays outstanding until
         `mark_fault_reverted`). Returns (ledger entry, the driver's revert detail)."""
         run = self._run
         assert run.injector is not None
-        entry = next(e for e in run.ledger.outstanding() if e.injection_id == run.facts["injection_id"])
+        injection_id = run.facts.get("injection_id")
+        entry = next((e for e in run.ledger.outstanding() if e.injection_id == injection_id), None)
+        if entry is None:
+            # without its ledger entry the revert cannot be journalled, and the kill switch could
+            # not find the fault again: refuse rather than undo it unrecorded
+            raise RuntimeError(f"injection {injection_id!r} of this run is not outstanding in the ledger "
+                               f"({run.ledger.path}); it cannot be reverted and journalled")
         return entry, await run.injector.revert(run.node, entry.detail)
 
-    def mark_fault_reverted(self, entry: Any, revert: dict[str, Any]) -> None:
+    def mark_fault_reverted(self, entry: LedgerEntry, revert: dict[str, Any]) -> None:
         self._run.ledger.transition(entry, "reverted", revert=revert, by="orchestrator")

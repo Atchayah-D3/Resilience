@@ -5,9 +5,9 @@ Serves NL-C-* and, later, CL-F-02 and DX-M-*. Unlike a power cut this leaves the
 cache intact, so it exercises crash recovery and WAL replay -- NOT durability
 (Framework §13.1). The catalog keeps those scenarios apart.
 
-Recovery is expected to be unattended: the service unit's own Restart policy brings the
-database back. `revert` only makes sure the unit is not left stopped, and puts back any
-parameter a reload changed.
+After a kill, recovery is expected to be unattended: the service unit's own Restart policy
+brings the database back, so a kill refuses a unit without one. `revert` only makes sure the
+unit is not left stopped, and puts back any parameter a reload changed.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ import time
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
+from catalog.schema import Fault, Repeat
+from resilience_tests.adapters.base import BaseDatabaseAdapter
 from resilience_tests.adapters.postgresql.adapter import IDLE_SESSION_APPLICATION_NAME
 from resilience_tests.control.profile import EnvProfile, Node
 from resilience_tests.execution.injectors.base import DriverNotAvailable, FaultInjector, FaultNotLanded, register
@@ -159,6 +161,12 @@ class _ProcessFault:
     the rest to this class: extra preflight checks, the injection, its confirmation and its
     revert. The default revert makes sure the service is running."""
 
+    # Recovery from this fault relies on the unit's Restart policy (a kill); preflight then
+    # refuses a unit without one. The policy is recorded for every fault either way.
+    needs_restart_policy: ClassVar[bool] = False
+    # This fault can be aimed at a single process (FaultInjector.aim_at) instead of the service.
+    can_aim: ClassVar[bool] = False
+
     def __init__(self, driver: OsSshProcessDriver) -> None:
         self.driver = driver
 
@@ -187,6 +195,9 @@ class _ProcessFault:
 
 class _ProcessKill(_ProcessFault):
     """`process_kill` -- SIGKILL the postmaster: crash recovery, WAL replay (NL-C)."""
+
+    needs_restart_policy = True
+    can_aim = True
 
     def __init__(self, driver: OsSshProcessDriver) -> None:
         super().__init__(driver)
@@ -302,16 +313,17 @@ class _ProcessKill(_ProcessFault):
                 "t0_mono_ns": t0_mono_ns, "death_confirmed_s": confirmed_s, "pre_armed": pre_armed}
 
 
-class _UnnamedFault(_ProcessKill):
+class _UnnamedFault(_ProcessFault):
     """A driver built with no (or an unknown) fault type -- the kill switch's fallback for a
-    ledger entry that names none. It injects a kill and reverts by making sure the service is
-    running, but neither arms nor confirms: only a named `process_kill` does."""
+    ledger entry that names none. It only reverts, by making sure the service is running (the
+    default revert). It refuses to check for or apply a fault: a fallback must never inject."""
 
-    async def arm(self, node: Node) -> None:
-        return None
+    async def preflight(self, host: RemoteHost, node: Node, detail: dict[str, Any]) -> None:
+        raise DriverNotAvailable(f"the os_ssh process driver has no fault {self.driver.fault_type!r}")
 
-    async def confirm(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any] | None:
-        return None
+    async def inject(self, node: Node) -> dict[str, Any]:
+        raise DriverNotAvailable(f"the os_ssh process driver has no fault {self.driver.fault_type!r}; "
+                                 "nothing was applied")
 
 
 class _ServiceRestart(_ProcessFault):
@@ -506,7 +518,27 @@ class OsSshProcessDriver(FaultInjector):
 
     def __init__(self, profile: EnvProfile, fault_type: str) -> None:
         super().__init__(profile, fault_type)
+        # (cycles, interval_s) when the scenario repeats its fault, so preflight can check the
+        # target can actually take that cadence (Framework NL-C-05)
+        self.repeat_plan: tuple[int, float] | None = None
+        # the scenario's fault.duration in seconds, for a fault held and then released inside
+        # `inject` (the connection flood); None for a permanent fault
+        self.duration_s: float | None = None
+        # the single process the next kill must hit (see `aim_at`); None for the whole unit
+        self.kill_target: Mapping[str, Any] | None = None
         self._fault: _ProcessFault = self.FAULTS.get(fault_type, _UnnamedFault)(self)
+
+    def configure(self, fault: Fault, repeat: Repeat | None, adapter: BaseDatabaseAdapter | None) -> None:
+        super().configure(fault, repeat, adapter)
+        if fault.duration != "permanent":
+            self.duration_s = float(fault.duration)
+        if repeat is not None:
+            self.repeat_plan = (repeat.cycles, repeat.interval_s)
+
+    def aim_at(self, target: Mapping[str, Any] | None) -> None:
+        if target is not None and not self._fault.can_aim:
+            super().aim_at(target)   # refuses
+        self.kill_target = target
 
     async def preflight(self, node: Node) -> dict[str, Any]:
         detail: dict[str, Any] = {"service": node.service}
@@ -517,7 +549,7 @@ class OsSshProcessDriver(FaultInjector):
             restart = await unit_property(host, node, "Restart")
             if active != "active" or pid is None:
                 raise DriverNotAvailable(f"{node.name}: service {node.service} is {active!r}, postmaster pid {pid}")
-            if restart in ("", "no"):
+            if self._fault.needs_restart_policy and restart in ("", "no"):
                 raise DriverNotAvailable(
                     f"{node.name}: {node.service} has Restart={restart!r}; the scenario requires unattended recovery"
                 )
@@ -535,6 +567,7 @@ class OsSshProcessDriver(FaultInjector):
         refuses to start the unit at all. The run would then measure a service the harness
         itself disabled, and every later cycle would read as a catastrophic recovery time.
         Checked here, before the first kill, rather than discovered at cycle six."""
+        assert self.repeat_plan is not None
         cycles, interval = self.repeat_plan
         burst = await unit_property(host, node, "StartLimitBurst")
         window_us = await unit_property(host, node, "StartLimitIntervalUSec")

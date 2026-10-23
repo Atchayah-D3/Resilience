@@ -48,39 +48,28 @@ class FaultInjector(ABC):
         # opened is the same one the run observes and cleanup ends. Handed over with
         # `use_adapter` (by `configure`, or by the kill switch); None when none was.
         self.adapter: BaseDatabaseAdapter | None = None
-        # (cycles, interval_s) when the scenario repeats its fault, so preflight can check the
-        # target can actually take that cadence (Framework NL-C-05)
-        self.repeat_plan: tuple[int, float] | None = None
-        # the scenario's fault.duration in seconds, for faults that are held and then released
-        # (None for a permanent fault)
-        self.duration_s: float | None = None
-        # A single process the fault must hit instead of the whole service, found by the
-        # adapter: {"pid", "parent_pid", "title_marker"}. Generic -- the driver re-checks
-        # parent and title before acting. Set per attempt by the orchestrator, cleared after.
-        self.kill_target: Mapping[str, Any] | None = None
-        # data_corruption: what kind of relation the fault damages (catalog fault.relation_kind)
-        self.corruption_kind: str = "heap"
 
     def configure(self, fault: Fault, repeat: Repeat | None, adapter: BaseDatabaseAdapter | None) -> None:
         """Take what the driver needs from the scenario's fault section, in one place. The
         orchestrator calls this once, right after resolving the driver; the kill switch, which
-        has no scenario, calls only `use_adapter`."""
+        has no scenario, calls only `use_adapter`. A driver that needs more of the scenario
+        (a hold duration, a repeat plan, a relation kind) overrides this, calls it, and keeps
+        those values itself."""
         self.use_adapter(adapter)
-        if fault.duration != "permanent":
-            self.duration_s = float(fault.duration)
-        if repeat is not None:
-            self.repeat_plan = (repeat.cycles, repeat.interval_s)
-        if fault.relation_kind is not None:
-            self.corruption_kind = fault.relation_kind
 
     def use_adapter(self, adapter: BaseDatabaseAdapter | None) -> None:
         """The run's database adapter: faults inside the database act on its own sessions."""
         self.adapter = adapter
 
     def aim_at(self, target: Mapping[str, Any] | None) -> None:
-        """The single process the next injection must hit (see `kill_target`); None for the
-        whole service again."""
-        self.kill_target = target
+        """A single process the next injection must hit instead of the whole service
+        ({"pid", "parent_pid", "title_marker"}, found by the adapter); None for the whole
+        service again. Set per attempt by the orchestrator and cleared after it.
+
+        A driver that cannot aim refuses: injecting into the whole service when one process was
+        asked for would test something else."""
+        if target is not None:
+            raise DriverNotAvailable(f"{self.driver_name} cannot aim {self.fault_type!r} at a single process")
 
     async def confirm(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
         """After recovery: independent evidence that the fault took effect, beyond the

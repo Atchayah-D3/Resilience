@@ -14,15 +14,16 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
-from resilience_tests.analysis import report
 from resilience_tests.analysis.degradation import load_ratios
 from resilience_tests.control.faults.context import RunContext
 
 if TYPE_CHECKING:
     from resilience_tests.control.orchestrator import TestOrchestrator
+    from resilience_tests.execution.workload.driver import MeasuredWindow
 
 
 class PhaseAbort(RuntimeError):
@@ -50,6 +51,9 @@ class FaultBehaviour:
     # the service recovers on its own; the ledger entry stays outstanding until cleanup's
     # revert has confirmed the node is back in its pre-fault state
     recovers_unattended: ClassVar[bool] = False
+    # keys of the driver's injection detail kept in each cycle's row of a repeated scenario
+    # (facts["cycles"]), as that cycle's evidence of the fault
+    cycle_evidence_keys: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, ctx: RunContext) -> None:
         self.ctx = ctx
@@ -87,6 +91,12 @@ class FaultBehaviour:
     async def after_inject(self, detail: dict[str, Any]) -> None:
         """Right after the fault landed and T0 was recorded; `detail` is the driver's."""
 
+    async def hold_and_release(self) -> dict[str, Any] | None:
+        """Fault-inject phase, after the injection: a fault the harness holds for a set time and
+        then removes itself does both here and sets T1 at the removal (see HeldFault). Returns
+        the hold's detail, or None for a fault that is not held (the default)."""
+        return None
+
     async def begin_recovery(self) -> dict[str, Any]:
         """Set T1 (the moment recovery may begin) and return the recovery phase's detail."""
         ctx = self.ctx
@@ -101,9 +111,12 @@ class FaultBehaviour:
         ctx.emit("t1", t1_mono_ns=ctx.t1_ns, action="unattended recovery expected")
         return {"recovery": "unattended (no harness action)"}
 
-    def recovery_hold_s(self, available_bound_s: float) -> float | None:
-        """A fixed time to observe after the fault instead of waiting for the return to SLO,
-        or None to wait for the SLO. `available_bound_s` is what the recovery phase allows."""
+    def recovery_soak_s(self, available_bound_s: float) -> float | None:
+        """Recovery phase: a fixed time to keep observing the target after the fault instead of
+        waiting for the return to SLO, or None to wait for the SLO (the default). For a fault
+        whose recovery is the engine's own doing, such as a timeout ending a session (NL-M-05).
+        Not to be confused with a held fault, which the harness itself releases in the
+        fault-inject phase. `available_bound_s` is what the recovery phase allows."""
         return None
 
     def slo_clock_from_t1(self) -> bool:
@@ -148,26 +161,37 @@ class HeldFault(FaultBehaviour):
     degrades without crashing -> contention clears -> performance returns to baseline, with no
     recovery action by anyone).
 
-    The driver's `inject` applies the fault and returns at once (T0). Recovery holds it with
-    the workload running, measured in its own exact window, then reverts it through the driver
-    (T1 = released), and the phase watches the return to SLO from there. The hold is added to
-    the recovery phase's bound. Subclasses add snapshots in `on_hold_start` / `on_hold_end`.
+    The driver's `inject` applies the fault and returns at once (T0). Still in the fault-inject
+    phase, `hold_and_release` holds it with the workload running, measured in its own exact
+    window, then reverts it through the driver (T1 = released). The recovery phase then only
+    watches the return to SLO from T1, so each phase's duration in the report means what its
+    name says. The hold is added to the fault-inject phase's bound. Subclasses add snapshots in
+    `on_hold_start` / `on_hold_end`.
 
     Measures produced for every held fault: oltp_tps_ratio and oltp_p99_ratio (load during
     the hold over the baseline, analysis/degradation.py)."""
+
+    def __init__(self, ctx: RunContext) -> None:
+        super().__init__(ctx)
+        self._held: MeasuredWindow | None = None          # the load measured during the hold
+        self._released: dict[str, Any] | None = None      # the hold's detail, once released
 
     def _hold_s(self) -> float | None:
         duration = self.ctx.scenario.fault.duration
         return None if duration == "permanent" else float(duration)
 
     def phase_extension_s(self, phase: str) -> float:
-        return (self._hold_s() or 0.0) if phase == "recovery" else 0.0
+        return (self._hold_s() or 0.0) if phase == "fault_inject" else 0.0
 
     async def before_inject(self) -> None:
+        # refused before anything is applied
         if self._hold_s() is None:
-            # refused before anything is applied: a held fault with no end would never clear
+            # a held fault with no end would never clear
             raise PhaseAbort(f"{self.ctx.scenario.fault.type} is held and released by the harness, "
                              "so the scenario must set fault.duration (seconds)")
+        if self.ctx.scenario.repeat is not None:
+            raise PhaseAbort(f"{self.ctx.scenario.fault.type} is held and released by the harness; "
+                             "repeating a held fault is not built yet")
 
     async def on_hold_start(self) -> None:
         """The fault is applied and the hold window has opened."""
@@ -175,7 +199,7 @@ class HeldFault(FaultBehaviour):
     async def on_hold_end(self) -> None:
         """The hold is over; the fault is still applied (released right after this)."""
 
-    async def begin_recovery(self) -> dict[str, Any]:
+    async def hold_and_release(self) -> dict[str, Any]:
         ctx = self.ctx
         hold_s = self._hold_s()
         assert hold_s is not None   # before_inject refused otherwise
@@ -196,13 +220,21 @@ class HeldFault(FaultBehaviour):
         ctx.set_t1(time.monotonic_ns())
         ctx.mark_fault_reverted(entry, released)
         ctx.emit("t1", t1_mono_ns=ctx.t1_ns, action="fault released after hold")
-        return {"held_s": round((window["end_mono_ns"] - window["start_mono_ns"]) / 1e9, 3), "released": released}
+        self._released = {"held_s": round((window["end_mono_ns"] - window["start_mono_ns"]) / 1e9, 3),
+                          "released": released}
+        return self._released
+
+    async def begin_recovery(self) -> dict[str, Any]:
+        """Released in the fault-inject phase (T1); recovery only watches from there."""
+        if self._released is None:
+            raise RuntimeError(f"{self.ctx.scenario.fault.type} reached recovery without being held and released")
+        return dict(self._released)
 
     def slo_clock_from_t1(self) -> bool:
         return True
 
     async def measure(self, events: list[Any]) -> dict[str, Any]:
-        ratios, why = load_ratios(getattr(self, "_held", None), self.ctx.baseline)
+        ratios, why = load_ratios(self._held, self.ctx.baseline)
         self.ctx.not_measured.update(why)
         return ratios
 
@@ -231,10 +263,14 @@ class DuringBehaviour:
     def check_settings(self, observed: dict[str, Any]) -> None:
         """Init: refuse or disclose on the deployment settings observed for this fault."""
 
-    async def establish(self) -> tuple[dict[str, Any], Any]:
-        """Bring the target into the state the fault must land inside. Returns (checkpoint
-        evidence, running index build) -- either empty."""
-        return {}, None
+    async def establish(self) -> dict[str, Any]:
+        """Bring the target into the state the fault must land inside, just before each
+        injection attempt. Returns evidence of that state to record with the injection's own
+        detail (e.g. {"checkpoint": ...}), or {} for none."""
+        return {}
+
+    async def after_inject(self, detail: dict[str, Any]) -> None:
+        """Right after each injection that landed; `detail` is the driver's."""
 
     async def verify(self, events: list[Any]) -> tuple[dict[str, Any], str | None]:
         """Validate: (measures, reason the fault did not land inside the operation or None)."""
@@ -264,11 +300,6 @@ def _register(registry: dict[str, Any], kind: str, name: str, cls: type) -> None
         raise ValueError(f"{kind} {name!r} is registered twice: {existing.__module__}.{existing.__qualname__} "
                          f"and {cls.__module__}.{cls.__qualname__}")
     registry[name] = cls
-    # its own report section, if it has one (registered once, however often it is registered)
-    section = cls.summary_lines.__func__
-    defaults = (FaultBehaviour.summary_lines.__func__, DuringBehaviour.summary_lines.__func__)
-    if section not in defaults and all(s.__func__ is not section for s in report.SECTIONS):
-        report.SECTIONS.append(cls.summary_lines)
 
 
 def register_fault(cls: type[FaultBehaviour]) -> type[FaultBehaviour]:
@@ -281,8 +312,16 @@ def register_during(cls: type[DuringBehaviour]) -> type[DuringBehaviour]:
     return cls
 
 
+def has_fault_behaviour(fault_type: str) -> bool:
+    """Whether a behaviour is registered for this fault type. A scenario whose fault type has
+    none is not built: the run plan skips it and init refuses it (control/matrix.py)."""
+    return fault_type in _FAULTS
+
+
 def fault_behaviour(run: TestOrchestrator) -> FaultBehaviour:
-    """The behaviour for the run's fault type; the defaults when none is registered."""
+    """The behaviour for the run's fault type. When none is registered, the defaults -- so the
+    run can still be built and its init phase refuse it, with the reason, before anything is
+    applied (see has_fault_behaviour)."""
     return _FAULTS.get(run.scenario.fault.type, FaultBehaviour)(RunContext(run))
 
 
@@ -297,3 +336,17 @@ def during_behaviour(run: TestOrchestrator) -> DuringBehaviour | None:
         raise NotImplementedError(f"no behaviour is registered for fault.during {during!r} "
                                   f"(registered: {', '.join(sorted(_DURING))})")
     return cls(RunContext(run))
+
+
+def summary_sections() -> list[Callable[[dict[str, Any]], list[str]]]:
+    """The summary.txt sections that belong to one fault or `during` operation: each registered
+    class's own `summary_lines`, the faults' first. Asked for when a report is written, so the
+    report names no fault and does not depend on which modules happen to be imported. Every
+    section returns no lines for a run it does not concern."""
+    defaults = (FaultBehaviour.summary_lines.__func__, DuringBehaviour.summary_lines.__func__)
+    sections: list[Callable[[dict[str, Any]], list[str]]] = []
+    for cls in [*_FAULTS.values(), *_DURING.values()]:
+        section = cls.summary_lines.__func__
+        if section not in defaults and all(s.__func__ is not section for s in sections):
+            sections.append(cls.summary_lines)
+    return sections

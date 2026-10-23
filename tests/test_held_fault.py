@@ -9,6 +9,8 @@ behaviour registered for a fault type no scenario implements yet.
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +20,7 @@ from resilience_tests.analysis.degradation import P99_RATIO, TPS_RATIO, load_rat
 from resilience_tests.analysis.predicates import NOT_MEASURED
 from resilience_tests.control.faults import base as faults_base
 from resilience_tests.control.faults.base import HeldFault
+from resilience_tests.control.killswitch import ledger_for
 from resilience_tests.control.matrix import RunPlanItem
 from resilience_tests.control.orchestrator import RunOptions, TestOrchestrator
 from resilience_tests.control.profile import load_profile
@@ -125,14 +128,44 @@ def test_a_held_fault_is_held_measured_released_and_judged(env, held):
     assert "alerting.source: none" in results["facts"]["not_measured"]["degradation_alerted"]
 
 
-def test_a_hold_longer_than_the_recovery_bound_is_not_cut_off(env, held):
-    """Was: every phase was capped at the profile bound, so a 300 s hold under a 120 s
-    recovery bound timed out. The hold is added to the bound of the phase it is held in."""
-    short = env.model_copy(update={"phase_timeouts_s": dict(env.phase_timeouts_s, recovery=1.0)})
+def test_a_hold_longer_than_the_fault_inject_bound_is_not_cut_off(env, held):
+    """Was: every phase was capped at the profile bound, so a 300 s hold under a 120 s bound
+    timed out. The hold is added to the bound of the phase it is held in: fault_inject."""
+    short = env.model_copy(update={"phase_timeouts_s": dict(env.phase_timeouts_s, fault_inject=1.0)})
     results = run_held(short, held_scenario(duration=2.0))
-    recovery = next(p for p in results["phases"] if p["phase"] == "recovery")
-    assert recovery["outcome"] == "ok", why(results)
+    inject = next(p for p in results["phases"] if p["phase"] == "fault_inject")
+    assert inject["outcome"] == "ok", why(results)
     assert results["status"] == "passed", why(results)
+
+
+def test_the_hold_is_part_of_the_fault_inject_phase_not_of_recovery(env, held):
+    """Was: the fault was held inside the recovery phase, so the report's recovery time
+    included the hold. Held and released in fault_inject, recovery measures only what follows
+    the release (T1)."""
+    results = run_held(env, held_scenario(duration=2.0))
+    assert results["status"] == "passed", why(results)
+    phases = {p["phase"]: p for p in results["phases"]}
+    assert phases["fault_inject"]["duration_s"] >= 2.0
+    assert phases["fault_inject"]["detail"]["hold"]["released"] == {"action": "revert"}
+    assert phases["recovery"]["detail"]["held_s"] >= 2.0          # reported, not spent again
+    # the hold opens and the release (T1) happens inside fault_inject, before recovery starts
+    events = [json.loads(line) for line in (Path(results["evidence_dir"]) / "events.jsonl").read_text().splitlines()]
+    order = [e["kind"] if e["kind"] not in ("phase_start", "phase_end") else f"{e['kind']}:{e['data']['phase']}"
+             for e in events if e["kind"] in ("phase_start", "phase_end", "hold_start", "hold_end", "t1")]
+    i = order.index
+    assert (i("phase_start:fault_inject") < i("hold_start") < i("hold_end") < i("t1")
+            < i("phase_end:fault_inject") < i("phase_start:recovery"))
+    ledger = [e for e in ledger_for(env).entries() if e.fault_type == "resource_limit"]
+    assert ledger and ledger[-1].state == "reverted"              # released by the hold itself
+
+
+def test_a_repeated_held_fault_is_refused_before_anything_is_applied(env, held):
+    sc = held_scenario()
+    sc = sc.model_copy(update={"repeat": CATALOG.scenarios["NL-C-05"].repeat})
+    results = run_held(env, sc)
+    assert results["status"] == "aborted"
+    assert "repeating a held fault is not built yet" in results["error"]
+    assert "after_inject" not in StandInHold.calls and FakeFault.reverts == []
 
 
 def test_a_held_fault_without_a_duration_is_refused_before_anything_is_applied(env, held):

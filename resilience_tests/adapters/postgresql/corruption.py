@@ -8,9 +8,17 @@ import re
 import struct
 import time
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
+
+from resilience_tests.adapters.base import CorruptionSupport
+
+if TYPE_CHECKING:
+    # what this mixin uses from the adapter's core class (host.py)
+    from resilience_tests.adapters.postgresql.host import PostgreSQLCore
+else:
+    PostgreSQLCore = object
 
 
 # NL-I (fault type data_corruption): the harness-owned relation the fault corrupts. Its own
@@ -79,9 +87,12 @@ def _plan_nodes(plan: Any) -> list[dict[str, Any]]:
     return nodes
 
 
-class CorruptionMixin:
-    """Corruption-target methods of PostgreSQLAdapter. Mixed into the class in
-    adapter.py; uses the core's `_connect` and `_psql_as_os_user`."""
+class CorruptionMixin(CorruptionSupport, PostgreSQLCore):
+    """Corruption-target methods of PostgreSQLAdapter. Mixed into the class in adapter.py; uses
+    the core's `_connect` (host.py). `amcheck_relation` stays in the core beside
+    `integrity_check`: both run pg_amcheck and share its output parsing."""
+
+    corruption_sqlstates = ("XX001",)  # data_corrupted
 
     async def prepare_corruption_target(self, kind: str = "heap") -> dict[str, Any]:
         """Recreate the corruption target and locate a populated page in its data file."""

@@ -12,6 +12,7 @@ from catalog.schema import Catalog, Scenario
 from resilience_tests.adapters import postgresql  # noqa: F401  (registers the adapter)
 from resilience_tests.adapters.base import capabilities_of
 from resilience_tests.adapters.target_resolver import ResolutionError, TargetResolver
+from resilience_tests.control.faults import has_fault_behaviour
 from resilience_tests.control.profile import EnvProfile, Node
 
 
@@ -39,15 +40,22 @@ def missing_infra(scenario: Scenario, profile: EnvProfile) -> list[str]:
 
 
 def not_built_reason(scenario: Scenario) -> str | None:
-    """Why the harness cannot run this scenario to specification yet, or None.
+    """Why the harness cannot run this scenario to specification yet, or None. Checked by the
+    run plan (skipped, with the reason) and again in init, before anything is applied.
 
-    A compound scenario (CL-X) declares a second fault, `compound.fault_b`, that nothing injects
-    yet: run anyway, it would apply fault A alone and could pass without being tested. Refused
-    until compound injection is built with the Tier-2 work (README: "Design note: tests on
-    several machines")."""
+    - A compound scenario (CL-X) declares a second fault, `compound.fault_b`, that nothing
+      injects yet: run anyway, it would apply fault A alone and could pass without being tested.
+      Refused until compound injection is built with the Tier-2 work (README: "Design note:
+      tests on several machines").
+    - A fault type with no behaviour in control/faults: the harness does not know how its
+      recovery begins or what it must measure, so the fault would be applied and then left
+      unjudged."""
     if scenario.compound is not None:
         return ("compound faults are not built yet: compound.fault_b would never be injected, "
                 "so the scenario cannot be run to specification")
+    if not has_fault_behaviour(scenario.fault.type):
+        return (f"fault type {scenario.fault.type!r} is not built yet: no behaviour for it is registered "
+                "in control/faults, so its recovery and measures are not defined")
     return None
 
 

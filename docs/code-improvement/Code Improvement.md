@@ -150,6 +150,27 @@ fault is applied, so the fault cannot be left in place indefinitely.
 | Unreadable idle-session state (NL-M-05) | A failed read was treated as "session not ended", which is a guess. | Reported as "not measured", with the reason. |
 | Load rate | A test definition without `rate_tps` ran as fast as the machine allowed. | The catalog checks refuse it (Framework §7.5). The workload profiles are described in README §7. |
 
+### Second review: fixes
+
+| # | Change | Before | After |
+|---|---|---|---|
+| 1 | A fault type with no fault class | The fault was applied, and the test refused only in the recovery phase, with the fault already in place. | Refused in init, before anything is applied, with the reason; the run plan skips it too. A test checks that every fault type a driver serves has a fault class. |
+| 2 | The process driver's fallback for an unknown fault | It inherited the process kill: anything reaching it with an empty fault type killed the database. | It never injects; it only reverts, by making sure the service runs (what the kill switch needs). |
+| 3 | Database interface defaults | Some returned invented answers, for example "checkpointer not active" or "session not ended by the timeout". | Every default either refuses or says it cannot tell. For example, "configuration deviations: cannot tell" is disclosed, never shown as "none". |
+| 4 | Driver settings | The driver base class held the kill target, the corruption kind, the repeat plan and the hold duration for every driver. | Each driver keeps its own. A driver that cannot aim at one process refuses to be aimed. |
+| 5 | Fault details in the orchestrator | The orchestrator read the targeted kill's `landed`, set the corruption exclusions on the adapter, kept the checkpoint evidence and listed the kill's per-cycle keys. | Each moved to the fault or `during` class that produces it. The per-cycle calculation moved to `analysis/cycles.py`. |
+| 6 | Database interface size and hidden dependencies | One class with 49 methods. The PostgreSQL mixins used core methods without declaring them. | Grouped into the core plus one interface per kind of fault. Each PostgreSQL file implements one group, and `host.py` declares what the files use from the core. A test fails if a file uses anything undeclared. |
+| 7 | Report sections | Registering a fault class added to a shared list in the report module, so the report's content depended on import order. | The report is handed the sections when it is written. |
+| 8 | Two kinds of "hold" | A held fault was held inside the recovery phase, so the recovery time in the report included the hold. NL-M-05's fixed observation time was also called a hold. | A held fault is held and released in the fault_inject phase; recovery measures only what follows. NL-M-05's observation is renamed `recovery_soak_s`. No current test uses a held fault, so no result changes. |
+| 9 | Run state | Created on first use, read with `getattr` defaults (in the orchestrator, the adapter files and two other classes). | Declared with its starting value. A test fails if the pattern comes back. |
+| 10 | Revert with no ledger entry | An obscure `StopIteration`. | A clear error naming the injection. |
+| 11 | Recovery phase description | Said "T1 = power restored" for every fault. | Describes each case. |
+| 13 | Restart policy | Required for every process fault. | Required only for the kill, whose recovery relies on it; recorded for all. |
+| — | A timing-sensitive automated test | On a busy machine, the simulated database sometimes did not hold normal speed long enough during its 4-second baseline, and the test failed (2 of 6 runs under load, with the old and the new code alike). | The test gives the simulated database an 8-second baseline and more time to recover: 10 of 10 runs passed under the same load. What it checks is unchanged. |
+
+Items 12 (held faults have no real test yet) and 14 (one machine per test) need NL-N-07 and the
+Tier 2 work; they are in section 3.
+
 ### Steps to add a new fault
 
 | Step | What to add |
@@ -199,6 +220,6 @@ The orchestrator, the safety components and the reporting are not modified.
 |---|---|
 | Tests using more than one machine | Noisy-neighbour tests need a second VM to generate load; cluster tests need a standby server. A test can currently target only one machine. Design: README §13. |
 | Two faults in one test | Some cluster tests apply two faults together. The test definition supports this; the orchestrator refuses such a test until it is built. Design: README §13. |
-| Smaller database interface | The database adapter's base class has 49 methods, which a second database type would have to implement. Splitting them into groups would make that easier. |
-| Simplify the orchestrator's validate phase | About 80 lines of result calculations can move to the analysis module. |
+| PostgreSQL commands in the OS/SSH drivers | The drivers run `psql`, `pg_ctl`, `pg_checksums` and `pg_controldata` and read `postmaster.pid` themselves, so they assume a PostgreSQL-family engine. Correct for ShaktiDB and, as far as is known, for DistDB. For a different engine, move these commands behind adapter methods. |
+| Capability-based skipping for fault support | An engine that lacks a fault-support method now refuses when the test runs. Declaring it as a capability would skip the test in the run plan instead, with the reason. Worth doing with the second engine. |
 | One unreliable test | One existing test fails about once in six runs on a heavily loaded machine. |

@@ -9,11 +9,18 @@ import re
 import shlex
 import time
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
 
+from resilience_tests.adapters.base import OperationSupport
 from resilience_tests.execution.remote import RemoteHost, as_user
+
+if TYPE_CHECKING:
+    # what this mixin uses from the adapter's core class (host.py)
+    from resilience_tests.adapters.postgresql.host import PostgreSQLCore
+else:
+    PostgreSQLCore = object
 
 # NL-C-03 (Framework §10.2): "kill -9 during a 10M-row INSERT". The kill is sent once the
 # child table has demonstrably grown by BULK_IN_FLIGHT_BYTES inside the open transaction --
@@ -66,6 +73,11 @@ SELECT i.indisvalid, i.indisready
 # churn table ends in milliseconds -- faster than the kill can arrive. These storage options
 # are the harness table's own (a harness object, disclosed), never global configuration:
 # threshold 1,000 dead rows with no scale factor, and a cost delay that paces the vacuum.
+# read, never written: the settings that decide whether and when autovacuum workers run
+AVAC_SETTINGS = ("autovacuum", "track_counts", "autovacuum_naptime", "autovacuum_max_workers",
+                 "autovacuum_vacuum_cost_delay", "autovacuum_vacuum_cost_limit",
+                 "autovacuum_vacuum_threshold", "autovacuum_vacuum_scale_factor",
+                 "restart_after_crash", "update_process_title")
 AVAC_TABLE = "resilience.avac_target"
 AVAC_ROWS = 1_000_000
 AVAC_DDL = f"CREATE TABLE IF NOT EXISTS {AVAC_TABLE} (id bigint PRIMARY KEY, v int NOT NULL DEFAULT 0)"
@@ -124,9 +136,56 @@ def _format_lsn(lsn: int | None) -> str | None:
     return None if lsn is None else f"{int(lsn) >> 32:X}/{int(lsn) & 0xFFFFFFFF:X}"
 
 
-class OperationsMixin:
-    """fault.during methods of PostgreSQLAdapter. Mixed into the class in
-    adapter.py; uses the core's `_connect` and `_psql_as_os_user`."""
+class OperationsMixin(OperationSupport, PostgreSQLCore):
+    """fault.during methods of PostgreSQLAdapter. Mixed into the class in adapter.py; uses the
+    core's `node` and `_connect` (host.py)."""
+
+    # Both idle states of the checkpointer process. The poll loop must wait until the
+    # checkpointer leaves ALL of these before declaring it "active". CheckpointerMain is the
+    # main-loop sleep when no checkpoint is pending; CheckpointDelay is the inter-checkpoint
+    # sleep. Either one means the checkpointer is NOT flushing dirty buffers.
+    _CHECKPOINTER_IDLE_EVENTS = frozenset({"CheckpointerMain", "CheckpointDelay"})
+
+    # Wait events that positively confirm the checkpointer is doing checkpoint I/O.
+    # We require one of these rather than merely "not idle", so a transient NULL or an
+    # unrecognised future event does not produce a false positive.
+    _CHECKPOINTER_ACTIVE_EVENTS = frozenset({
+        "CheckpointWriteDelay",   # Timeout: throttling between buffer writes
+        "CheckpointSync",         # IO: syncing relation files to storage (older PG)
+        "DataFileSync",           # IO: syncing relation files to storage (PG 10+)
+        "DataFileWrite",          # IO: writing data pages
+        "WalSync",                # IO: flushing WAL during checkpoint
+        "WALSync",                # IO: capitalization variation
+        "SlruWrite",              # IO: writing SLRU pages
+        "SlruSync",               # IO: syncing SLRU pages
+        "SLRUSync",               # IO: capitalization variation
+        "ControlFileWrite",       # IO: writing control file
+        "ControlFileSync",        # IO: syncing control file
+        "ControlFileSyncUpdate",  # IO: updating control file
+        "BufFileWrite",           # IO: writing temp buffers (rare during checkpoint)
+    })
+    _CHECKPOINTER_ACTIVE_TYPES = frozenset({"IO", "Timeout"})
+
+    # the operation in progress (none until one is started)
+    _bg_task: asyncio.Task[None] | None = None
+    _bg_conn: asyncpg.Connection | None = None
+    _bg_pid: int | None = None
+    _avac_round = 0
+    _checkpoint_baseline: dict[str, Any] | None = None
+    _checkpoint_conn: asyncpg.Connection | None = None
+    _checkpoint_task: asyncio.Task[str] | None = None
+    _checkpointer_pid: int | None = None
+
+    async def observe_autovacuum_settings(self) -> dict[str, str]:
+        """Read only -- nothing is written (NL-M-03)."""
+        conn = await self._connect(timeout_s=10.0)
+        try:
+            rows = await conn.fetch("SELECT name, setting || coalesce(unit, '') AS v FROM pg_settings "
+                                    "WHERE name = ANY($1::text[])", list(AVAC_SETTINGS))
+            return {r["name"]: r["v"] for r in rows}
+        finally:
+            await conn.close()
+
 
     # Objects a `during` operation needs, created in init -- before the baseline, so seeding
     # them never disturbs the steady state being measured. Each `during` behaviour asks for its own.
@@ -173,7 +232,7 @@ class OperationsMixin:
     async def _make_dead_tuples(self, conn: asyncpg.Connection) -> int:
         """Dead tuples on the harness table, created AFTER the latest recovery: crash recovery
         discards the statistics autovacuum uses to choose tables, so earlier ones are unseen."""
-        self._avac_round = (getattr(self, "_avac_round", 0) + 1) % 4
+        self._avac_round = (self._avac_round + 1) % 4
         status = await conn.execute(AVAC_MAKE_DEAD, self._avac_round)
         return int(status.split()[-1]) if status.split()[-1].isdigit() else 0
 
@@ -304,7 +363,7 @@ class OperationsMixin:
 
     def _bg_finished(self) -> str | None:
         """None while the background operation runs; otherwise how it ended."""
-        task = getattr(self, "_bg_task", None)
+        task = self._bg_task
         if task is None or not task.done():
             return None
         if task.cancelled():
@@ -408,9 +467,9 @@ class OperationsMixin:
 
     async def abandon_background_operation(self) -> dict[str, Any]:
         detail: dict[str, Any] = {}
-        task = getattr(self, "_bg_task", None)
-        conn = getattr(self, "_bg_conn", None)
-        pid = getattr(self, "_bg_pid", None)
+        task = self._bg_task
+        conn = self._bg_conn
+        pid = self._bg_pid
         if task is not None:
             detail["ended"] = self._bg_finished() or "still running"
             if not task.done():
@@ -709,15 +768,15 @@ class OperationsMixin:
 
         pg_control after recovery cannot answer this: recovery writes its own end-of-recovery
         checkpoint, which is always newer than the pre-kill one whether or not ours finished."""
-        if hasattr(self, "_checkpoint_task"):
+        if self._checkpoint_task is not None:
             self._checkpoint_task.cancel()
-        if hasattr(self, "_checkpoint_conn"):
+        if self._checkpoint_conn is not None:
             try:
                 await self._checkpoint_conn.close()
             except Exception:  # noqa: BLE001 -- the server it talked to was killed
                 pass
 
-        prior = (getattr(self, "_checkpoint_baseline", None) or {}).get("redo_lsn")
+        prior = (self._checkpoint_baseline or {}).get("redo_lsn")
         redo_start = recovery_redo_start_lsn(log_lines)
         detail: dict[str, Any] = {"prior_redo_lsn": _format_lsn(prior), "recovery_redo_start_lsn": _format_lsn(redo_start)}
         if prior is None:

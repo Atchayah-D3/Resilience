@@ -48,7 +48,7 @@ class IdleTransaction(FaultBehaviour):
             ]
         return lines
 
-    def recovery_hold_s(self, available_bound_s: float) -> float | None:
+    def recovery_soak_s(self, available_bound_s: float) -> float | None:
         """Hold the session open for the configured timeout plus a grace when that fits the
         recovery bound; the return to SLO is polled only as telemetry, never as the exit."""
         ctx = self.ctx
