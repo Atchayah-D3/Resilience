@@ -278,7 +278,7 @@ class WorkloadDriver:
                         await asyncio.sleep(RECONNECT_PAUSE_S)
                         continue
                     if ever_connected:
-                        self._count(reconnects=1)
+                        self._count(reconnects=1) 
                     else:
                         self.connected_workers += 1
                     ever_connected = True
