@@ -251,3 +251,25 @@ def test_decision_names_waiting_otherwise():
 def test_no_decision_when_no_step_passed_its_checks():
     d = _decision([_step(ok=False)], 5_000, 8)
     assert d["tps_per_process"] is None and d["cores_needed"] is None
+
+
+# --- the output folder is checked before any database work ---------------------------------
+
+def test_output_folder_that_cannot_be_written_is_refused_at_once(tmp_path):
+    import argparse
+    from types import SimpleNamespace
+    from tools.tpcc_speedtest.__main__ import _make_out_dir
+
+    blocked = tmp_path / "blocked"
+    blocked.mkdir(mode=0o500)                 # not writable
+    a = argparse.Namespace(out=str(blocked / "x" / "y"))
+    with pytest.raises(SystemExit, match="cannot create output folder"):
+        _make_out_dir(a, SimpleNamespace(), "stamp")
+
+    existing = tmp_path / "exists"
+    existing.mkdir()
+    with pytest.raises(SystemExit, match="already exists"):
+        _make_out_dir(argparse.Namespace(out=str(existing)), SimpleNamespace(), "stamp")
+
+    made = _make_out_dir(argparse.Namespace(out=str(tmp_path / "new")), SimpleNamespace(), "stamp")
+    assert made.is_dir()

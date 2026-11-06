@@ -47,6 +47,8 @@ load, or must the engine be written in Go?**
 
 - `--target-max-tps`: the maximum TPS of the biggest target we plan to test (from the lead).
   Without it, the report shows the formula instead of the number of cores.
+- `--out`: the output folder. Needed when you are not the user whose `run_dir` the environment file
+  names, e.g. `--out ~/resilience-runs/speedtest-1`.
 - `--clerks`, `--duration`, `--warmup`, `--warehouses`: see `--help`.
 - Safety, as in the harness: the target's hostname (read over SSH) must match the environment's
   allowlist, and the sentinel table must have a row for it. Otherwise the test refuses to start.
@@ -54,7 +56,8 @@ load, or must the engine be written in Go?**
 
 ## How to read the result
 
-The result is in `~/resilience-runs/speedtest-<time>/summary.md` (all numbers in `results.json`;
+The result is in `<driver_host.run_dir>/speedtest-<time>/summary.md` (or the folder given with `--out`; the
+folder is created before any database work, so a folder you cannot write is refused at once) (all numbers in `results.json`;
 the journals of each step in `processes-<n>/`).
 
 | Column | Meaning |

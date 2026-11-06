@@ -196,9 +196,26 @@ def _decision(steps: list[dict[str, Any]], target_max_tps: float | None, harness
 
 # --- commands ----------------------------------------------------------------------------
 
+def _make_out_dir(a: argparse.Namespace, profile: EnvProfile, stamp: str) -> Path:
+    """Creates the output folder before any database work, so a folder that cannot be written
+    fails at once, not after the data is loaded."""
+    out = Path(a.out).expanduser() if a.out else Path(profile.driver_host.run_dir) / f"speedtest-{stamp}"
+    try:
+        out.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        raise SystemExit(f"refused: output folder {out} already exists; choose another with --out") from None
+    except OSError as exc:
+        raise SystemExit(f"refused: cannot create output folder {out} ({exc.strerror}); "
+                         f"choose a folder you can write with --out, e.g. --out ~/resilience-runs/speedtest-{stamp}"
+                         ) from None
+    return out
+
+
 async def _main(a: argparse.Namespace) -> int:
     profile = load_profile(a.env)
     node = profile.node(a.node) if a.node else profile.nodes[0]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = _make_out_dir(a, profile, stamp) if a.command in ("all", "run") else None
     async with RemoteHost(node.ssh) as host:
         dsn = await _check_safety(profile, a.node, host)
         conn = await asyncpg.connect(**dsn, timeout=5,
@@ -216,7 +233,8 @@ async def _main(a: argparse.Namespace) -> int:
                 secs = await runner.setup(conn, a.warehouses, a.items)
                 print(f"loaded {a.warehouses} warehouses, {a.items} items in {secs:.0f} s")
             try:
-                return await _run(a, profile, dsn, conn, host)
+                assert out is not None
+                return await _run(a, profile, dsn, conn, host, out, stamp)
             finally:
                 if a.command == "all":
                     gone = await runner.teardown(conn)
@@ -226,12 +244,9 @@ async def _main(a: argparse.Namespace) -> int:
 
 
 async def _run(a: argparse.Namespace, profile: EnvProfile, dsn: dict[str, Any], conn: asyncpg.Connection,
-               host: RemoteHost) -> int:
+               host: RemoteHost, out: Path, stamp: str) -> int:
     processes = [int(p) for p in a.processes.split(",")]
     harness_cores = os.cpu_count() or 1
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    out = Path(a.out) if a.out else Path(profile.driver_host.run_dir) / f"speedtest-{stamp}"
-    out.mkdir(parents=True, exist_ok=False)
     warehouses, items = await runner.read_meta(conn)
     meta = {"started": stamp, "env": profile.name, "harness_cores": harness_cores, "warehouses": warehouses,
             "items": items, "clerks": a.clerks, "warmup_s": a.warmup, "duration_s": a.duration,
