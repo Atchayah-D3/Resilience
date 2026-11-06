@@ -120,8 +120,9 @@ def _summary_md(meta: dict[str, Any], steps: list[dict[str, Any]], decision: dic
         "## Speed",
         "",
         "| Processes | Clerks | TPS total | TPS per process | Call p50 / p99 (ms) | Journal p99 (ms) "
-        "| Python CPU (lowest process) | Python is the limit | Target CPU busy / iowait | Checks |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| Python CPU (lowest process) | Python CPU per transaction (ms) | Python is the limit "
+        "| Target CPU busy / iowait | Checks |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for s in steps:
         busy = s["target_cpu_busy"]
@@ -129,7 +130,8 @@ def _summary_md(meta: dict[str, Any], steps: list[dict[str, Any]], decision: dic
         lines.append(
             f"| {s['processes']} | {s['clerks_total']} | {s['tps_total']:.0f} | {s['tps_per_process_avg']:.0f} "
             f"| {_fmt(s['call_p50_ms'])} / {_fmt(s['call_p99_ms'])} | {_fmt(s['journal_p99_ms'])} "
-            f"| {min(s['python_cpu_share']):.0%} | {'yes' if s['python_limited'] else 'no'} "
+            f"| {min(s['python_cpu_share']):.0%} | {_fmt(s.get('python_cpu_ms_per_txn'), '.2f')} "
+            f"| {'yes' if s['python_limited'] else 'no'} "
             f"| {target} | {'pass' if s['checks_ok'] else '**FAIL**'} |")
     lines += ["", "## Checks (is the measurement true?)", ""]
     for s in steps:
@@ -147,22 +149,37 @@ def _summary_md(meta: dict[str, Any], steps: list[dict[str, Any]], decision: dic
 
 
 TARGET_BUSY_CPU_SHARE = 0.85
+TARGET_DISK_WAIT_SHARE = 0.10   # target iowait from which its disk counts as a reason to wait
+LONG_TAIL_FACTOR = 10           # call p99 this many times p50: some calls waited very long
 
 
 def _what_limited(step: dict[str, Any]) -> str:
-    """Names the likely limit of a step in which Python was not busy."""
-    busy = step["target_cpu_busy"]
+    """Names the likely limit of a step in which Python was not busy.
+
+    A clerk spends each transaction writing two journal lines (marker and committed) and
+    waiting for one database call, one after the other. Average times are compared, because
+    the average is what decides how many transactions one clerk completes per second."""
     where = f"In the {step['processes']}-process step"
+    busy, iowait = step["target_cpu_busy"], step["target_cpu_iowait"]
     if busy is not None and busy >= TARGET_BUSY_CPU_SHARE:
-        return f"{where} the target's CPU was {busy:.0%} busy: the database was the limit."
-    journal, call = step["journal_p99_ms"], step["call_p50_ms"]
-    if journal is not None and call is not None and journal > call:
-        return (f"{where} the journal flush on the harness disk (p99 {journal:.1f} ms) took longer than "
-                f"a database call (p50 {call:.1f} ms): the harness disk was the limit. Run the test with "
-                f"more clerks per process, or put the journals on a faster disk.")
-    busy_text = "unknown" if busy is None else f"{busy:.0%}"
-    return (f"{where} neither Python nor the target's CPU (busy: {busy_text}) was the limit: the clerks "
-            f"were waiting on the network or on locks. Run the test with more clerks per process.")
+        return f"{where} the target's CPU was {busy:.0%} busy: the database's CPU was the limit."
+    call_mean, journal_mean = step.get("call_mean_ms"), step.get("journal_mean_ms")
+    if call_mean is not None and journal_mean is not None and 2 * journal_mean > call_mean:
+        return (f"{where} a clerk spent longer writing its two journal lines (about {2 * journal_mean:.1f} ms) "
+                f"than waiting for the database call (average {call_mean:.1f} ms): the harness disk was the "
+                f"limit. Put the journals on a faster disk.")
+    p50, p99 = step["call_p50_ms"], step["call_p99_ms"]
+    long_tail = p50 is not None and p99 is not None and p99 > LONG_TAIL_FACTOR * p50
+    disk_wait = iowait is not None and iowait >= TARGET_DISK_WAIT_SHARE
+    if long_tail or disk_wait:
+        tail = f"the slowest 1% of calls took {p99:.0f} ms against a typical {p50:.1f} ms" if long_tail else ""
+        disk = f"the target waited for its disk {iowait:.0%} of the time" if disk_wait else ""
+        both = " and ".join(t for t in (tail, disk) if t)
+        return (f"{where} neither Python nor the target's CPU was busy; the clerks mostly waited for the database "
+                f"to commit: {both}. The target's disk (its commit flushes) was the limit. More clerks, or a "
+                f"target with a faster disk, give more TPS.")
+    return (f"{where} neither Python nor the target was busy: the clerks were waiting on the network or on "
+            f"locks. Run the test with more clerks per process.")
 
 
 def _decision(steps: list[dict[str, Any]], target_max_tps: float | None, harness_cores: int) -> dict[str, Any]:
@@ -170,26 +187,43 @@ def _decision(steps: list[dict[str, Any]], target_max_tps: float | None, harness
                  for s in steps]
     rate = tps_per_process(summaries)
     text: list[str] = []
-    out: dict[str, Any] = {"tps_per_process": None, "exact": None, "cores_needed": None, "text": text}
+    out: dict[str, Any] = {"tps_per_process": None, "exact": None, "cores_needed": None,
+                           "estimated_tps_per_core": None, "estimated_cores_needed": None, "text": text}
     if rate is None:
         text.append("No step passed its checks: no decision can be taken from this run.")
         return out
     out["tps_per_process"], out["exact"] = rate.tps, rate.exact
+    need = target_max_tps * HEADROOM if target_max_tps else None
     if rate.exact:
         text.append(f"One Python process drives about {rate.tps:.0f} TPS while Python is the limit.")
+        if need:
+            cores = cores_needed(target_max_tps, rate.tps)
+            out["cores_needed"] = cores
+            text.append(f"Target maximum {target_max_tps:.0f} TPS × {HEADROOM} = {need:.0f} TPS needed → "
+                        f"about {cores} Python processes (one core each) on the harness machine(s).")
     else:
-        text.append(f"Python was never the limit. One Python process drove at least {rate.tps:.0f} TPS "
-                    f"(a lower bound).")
+        text.append(f"Python was never the limit: one Python process drove at least {rate.tps:.0f} TPS, and "
+                    f"was mostly waiting.")
         text.append(_what_limited(steps[-1]))
-    if target_max_tps:
-        cores = cores_needed(target_max_tps, rate.tps)
-        out["cores_needed"] = cores
-        amount = "about" if rate.exact else "at most"
-        text.append(f"Target maximum {target_max_tps:.0f} TPS × {HEADROOM} = {target_max_tps * HEADROOM:.0f} TPS "
-                    f"needed → {amount} {cores} Python processes (one core each) on the harness machine(s).")
+        estimates = [s.get("estimated_tps_per_core") for s in steps if s["checks_ok"]]
+        estimates = [e for e in estimates if e]
+        if estimates:
+            est = min(estimates)          # the most expensive step: the safe estimate
+            cpu_ms = 1000.0 / est
+            out["estimated_tps_per_core"] = est
+            text.append(f"Python used about {cpu_ms:.2f} ms of CPU per transaction (the most of any step), so one "
+                        f"fully busy Python process would reach about {est:.0f} TPS (an estimate: Python was never "
+                        f"busy, so this is not measured).")
+            if need:
+                cores = cores_needed(target_max_tps, est)
+                out["estimated_cores_needed"] = cores
+                text.append(f"Target maximum {target_max_tps:.0f} TPS × {HEADROOM} = {need:.0f} TPS needed → "
+                            f"about {cores} Python processes (estimate). Even with no estimate at all, it is at "
+                            f"most {cores_needed(target_max_tps, rate.tps)} (from the lower bound).")
+    if need:
         text.append(f"This harness machine has {harness_cores} cores.")
     else:
-        text.append(f"Cores needed = (target maximum TPS × {HEADROOM}) ÷ {rate.tps:.0f}. "
+        text.append(f"Cores needed = (target maximum TPS × {HEADROOM}) ÷ (TPS of one Python process). "
                     f"Give --target-max-tps to calculate it.")
     return out
 

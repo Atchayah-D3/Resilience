@@ -220,9 +220,11 @@ def test_steps_with_failed_checks_are_never_used():
 from tools.tpcc_speedtest.__main__ import _decision  # noqa: E402
 
 
-def _step(processes=2, tps=500.0, limited=False, ok=True, busy=None, journal=1.0, call=3.0):
+def _step(processes=2, tps=500.0, limited=False, ok=True, busy=None, iowait=None, journal_mean=1.0,
+          call_mean=3.0, p50=3.0, p99=6.0, est=None):
     return {"processes": processes, "tps_per_process_avg": tps, "python_limited": limited, "checks_ok": ok,
-            "target_cpu_busy": busy, "journal_p99_ms": journal, "call_p50_ms": call}
+            "target_cpu_busy": busy, "target_cpu_iowait": iowait, "journal_mean_ms": journal_mean,
+            "call_mean_ms": call_mean, "call_p50_ms": p50, "call_p99_ms": p99, "estimated_tps_per_core": est}
 
 
 def test_decision_with_python_as_the_limit_gives_about_n_cores():
@@ -231,26 +233,50 @@ def test_decision_with_python_as_the_limit_gives_about_n_cores():
     assert any("about 4 Python processes" in t for t in d["text"])
 
 
-def test_decision_without_python_limit_gives_at_most_n_cores_and_names_the_database():
+def test_decision_names_the_database_cpu():
     d = _decision([_step(busy=0.95)], 5_000, 8)
-    assert d["cores_needed"] == 12 and not d["exact"]
-    assert any("at most 12" in t for t in d["text"])
-    assert any("the database was the limit" in t for t in d["text"])
+    assert any("database's CPU was the limit" in t for t in d["text"])
 
 
-def test_decision_names_the_harness_disk_when_the_journal_is_slower_than_the_call():
-    d = _decision([_step(busy=0.30, journal=12.0, call=3.0)], None, 8)
+def test_decision_names_the_harness_disk_only_when_the_journal_takes_longer_on_average():
+    d = _decision([_step(busy=0.30, journal_mean=4.0, call_mean=3.0)], None, 8)
     assert any("harness disk was the limit" in t for t in d["text"])
 
 
+def test_lab_run_2026_11_06_names_the_target_disk_not_the_harness_disk():
+    # The real lab result: Python 7-8% busy, target CPU 11% busy and 11% iowait, call p50 6.3 ms
+    # but p99 826 ms; the journal's p99 (7.2 ms) exceeded the call's p50, which the first version
+    # of the report wrongly read as "the harness disk was the limit".
+    lab = _step(processes=4, tps=250, busy=0.11, iowait=0.11, journal_mean=1.5, call_mean=50.0,
+                p50=6.3, p99=826.2, est=3_100)
+    d = _decision([lab], 5_000, 4)
+    assert not any("harness disk" in t for t in d["text"])
+    assert any("target's disk" in t for t in d["text"])
+    assert d["estimated_tps_per_core"] == 3_100 and d["estimated_cores_needed"] == 2
+    assert any("at most 24" in t for t in d["text"])          # from the lower bound 250 TPS
+
+
+def test_estimate_uses_the_most_expensive_step():
+    d = _decision([_step(est=3_900), _step(est=3_100)], 5_000, 4)
+    assert d["estimated_tps_per_core"] == 3_100
+
+
 def test_decision_names_waiting_otherwise():
-    d = _decision([_step(busy=0.30, journal=1.0, call=3.0)], None, 8)
-    assert any("network or on locks" in t for t in d["text"])
+    d = _decision([_step(busy=0.30, iowait=0.01)], None, 8)
+    assert any("network or on" in t for t in d["text"])
 
 
 def test_no_decision_when_no_step_passed_its_checks():
     d = _decision([_step(ok=False)], 5_000, 8)
     assert d["tps_per_process"] is None and d["cores_needed"] is None
+
+
+def test_cpu_cost_per_transaction_and_estimate():
+    from tools.tpcc_speedtest.logic import cpu_ms_per_transaction, estimated_tps_per_core, mean
+    assert cpu_ms_per_transaction(4.2, 16_800) == pytest.approx(0.25)     # 7% of 60 s for 275 TPS
+    assert estimated_tps_per_core(0.25) == pytest.approx(4_000)
+    assert cpu_ms_per_transaction(1.0, 0) is None and estimated_tps_per_core(None) is None
+    assert mean([1, 2, 3]) == 2 and mean([]) is None
 
 
 # --- the output folder is checked before any database work ---------------------------------

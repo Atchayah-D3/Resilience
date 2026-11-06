@@ -111,6 +111,21 @@ def percentile(values: Sequence[float], q: float) -> float | None:
     return ordered[max(0, rank - 1)]
 
 
+def mean(values: Sequence[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def cpu_ms_per_transaction(cpu_s_total: float, committed: int) -> float | None:
+    """Python CPU time spent per committed transaction, over all processes of a step."""
+    return cpu_s_total * 1000.0 / committed if committed > 0 and cpu_s_total > 0 else None
+
+
+def estimated_tps_per_core(cpu_ms: float | None) -> float | None:
+    """The TPS one fully busy Python process would reach if its CPU cost per transaction stayed
+    the same. An estimate: it is exact only in a step where Python really was the limit."""
+    return 1000.0 / cpu_ms if cpu_ms else None
+
+
 # A Python process whose CPU use stays at or above this share of one core is "busy": its
 # speed is then the limit of Python, not of the database. Below it, the process was waiting
 # (for the database, the network or the disk) and its TPS is only a lower bound.

@@ -24,7 +24,10 @@ from tools.tpcc_speedtest.logic import (
     RunConstants,
     StepEvidence,
     check_step,
+    cpu_ms_per_transaction,
+    estimated_tps_per_core,
     home_warehouses,
+    mean,
     percentile,
     python_limited,
 )
@@ -174,6 +177,8 @@ async def run_step(dsn: dict[str, Any], conn: asyncpg.Connection, step: StepConf
     per_process_tps = [r["committed_in_window"] / step.duration_s for r in results]
     cpu_shares = [r["cpu_s"] / r["wall_s"] if r["wall_s"] > 0 else 0.0 for r in results]
     target_busy, target_iowait = _cpu_share(cpu_pair)
+    cpu_ms = cpu_ms_per_transaction(sum(r["cpu_s"] for r in results),
+                                    sum(r["committed_in_window"] for r in results))
     return {
         "processes": step.processes,
         "clerks_per_process": step.clerks_per_process,
@@ -184,8 +189,12 @@ async def run_step(dsn: dict[str, Any], conn: asyncpg.Connection, step: StepConf
         "tps_per_process_avg": sum(per_process_tps) / len(per_process_tps),
         "call_p50_ms": percentile(call_ms, 0.50),
         "call_p99_ms": percentile(call_ms, 0.99),
+        "call_mean_ms": mean(call_ms),
         "journal_p99_ms": percentile(journal_ms, 0.99),
+        "journal_mean_ms": mean(journal_ms),
         "python_cpu_share": cpu_shares,
+        "python_cpu_ms_per_txn": cpu_ms,
+        "estimated_tps_per_core": estimated_tps_per_core(cpu_ms),
         "python_limited": python_limited(cpu_shares),
         "target_cpu_busy": target_busy,
         "target_cpu_iowait": target_iowait,
