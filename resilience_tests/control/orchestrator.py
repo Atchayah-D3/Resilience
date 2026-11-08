@@ -55,6 +55,7 @@ from resilience_tests.execution.probes.probers import DiskUsageProber, LogTailer
 from resilience_tests.execution.remote import run_once
 from resilience_tests.execution.workload.driver import MeasuredWindow, WorkloadDriver
 from resilience_tests.execution.workload.history_writer import HistoryWriter
+from resilience_tests.execution.workload.hooks import NoProfileHooks, hooks_for
 from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals
 from resilience_tests.observability.event_stream import EventStream
 
@@ -144,6 +145,7 @@ class TestOrchestrator:
         # what this fault type, and the operation it must land inside, add to the phases
         self.fault_behaviour = fault_behaviour(self)
         self.during_behaviour = during_behaviour(self)
+        self.workload_hooks = NoProfileHooks()   # replaced in init by the profile's own hooks
 
     @property
     def ledger(self) -> InjectionLedger:
@@ -374,6 +376,16 @@ class TestOrchestrator:
                 f"Configuration deviation in postgresql.auto.conf: "
                 f"{', '.join(f'{k}={v}' for k, v in sorted(deviations.items()))}"
             )
+        # Profile hooks (docs/tpcc-contract.md §6): the custom workload's do nothing.
+        self.workload_hooks = hooks_for(self.scenario.workload)
+        prepared = await self.workload_hooks.prepare(self.adapter)
+        if prepared:
+            self.facts["workload_prepare"] = prepared
+        if self.scenario.workload.session:
+            self.disclosures.append(
+                "Each workload connection set its own session settings: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(self.scenario.workload.session.items()))
+                + " (on the client connections only; no role or server setting was changed)")
         self.journals = MarkerJournals(self.run_dir)
         if self.scenario.workload.history == "list_append":
             self.history = HistoryWriter(self.run_dir / HISTORY_FILE)
@@ -818,6 +830,7 @@ class TestOrchestrator:
             m.update(during_measures)
 
         m.update(await self.fault_behaviour.measure(events))
+        m.update(await self.workload_hooks.consistency_checks(self.adapter, self.run_dir))
 
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).

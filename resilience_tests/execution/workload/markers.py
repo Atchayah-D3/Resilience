@@ -181,11 +181,35 @@ def diff_markers(written: Iterable[str], acked: Iterable[str], db: Iterable[str]
     )
 
 
+def journal_paths(run_dir: Path, name: str) -> list[Path]:
+    """Every journal of one kind in a run: `marker.jrnl` (one process, as the custom workload
+    writes) and `marker.<n>.jrnl` (one per worker process, as the TPC-C engine will write).
+    Missing files are left out; the caller decides whether none at all is an error."""
+    stem, suffix = name.rsplit(".", 1)
+    single = run_dir / name
+    paths = [single] if single.exists() else []
+    paths += sorted(p for p in run_dir.glob(f"{stem}.*.{suffix}") if p != single)
+    return paths
+
+
 def diff_from_journals(run_dir: Path, db_uuids: Iterable[str]) -> tuple[MarkerDiff, int]:
-    """Returns the diff and the number of torn journal lines."""
-    marker = read_journal(run_dir / MARKER_JOURNAL)
-    acked = read_journal(run_dir / ACKED_JOURNAL)
+    """Returns the diff and the number of torn journal lines, over every journal file present."""
+    marker_paths = journal_paths(run_dir, MARKER_JOURNAL)
+    acked_paths = journal_paths(run_dir, ACKED_JOURNAL)
+    if not marker_paths:
+        # as before: a run without a marker journal is an error, never an empty (perfect) RPO
+        raise FileNotFoundError(run_dir / MARKER_JOURNAL)
+    # Every marker journal must have its acknowledgement journal: without it the commits it
+    # covers would silently count as never acknowledged, and their loss could not be seen.
+    for mp in marker_paths:
+        expected = mp.with_name(mp.name.replace(MARKER_JOURNAL.rsplit(".", 1)[0], ACKED_JOURNAL.rsplit(".", 1)[0], 1))
+        if not expected.exists():
+            raise FileNotFoundError(expected)
+    markers = [read_journal(p) for p in marker_paths]
+    acks = [read_journal(p) for p in acked_paths]
     result = diff_markers(
-        (r["uuid"] for r in marker.records), (r["uuid"] for r in acked.records), db_uuids
+        (r["uuid"] for j in markers for r in j.records),
+        (r["uuid"] for j in acks for r in j.records),
+        db_uuids,
     )
-    return result, marker.torn_lines + acked.torn_lines
+    return result, sum(j.torn_lines for j in markers + acks)

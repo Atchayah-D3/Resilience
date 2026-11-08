@@ -14,6 +14,7 @@ from resilience_tests.adapters.base import capabilities_of
 from resilience_tests.adapters.target_resolver import ResolutionError, TargetResolver
 from resilience_tests.control.faults import has_fault_behaviour
 from resilience_tests.control.profile import EnvProfile, Node
+from resilience_tests.execution.workload.hooks import not_built_reason as workload_not_built_reason
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,11 @@ def not_built_reason(scenario: Scenario) -> str | None:
       tests on several machines").
     - A fault type with no behaviour in control/faults: the harness does not know how its
       recovery begins or what it must measure, so the fault would be applied and then left
-      unjudged."""
+      unjudged.
+    - A workload profile the catalog accepts but nothing runs yet (`tpcc` until it is built)."""
+    workload_reason = workload_not_built_reason(scenario.workload)
+    if workload_reason:
+        return workload_reason
     if scenario.compound is not None:
         return ("compound faults are not built yet: compound.fault_b would never be injected, "
                 "so the scenario cannot be run to specification")

@@ -21,6 +21,7 @@ import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from resilience_tests.analysis import predicates
+from resilience_tests.execution.workload import contract as workload_contract
 
 CATALOG_ROOT = Path(__file__).resolve().parent
 
@@ -62,7 +63,9 @@ COMPOUND_CATEGORY = "CL-X"
 Role = Literal["standalone", "distdb.pc", "distdb.qc", "distdb.worker"]
 EnvClass = Literal["E1", "E2", "E3", "E4"]
 Priority = Literal["P0", "P1", "P2"]
-WorkloadProfile = Literal["idle", "oltp_read", "oltp_write_heavy", "bulk_load", "long_analytic", "mixed"]
+# `tpcc`: the TPC-C-like workload (docs/tpcc-workload-proposal.md). Accepted by the catalog so scenarios can
+# be written against it; refused as "not built yet" by the run plan and init until the profile exists.
+WorkloadProfile = Literal["idle", "oltp_read", "oltp_write_heavy", "bulk_load", "long_analytic", "mixed", "tpcc"]
 Environment = Literal["lab", "staging"]  # Framework §7.1: never production
 
 # Arch §5 -- fault types (one FaultInjector interface; the env profile picks the driver).
@@ -123,6 +126,25 @@ class SteadyState(_Model):
     duration_s: int = Field(gt=0)
 
 
+# A PostgreSQL duration or plain number, as a session setting takes it: 5s, 500ms, 2min, 30000.
+SESSION_VALUE_RE = re.compile(r"^\d+(us|ms|s|min|h|d)?$")
+
+
+class WorkloadGroup(_Model):
+    """A named group of clerks (docs/tpcc-contract.md §1). Every sample reports it separately."""
+
+    name: str = Field(pattern=workload_contract.GROUP_NAME_PATTERN)
+    clerks: int = Field(gt=0)
+
+
+class TpccOptions(_Model):
+    """Options of the `tpcc` profile (docs/tpcc-contract.md §1)."""
+
+    warehouses: int = Field(gt=0)
+    # group name -> the warehouse every clerk of that group works on
+    home_warehouse: dict[str, int] = Field(default_factory=dict)
+
+
 class Workload(_Model):
     profile: WorkloadProfile
     concurrency: int = Field(gt=0)
@@ -131,6 +153,12 @@ class Workload(_Model):
     # `list_append`: every marker transaction also appends to and reads back Elle's lists, and
     # the operation history records what was actually read (Arch §10.3). `none`: no history.
     history: Literal["none", "list_append"] = "none"
+    # Optional (docs/tpcc-contract.md §1). `session`: settings each clerk sets on its own
+    # connection -- never ALTER ROLE, never a server setting. `groups`: named groups of clerks.
+    # `tpcc`: options of the tpcc profile. Absent, a scenario behaves exactly as before.
+    session: dict[str, str] = Field(default_factory=dict)
+    groups: tuple[WorkloadGroup, ...] = ()
+    tpcc: TpccOptions | None = None
 
     @model_validator(mode="after")
     def _declared_rate(self) -> Workload:
@@ -138,6 +166,34 @@ class Workload(_Model):
         # execution time. Without a rate the load would be "as fast as this machine can go".
         if self.rate_tps is None and self.profile != "idle":
             raise ValueError(f"workload.rate_tps must be declared for profile {self.profile!r} (Framework §7.5)")
+        return self
+
+    @model_validator(mode="after")
+    def _contract_fields(self) -> Workload:
+        unknown = sorted(set(self.session) - workload_contract.SESSION_SETTINGS)
+        if unknown:
+            raise ValueError(f"workload.session: {', '.join(unknown)} not allowed; only "
+                             f"{', '.join(sorted(workload_contract.SESSION_SETTINGS))}")
+        bad = sorted(k for k, v in self.session.items() if not SESSION_VALUE_RE.match(str(v)))
+        if bad:
+            raise ValueError(f"workload.session: {', '.join(bad)} must be a number with an optional unit "
+                             "(us, ms, s, min, h, d), e.g. 5s")
+        problems = workload_contract.group_problems(
+            self.concurrency, [{"name": g.name, "clerks": g.clerks} for g in self.groups])
+        if problems:
+            raise ValueError("workload.groups: " + "; ".join(problems))
+        if self.profile == "tpcc" and self.tpcc is None:
+            raise ValueError("workload.tpcc (warehouses, ...) must be given for profile 'tpcc'")
+        if self.profile != "tpcc" and self.tpcc is not None:
+            raise ValueError("workload.tpcc is only allowed with profile 'tpcc'")
+        if self.tpcc is not None:
+            names = {g.name for g in self.groups}
+            for group, warehouse in self.tpcc.home_warehouse.items():
+                if group not in names:
+                    raise ValueError(f"workload.tpcc.home_warehouse: group {group!r} is not declared in workload.groups")
+                if not 1 <= warehouse <= self.tpcc.warehouses:
+                    raise ValueError(f"workload.tpcc.home_warehouse: warehouse {warehouse} of group {group!r} "
+                                     f"is not between 1 and {self.tpcc.warehouses}")
         return self
 
 

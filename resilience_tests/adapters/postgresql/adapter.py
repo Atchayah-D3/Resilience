@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from collections.abc import Mapping
 from typing import Any
 
 import asyncpg
@@ -333,13 +334,17 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, BaseDat
                        f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} {flags} -p {self.node.db.port} "
                        f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(sql)}")
 
-    async def session(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0) -> DatabaseSession:
+    async def session(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0,
+                      settings: Mapping[str, str] | None = None) -> DatabaseSession:
         """A workload/probe session. Statements are NOT bounded by the connect timeout: the
         caller bounds its own operation (the workload gives a marker transaction
         TXN_TIMEOUT_S, a probe gives its attempt PROBE_ATTEMPT_TIMEOUT_S). Tying the two
         together made a commit slower than the 2 s connect timeout indeterminate -- dropping
         genuine losses out of rpo_txn, and counting a latency spike as a dropped connection."""
-        return PostgreSQLSession(await self._connect(endpoint or self.node.client, timeout_s, command_timeout=None))
+        # `settings` travel in the connection's startup message, so they apply to this session
+        # only, from its first statement (no SET round trip, nothing changed for other sessions).
+        return PostgreSQLSession(await self._connect(endpoint or self.node.client, timeout_s, command_timeout=None,
+                                                     server_settings=dict(settings) if settings else None))
 
     async def prepare_harness_state(self) -> None:
         # Pre-grant required roles to harness user if running against a cluster with SSH access.

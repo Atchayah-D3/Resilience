@@ -29,6 +29,7 @@ from dataclasses import dataclass
 
 from catalog.schema import Workload
 from resilience_tests.adapters.base import BaseDatabaseAdapter, Capability, DatabaseSession, TransactionOutcome
+from resilience_tests.execution.workload import contract
 from resilience_tests.execution.workload.history_writer import HistoryWriter
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.observability.event_stream import EventStream
@@ -123,6 +124,31 @@ def p99(values: list[float]) -> float | None:
     return ordered[max(0, rank - 1)]
 
 
+def group_of_workers(workload: Workload) -> list[str]:
+    """The clerk group of every worker (docs/tpcc-contract.md §1): groups take workers in the
+    order they are declared; without groups every worker is in contract.DEFAULT_GROUP."""
+    if not workload.groups:
+        return [contract.DEFAULT_GROUP] * workload.concurrency
+    out: list[str] = []
+    for g in workload.groups:
+        out.extend([g.name] * g.clerks)
+    return out
+
+
+def _type_stats(w: _Window, elapsed: float) -> dict:
+    lat = w.latencies_ms or []
+    return {"commits": w.commits, "tps": w.commits / elapsed if elapsed > 0 else 0.0,
+            "p90_ms": percentile(lat, 0.90), "p99_ms": p99(lat), "errors": w.errors,
+            "business_rollbacks": 0}   # the custom workload has no expected rollbacks
+
+
+def _group_stats(w: _Window, elapsed: float) -> dict:
+    lat = w.latencies_ms or []
+    return {"commits": w.commits, "tps": w.commits / elapsed if elapsed > 0 else 0.0,
+            "p50_ms": percentile(lat, 0.50), "p95_ms": percentile(lat, 0.95), "p99_ms": p99(lat),
+            "errors": w.errors, "indeterminate": w.indeterminate, "drops": w.drops}
+
+
 class WorkloadDriver:
     def __init__(
         self,
@@ -183,6 +209,11 @@ class WorkloadDriver:
         self._measure_t0 = 0.0
         self.failure: str | None = None
         self.connected_workers = 0   # workers that have opened their first session
+        # docs/tpcc-contract.md: clerk groups (reported per group in every sample) and the
+        # session settings each worker sets on its own connection (never ALTER ROLE)
+        self._group_of = group_of_workers(workload)
+        self._group_windows = {g: _Window() for g in dict.fromkeys(self._group_of)}
+        self.session_settings = dict(workload.session)
 
     async def wait_until_ready(self, poll_s: float = 0.1) -> None:
         """Return once every worker has opened its session -- the load the scenario declares
@@ -236,6 +267,7 @@ class WorkloadDriver:
             now = time.monotonic()
             elapsed, last = now - last, now
             w, self._window = self._window, _Window()
+            groups, self._group_windows = self._group_windows, {g: _Window() for g in self._group_windows}
             self.stream.emit(
                 "workload", "sample", interval_s=elapsed, commits=w.commits,
                 tps=w.commits / elapsed if elapsed > 0 else 0.0,
@@ -243,6 +275,10 @@ class WorkloadDriver:
                 p50_ms=percentile(w.latencies_ms or [], 0.50), p95_ms=percentile(w.latencies_ms or [], 0.95),
                 errors=w.errors, indeterminate=w.indeterminate, drops=w.drops,
                 reconnects=w.reconnects, connect_failures=w.connect_failures,
+                # extra fields (docs/tpcc-contract.md §2): one transaction type, and one entry
+                # per clerk group; the fields above stay the totals the analysis reads
+                **{contract.BY_TYPE: {contract.MARKER_TYPE: _type_stats(w, elapsed)},
+                   contract.BY_GROUP: {g: _group_stats(gw, elapsed) for g, gw in groups.items()}},
             )
 
     def _fail(self, worker_id: int, exc: BaseException) -> None:
@@ -267,18 +303,22 @@ class WorkloadDriver:
             while not self._stop.is_set():
                 if session is not None and session.is_closed:
                     # the server (or the network) closed a connection we were not using
-                    self._count(drops=1)
+                    self._count(drops=1, worker_id=worker_id)
                     session = None
                 if session is None:
                     try:
-                        session = await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S)
+                        if self.session_settings:
+                            session = await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S,
+                                                                 settings=self.session_settings)
+                        else:
+                            session = await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S)
                     except Exception:  # noqa: BLE001 -- engine-specific; the adapter owns the taxonomy
                         session = None
-                        self._count(connect_failures=1)
+                        self._count(connect_failures=1, worker_id=worker_id)
                         await asyncio.sleep(RECONNECT_PAUSE_S)
                         continue
                     if ever_connected:
-                        self._count(reconnects=1) 
+                        self._count(reconnects=1, worker_id=worker_id)
                     else:
                         self.connected_workers += 1
                     ever_connected = True
@@ -315,29 +355,29 @@ class WorkloadDriver:
             outcome = TransactionOutcome.UNKNOWN
         except Exception:  # noqa: BLE001 -- anything the adapter did not classify is unknown
             outcome = TransactionOutcome.UNKNOWN
-        return await self._settle(session, outcome, marker_id, t0, journal_ms)
+        return await self._settle(session, outcome, marker_id, t0, journal_ms, worker_id)
 
     async def _settle(self, session: DatabaseSession, outcome: TransactionOutcome, marker_id: str,
-                      t0: float, journal_ms: float) -> DatabaseSession | None:
+                      t0: float, journal_ms: float, worker_id: int | None = None) -> DatabaseSession | None:
         """Count the outcome and journal the acknowledgement. Returns the session to reuse."""
         # Latency is recorded for EVERY attempt, not only the ones that committed: a client
         # waited for the failures too. Percentiles over survivors alone would read a stall that
         # ended in a timeout as no latency at all -- and a lower baseline p99 than the client saw.
         latency_ms = (time.monotonic() - t0) * 1000
         if outcome is TransactionOutcome.DEFINITELY_ABORTED:
-            self._count(errors=1, latency_ms=latency_ms)
+            self._count(errors=1, latency_ms=latency_ms, worker_id=worker_id)
             return session
         if outcome is TransactionOutcome.UNKNOWN:
             # stays in written - acked (indeterminate); the connection was lost or is no
             # longer trustworthy, so it is discarded -- a dropped connection for the client
-            self._count(indeterminate=1, drops=1, latency_ms=latency_ms)
+            self._count(indeterminate=1, drops=1, latency_ms=latency_ms, worker_id=worker_id)
             await _discard(session)
             return None
         # 3. only on acknowledgement
         t2 = time.monotonic()
         await self.journals.acknowledged(marker_id, time.time())
         journal_ms += (time.monotonic() - t2) * 1000
-        self._count(commits=1, latency_ms=latency_ms, journal_ms=journal_ms)
+        self._count(commits=1, latency_ms=latency_ms, journal_ms=journal_ms, worker_id=worker_id)
         return session
 
     async def _list_append_transaction(self, session: DatabaseSession, worker_id: int, seq: int,
@@ -370,7 +410,7 @@ class WorkloadDriver:
             self.history.record("fail", process, invoked, error="aborted")
         else:
             self._crash_process(worker_id, process, invoked, "indeterminate")
-        return await self._settle(session, outcome, marker_id, t0, journal_ms)
+        return await self._settle(session, outcome, marker_id, t0, journal_ms, worker_id)
 
     def _crash_process(self, worker_id: int, process: int, invoked: list, error: str) -> None:
         assert self.history is not None
@@ -379,8 +419,11 @@ class WorkloadDriver:
 
     def _count(self, *, commits: int = 0, errors: int = 0, indeterminate: int = 0, drops: int = 0,
                reconnects: int = 0, connect_failures: int = 0,
-               latency_ms: float | None = None, journal_ms: float | None = None) -> None:
-        for w in (self._window, self._measure):
+               latency_ms: float | None = None, journal_ms: float | None = None,
+               worker_id: int | None = None) -> None:
+        group = (self._group_windows.get(self._group_of[worker_id])
+                 if worker_id is not None and 0 <= worker_id < len(self._group_of) else None)
+        for w in (self._window, self._measure, group):
             if w is None:
                 continue
             w.commits += commits

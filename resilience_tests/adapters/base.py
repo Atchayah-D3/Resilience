@@ -12,7 +12,7 @@ capability fails rather than passing on a measurement nobody took.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar
@@ -136,8 +136,11 @@ class CoreAdapter(ABC):
     # --- client sessions -------------------------------------------------------------
 
     @abstractmethod
-    async def session(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0) -> DatabaseSession:
-        """Open a session. `endpoint` defaults to the node's client endpoint."""
+    async def session(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0,
+                      settings: Mapping[str, str] | None = None) -> DatabaseSession:
+        """Open a session. `endpoint` defaults to the node's client endpoint. `settings`: session
+        settings this connection sets for itself (docs/tpcc-contract.md §1, e.g. lock_timeout);
+        never a role or server setting. The workload passes it only when the scenario has some."""
 
     # --- state the harness needs ------------------------------------------------------
 
