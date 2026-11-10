@@ -96,6 +96,17 @@ class DatabaseSession(ABC):
         Engines without Capability.LIST_APPEND_HISTORY inherit this refusal."""
         raise NotImplementedError(f"{type(self).__name__} does not implement the list-append workload")
 
+    async def tpcc_execute(self, txn_type: str, inputs: Mapping[str, Any],
+                           marker: tuple[int, str] | None) -> tuple[str, dict[str, Any], str | None]:
+        """One TPC-C transaction as ONE call (docs/tpcc-workload-proposal.md 6.2): `txn_type` and
+        `inputs` as tpcc/inputs.py makes them; `marker` = (seq, uuid) for a write transaction,
+        whose marker row is saved in the same transaction. Returns (outcome, journal, sqlstate):
+          outcome  contract outcome: committed / business_rollback / definitely_aborted / unknown
+          journal  what the "committed" journal line records (New-Order: w, d, o_id, ol_cnt)
+          sqlstate the server's error code when it rolled back, else None
+        Engines without Capability.TPCC_WORKLOAD inherit this refusal."""
+        raise NotImplementedError(f"{type(self).__name__} does not implement the TPC-C workload")
+
     @abstractmethod
     async def try_write(self) -> bool:
         """A single small write, for the write prober. True when it succeeded."""
@@ -478,6 +489,17 @@ class TpccSupport:
 
     async def tpcc_drop(self) -> bool:
         """Remove every TPC-C object; True when nothing is left."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+    async def tpcc_orders_incomplete(self, orders: Sequence[Mapping[str, Any]]) -> int:
+        """The per-order check: of these acknowledged New-Orders ({w, d, o_id, ol_cnt} each, from
+        the "committed" journal), how many are missing, or lack their new-order row, or do not
+        have exactly ol_cnt lines. 0 = every one is complete."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+    async def tpcc_install_functions(self) -> None:
+        """Create or replace the five TPC-C transaction functions (before every run, so a newer
+        harness brings its functions without reloading the data)."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
     async def tpcc_data_status(self) -> dict[str, Any]:

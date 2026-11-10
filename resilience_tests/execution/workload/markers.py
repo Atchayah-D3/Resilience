@@ -33,6 +33,9 @@ from typing import Any
 
 MARKER_JOURNAL = "marker.jrnl"
 ACKED_JOURNAL = "acked.jrnl"
+# Sure rollbacks (the server said the transaction did not happen). Written by the TPC-C engine;
+# created only when first used, so a run of the custom workload has the same files as before.
+ABORTED_JOURNAL = "aborted.jrnl"
 
 _STOP = object()
 
@@ -108,26 +111,39 @@ def _settle_all(futures: list[asyncio.Future[None]], err: BaseException | None) 
 
 
 class MarkerJournals:
-    """The two journals of the protocol, owned by the workload driver."""
+    """The journals of the protocol, owned by the workload driver. Extra fields (`**extra`)
+    are added to a line, e.g. the TPC-C transaction type, or the order number of a New-Order
+    for the per-order check after a fault; without them each line is exactly as before."""
 
     def __init__(self, run_dir: Path) -> None:
+        self.run_dir = run_dir
         self.marker = DurableJournal(run_dir / MARKER_JOURNAL)
         self.acked = DurableJournal(run_dir / ACKED_JOURNAL)
+        self._aborted: DurableJournal | None = None
         self._seq = 0
 
     def next_marker(self) -> tuple[int, str]:
         self._seq += 1
         return self._seq, str(uuidlib.uuid4())
 
-    async def written(self, seq: int, uuid: str, t_pre: float) -> None:
-        await self.marker.append({"seq": seq, "uuid": uuid, "t_pre": t_pre})
+    async def written(self, seq: int, uuid: str, t_pre: float, **extra: Any) -> None:
+        await self.marker.append({"seq": seq, "uuid": uuid, "t_pre": t_pre, **extra})
 
-    async def acknowledged(self, uuid: str, t_ack: float) -> None:
-        await self.acked.append({"uuid": uuid, "t_ack": t_ack})
+    async def acknowledged(self, uuid: str, t_ack: float, **extra: Any) -> None:
+        await self.acked.append({"uuid": uuid, "t_ack": t_ack, **extra})
+
+    async def aborted(self, uuid: str, t_abort: float, **extra: Any) -> None:
+        """A sure rollback: the server answered that the transaction did not happen. Never
+        written for an unknown outcome -- that stays a marker line with no other line."""
+        if self._aborted is None:
+            self._aborted = DurableJournal(self.run_dir / ABORTED_JOURNAL)
+        await self._aborted.append({"uuid": uuid, "t_abort": t_abort, **extra})
 
     def close(self) -> None:
         self.marker.close()
         self.acked.close()
+        if self._aborted is not None:
+            self._aborted.close()
 
 
 # --- analysis (pure) ---------------------------------------------------------------------

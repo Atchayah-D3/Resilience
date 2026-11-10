@@ -70,7 +70,14 @@ def test_invalid_new_fields_are_refused_with_the_reason(changes, message):
 
 # --- tpcc is refused as not built, before anything is applied -----------------------------
 
-def test_tpcc_profile_is_refused_as_not_built_by_the_run_plan_and_init():
+def test_a_registered_profile_that_is_not_built_is_refused_by_the_run_plan_and_init(monkeypatch):
+    # tpcc is built since step 6; a not-built stand-in shows the refusal still works
+    from resilience_tests.execution.workload.profiles import base as profiles_base
+    from resilience_tests.execution.workload.tpcc.profile import TpccProfile
+
+    class NotBuilt(TpccProfile):
+        built = False
+    monkeypatch.setitem(profiles_base._PROFILES, "tpcc", NotBuilt)
     sc = load_catalog().scenarios["NL-C-01"]
     tpcc_sc = sc.model_copy(update={"workload": wl(profile="tpcc", tpcc={"warehouses": 40})})
     reason = not_built_reason(tpcc_sc)
@@ -78,13 +85,13 @@ def test_tpcc_profile_is_refused_as_not_built_by_the_run_plan_and_init():
     assert not_built_reason(sc) is None                      # existing scenarios are unaffected
 
 
-def test_hooks_for_the_custom_workload_do_nothing_and_tpcc_is_refused():
+def test_hooks_for_the_custom_workload_do_nothing_and_tpcc_has_its_own():
+    from resilience_tests.execution.workload.tpcc.profile import TpccProfile
     hooks = hooks_for(WORKLOAD)
     assert isinstance(hooks, NoProfileHooks)
     assert asyncio.run(hooks.prepare(None)) == {}
     assert asyncio.run(hooks.consistency_checks(None, Path("."))) == {}
-    with pytest.raises(NotImplementedError, match="not built yet"):
-        hooks_for(wl(profile="tpcc", tpcc={"warehouses": 40}))
+    assert isinstance(hooks_for(wl(profile="tpcc", tpcc={"warehouses": 40})), TpccProfile)
 
 
 # --- the driver: groups, extra sample fields, session settings ----------------------------

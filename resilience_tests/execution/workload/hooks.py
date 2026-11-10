@@ -16,7 +16,7 @@ from typing import Any
 
 from catalog.schema import Workload
 from resilience_tests.execution.workload.contract import ProfileHooks
-from resilience_tests.execution.workload.profiles import profile_class
+from resilience_tests.execution.workload.profiles import WorkloadProfile, profile_class
 
 
 class NoProfileHooks:
@@ -35,6 +35,24 @@ def not_built_reason(workload: Workload) -> str | None:
         return (f"workload profile {workload.profile!r} is not built yet (TPC-C build plan, "
                 "docs/tpcc-build-plan.md): the scenario cannot be run to specification")
     return None
+
+
+def fault_runs_reason(workload: Workload) -> str | None:
+    """Why this workload may only be used for dry runs (--stop-before-fault) for now, or None."""
+    cls = profile_class(workload.profile)
+    if cls is not None and cls.built and not cls.ready_for_faults:
+        return (f"workload profile {workload.profile!r} can run only dry runs (--stop-before-fault) until its "
+                "checks after a fault are built (docs/tpcc-build-plan.md, step 7)")
+    return None
+
+
+def make_workload_driver(adapter: Any, workload: Workload, journals: Any, stream: Any,
+                         history: Any, hooks: ProfileHooks) -> Any:
+    """The engine for this workload: a registered profile's own engine, else the custom driver."""
+    if isinstance(hooks, WorkloadProfile):
+        return hooks.make_driver(adapter, journals, stream)
+    from resilience_tests.execution.workload.driver import WorkloadDriver
+    return WorkloadDriver(adapter, workload, journals, stream, history=history)
 
 
 def required_capabilities(workload: Workload) -> set[str]:

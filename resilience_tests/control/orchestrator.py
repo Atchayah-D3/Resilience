@@ -53,9 +53,16 @@ from resilience_tests.execution import injectors  # noqa: F401  (registers drive
 from resilience_tests.execution.injectors.base import FaultInjector, FaultNotLanded, resolve
 from resilience_tests.execution.probes.probers import DiskUsageProber, LogTailer, WriteProber, measure_clock_offset
 from resilience_tests.execution.remote import run_once
-from resilience_tests.execution.workload.driver import MeasuredWindow, WorkloadDriver
+from resilience_tests.execution.workload.contract import WorkloadDriverContract
+from resilience_tests.execution.workload.driver import MeasuredWindow
 from resilience_tests.execution.workload.history_writer import HistoryWriter
-from resilience_tests.execution.workload.hooks import NoProfileHooks, hooks_for, required_capabilities
+from resilience_tests.execution.workload.hooks import (
+    NoProfileHooks,
+    fault_runs_reason,
+    hooks_for,
+    make_workload_driver,
+    required_capabilities,
+)
 from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals
 from resilience_tests.observability.event_stream import EventStream
 
@@ -114,7 +121,7 @@ class TestOrchestrator:
         self.stream: EventStream | None = None
         self.journals: MarkerJournals | None = None
         self.history: HistoryWriter | None = None
-        self.workload: WorkloadDriver | None = None
+        self.workload: WorkloadDriverContract | None = None
         self.write_prober: WriteProber | None = None
         self.log_tailer: LogTailer | None = None
         self.disk_prober: DiskUsageProber | None = None
@@ -315,6 +322,10 @@ class TestOrchestrator:
             # the run plan skips these too; refused here before anything is applied, so a direct
             # run can never report a pass for a fault it did not inject
             raise PhaseAbort(not_built)
+        # a workload whose checks after a fault are not built yet may only be dry-run
+        dry_only = fault_runs_reason(self.scenario.workload)
+        if dry_only and not self.options.stop_before_fault:
+            raise PhaseAbort(dry_only)
         # the workload profile's own engine needs (the run plan skips these too)
         workload_missing = sorted(required_capabilities(self.scenario.workload)
                                   - {c.value for c in self.adapter.capabilities})
@@ -395,8 +406,8 @@ class TestOrchestrator:
         self.journals = MarkerJournals(self.run_dir)
         if self.scenario.workload.history == "list_append":
             self.history = HistoryWriter(self.run_dir / HISTORY_FILE)
-        self.workload = WorkloadDriver(self.adapter, self.scenario.workload, self.journals, self.stream,
-                                       history=self.history)
+        self.workload = make_workload_driver(self.adapter, self.scenario.workload, self.journals, self.stream,
+                                             history=self.history, hooks=self.workload_hooks)
         return {"hostname": hostname, "settings": settings}
 
     async def _p_baseline(self) -> dict[str, Any]:

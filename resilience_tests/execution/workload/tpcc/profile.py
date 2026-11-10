@@ -1,13 +1,13 @@
 """The `tpcc` workload profile: TPC-C 5.11-like transactions (docs/tpcc-workload-proposal.md).
 
-A skeleton (TPC-C build step 3): it is registered, so the harness knows the name, the
-capability it needs and where its hooks live, but `built = False`, so every scenario that uses
-it is skipped by the run plan and refused by init, with the reason, before anything is
-applied. The later steps fill it in (docs/tpcc-build-plan.md):
+Registered in step 3; it runs since step 6. Until step 7 builds its checks after a fault,
+`ready_for_faults = False`: only dry runs (--stop-before-fault) are allowed, so no fault is
+injected whose effect on the TPC-C data could not be judged. Build steps
+(docs/tpcc-build-plan.md):
 
     step 4  prepare(): the TPC-C data is loaded, the right size and consistent   (done)
     step 5  terminal(), next_request(): clerk placement and the TPC-C inputs (pure code)   (done)
-    step 6  execute(): one server-side function call per transaction
+    step 6  execute(): one server-side function call per transaction; the engine   (done)
     step 7  consistency_checks(): RPO, per-order check, consistency rules after the fault
 """
 
@@ -50,7 +50,8 @@ class TpccDataError(RuntimeError):
 @register_profile
 class TpccProfile(WorkloadProfile):
     name = "tpcc"
-    built = False            # becomes True when steps 4-7 are done
+    built = True
+    ready_for_faults = False     # becomes True with step 7 (checks after a fault)
 
     def __init__(self, workload: Any, seed: int = SEED) -> None:
         super().__init__(workload)
@@ -77,6 +78,7 @@ class TpccProfile(WorkloadProfile):
         problems = data.data_problems(status, self.workload.tpcc.warehouses)
         results: dict[int, int] = {}
         if not problems:
+            await adapter.tpcc_install_functions()     # this harness's transaction functions
             results = await adapter.tpcc_consistency(data.PREPARE_RULES, district_sample=data.PREPARE_DISTRICT_SAMPLE)
             problems = data.consistency_problems({r: results.get(r) for r in data.PREPARE_RULES})
         if problems:
@@ -122,7 +124,15 @@ class TpccProfile(WorkloadProfile):
         return Request(txn_type=card, inputs=values, needs_marker=card not in TPCC_READ_ONLY_TYPES)
 
     async def execute(self, session: Any, request: Request, marker: tuple[int, str] | None) -> Result:
-        raise NotImplementedError(NOT_BUILT.format(step=6))
+        """One transaction = one call through the adapter (all SQL lives there)."""
+        outcome, journal, sqlstate = await session.tpcc_execute(request.txn_type, request.inputs, marker)
+        return Result(outcome=outcome, journal=journal, sqlstate=sqlstate)
+
+    def make_driver(self, adapter: Any, journals: Any, stream: Any) -> Any:
+        from resilience_tests.execution.workload.tpcc.engine import TpccWorkloadDriver
+        if self.constants is None:
+            raise RuntimeError("the run's NURand constants are not set: prepare() must run first")
+        return TpccWorkloadDriver(adapter, self.workload, journals, stream, self)
 
     async def consistency_checks(self, adapter: Any, run_dir: Path) -> dict[str, Any]:
         raise NotImplementedError(NOT_BUILT.format(step=7))

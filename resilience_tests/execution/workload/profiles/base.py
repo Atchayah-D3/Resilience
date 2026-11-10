@@ -53,11 +53,15 @@ class Result:
 
     outcome: str                     # committed / definitely_aborted / business_rollback / unknown
     journal: dict[str, Any] = field(default_factory=dict)   # e.g. New-Order: w, d, o_id, ol_cnt
+    sqlstate: str | None = None      # the server's error code when it rolled the transaction back
 
 
 class WorkloadProfile(ABC):
     name: ClassVar[str] = ""
     built: ClassVar[bool] = True
+    # False while the profile's checks after a fault are not built: only dry runs
+    # (--stop-before-fault) are allowed, so no fault is injected that could not be judged.
+    ready_for_faults: ClassVar[bool] = True
 
     def __init__(self, workload: Workload) -> None:
         self.workload = workload
@@ -79,6 +83,10 @@ class WorkloadProfile(ABC):
 
     async def consistency_checks(self, adapter: Any, run_dir: Path) -> dict[str, Any]:
         return {}
+
+    def make_driver(self, adapter: Any, journals: Any, stream: Any) -> Any:
+        """The engine that runs this profile's clerks (contract.WorkloadDriverContract)."""
+        raise NotImplementedError(f"workload profile {self.name!r} has no engine")
 
 
 # --- registry ----------------------------------------------------------------------------

@@ -45,7 +45,7 @@ from resilience_tests.adapters.postgresql.sessions import (  # noqa: F401  (re-e
     SessionsMixin,
     parse_pg_interval_s,
 )
-from resilience_tests.adapters.postgresql.tpcc import TpccMixin  # TPC-C SQL (build step 4)
+from resilience_tests.adapters.postgresql.tpcc import TpccMixin, call_tpcc  # TPC-C SQL (build steps 4, 6)
 from resilience_tests.control.profile import DbEndpoint, Node
 from resilience_tests.execution.remote import RemoteHost, as_user
 
@@ -270,6 +270,13 @@ class PostgreSQLSession(DatabaseSession):
             ("r", append_key, None if after is None else list(after)),
         ]
 
+    async def tpcc_execute(self, txn_type: str, inputs: Mapping[str, Any],
+                           marker: tuple[int, str] | None) -> tuple[str, dict[str, Any], str | None]:
+        outcome, journal, sqlstate = await call_tpcc(self._conn, txn_type, inputs, marker)
+        if outcome == "unknown":
+            await self.close()          # no longer trustworthy: the workload reconnects
+        return outcome, journal, sqlstate
+
     async def try_write(self) -> bool:
         try:
             await self._conn.execute(PROBE_WRITE)
@@ -301,6 +308,7 @@ class PostgreSQLSession(DatabaseSession):
 class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMixin, BaseDatabaseAdapter):
     engine = "postgresql"
     capabilities = frozenset({
+        Capability.TPCC_WORKLOAD,          # tables, loader, the five functions, consistency (TPC-C steps 4, 6)
         Capability.TRANSACTIONAL_MARKERS,
         Capability.WORKLOAD_CHURN,
         Capability.STRUCTURAL_INTEGRITY_CHECK,

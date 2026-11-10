@@ -15,12 +15,28 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from collections.abc import Callable, Sequence
+import uuid as uuidlib
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import asyncpg
+
 from resilience_tests.adapters.base import TpccSupport
-from resilience_tests.execution.workload.contract import TPCC_META, TPCC_SCHEMA, TPCC_TABLE_NAMES
+from resilience_tests.execution.workload.contract import (
+    DELIVERY,
+    NEW_ORDER,
+    ORDER_STATUS,
+    OUTCOME_BUSINESS_ROLLBACK,
+    OUTCOME_COMMITTED,
+    OUTCOME_DEFINITELY_ABORTED,
+    OUTCOME_UNKNOWN,
+    PAYMENT,
+    STOCK_LEVEL,
+    TPCC_META,
+    TPCC_SCHEMA,
+    TPCC_TABLE_NAMES,
+)
 from resilience_tests.execution.workload.tpcc import data
 
 if TYPE_CHECKING:
@@ -30,8 +46,70 @@ else:
     PostgreSQLCore = object
 
 SQL_DIR = Path(__file__).with_name("sql")
-SETUP_FILES = ("tpcc_schema.sql", "tpcc_load.sql", "tpcc_consistency.sql")
+SETUP_FILES = ("tpcc_schema.sql", "tpcc_load.sql", "tpcc_consistency.sql", "tpcc_functions.sql")
 INDEX_FILE = "tpcc_indexes.sql"
+FUNCTIONS_FILE = "tpcc_functions.sql"
+
+# --- one TPC-C transaction = one call (build step 6) --------------------------------------
+
+S = TPCC_SCHEMA
+TPCC_CALL_SQL = {
+    NEW_ORDER: f"SELECT {S}.new_order($1, $2, $3, $4, $5, $6::int[], $7::int[], $8::int[])",
+    PAYMENT: f"SELECT {S}.payment($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    ORDER_STATUS: f"SELECT {S}.order_status($1, $2, $3, $4)",
+    DELIVERY: f"SELECT {S}.delivery($1, $2, $3, $4)",
+    STOCK_LEVEL: f"SELECT {S}.stock_level($1, $2, $3)",
+}
+BUSINESS_ROLLBACK_SQLSTATE = "TP001"     # New-Order's unknown item (Clause 2.4.1.4), raised in tpcc_functions.sql
+NO_CUSTOMER_SQLSTATE = "TP002"
+# The server answered with an error, so the call (marker row included) did NOT happen: a sure
+# rollback. lock_timeout and statement_timeout end the statement the same way (scenarios 2, 4).
+_SURE_ROLLBACK = (asyncpg.exceptions.IntegrityConstraintViolationError, asyncpg.exceptions.SerializationError,
+                  asyncpg.exceptions.DeadlockDetectedError, asyncpg.exceptions.LockNotAvailableError,
+                  asyncpg.exceptions.QueryCanceledError)
+# Anything else -- a lost connection, a timeout, a server shutting down -- may or may not have
+# committed: unknown, never guessed (the harness's rule, adapter.py _CONNECTION_ERRORS).
+_UNKNOWN = (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, TimeoutError)
+
+
+def _call_args(txn_type: str, v: Mapping[str, Any], marker: tuple[int, str] | None) -> tuple:
+    def m() -> tuple:
+        if marker is None:
+            raise ValueError(f"{txn_type} is a write transaction and needs a marker")
+        return (uuidlib.UUID(marker[1]), marker[0])
+    if txn_type == NEW_ORDER:
+        return (*m(), v["w_id"], v["d_id"], v["c_id"], list(v["items"]), list(v["supply_w"]), list(v["quantities"]))
+    if txn_type == PAYMENT:
+        return (*m(), v["w_id"], v["d_id"], v["c_w_id"], v["c_d_id"], v["c_id"], v["c_last"], v["amount_cents"])
+    if txn_type == ORDER_STATUS:
+        return (v["w_id"], v["d_id"], v["c_id"], v["c_last"])
+    if txn_type == DELIVERY:
+        return (*m(), v["w_id"], v["o_carrier_id"])
+    if txn_type == STOCK_LEVEL:
+        return (v["w_id"], v["d_id"], v["threshold"])
+    raise ValueError(f"unknown TPC-C transaction type {txn_type!r}")
+
+
+async def call_tpcc(conn: asyncpg.Connection, txn_type: str, inputs: Mapping[str, Any],
+                    marker: tuple[int, str] | None) -> tuple[str, dict[str, Any], str | None]:
+    """Run one TPC-C transaction as one call, outside BEGIN ... COMMIT, and say how it ended.
+    The call returning means committed: PostgreSQL commits a lone statement before it answers."""
+    args = _call_args(txn_type, inputs, marker)
+    try:
+        value = await conn.fetchval(TPCC_CALL_SQL[txn_type], *args)
+    except asyncpg.PostgresError as exc:
+        if exc.sqlstate == BUSINESS_ROLLBACK_SQLSTATE:
+            return OUTCOME_BUSINESS_ROLLBACK, {}, exc.sqlstate
+        if isinstance(exc, _SURE_ROLLBACK) or exc.sqlstate == NO_CUSTOMER_SQLSTATE:
+            return OUTCOME_DEFINITELY_ABORTED, {}, exc.sqlstate
+        return OUTCOME_UNKNOWN, {}, exc.sqlstate
+    except _UNKNOWN:
+        return OUTCOME_UNKNOWN, {}, None
+    if txn_type == NEW_ORDER:
+        # the per-order check after a fault looks for exactly this order with exactly these lines
+        return OUTCOME_COMMITTED, {"w": inputs["w_id"], "d": inputs["d_id"], "o_id": value,
+                                   "ol_cnt": len(inputs["items"])}, None
+    return OUTCOME_COMMITTED, {}, None
 
 
 class TpccLoadError(RuntimeError):
@@ -123,6 +201,36 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
         try:
             await conn.execute(f"DROP SCHEMA IF EXISTS {TPCC_SCHEMA} CASCADE")
             return not await self._tpcc_schema_exists(conn)
+        finally:
+            await conn.close()
+
+    async def tpcc_orders_incomplete(self, orders: Sequence[Mapping[str, Any]]) -> int:
+        if not orders:
+            return 0
+        rows = [(int(o["w"]), int(o["d"]), int(o["o_id"]), int(o["ol_cnt"])) for o in orders]
+        conn = await self._connect(timeout_s=10.0, command_timeout=None)
+        try:
+            async with conn.transaction():
+                await conn.execute("CREATE TEMP TABLE tpcc_acked (w int, d int, o_id int, ol_cnt int) ON COMMIT DROP")
+                await conn.copy_records_to_table("tpcc_acked", records=rows)
+                # A New-Order can be delivered afterwards (new_order row gone, carrier set): that is
+                # complete too. Incomplete = no order, a wrong line count, or a missing new_order
+                # row on an order no Delivery has touched.
+                return await conn.fetchval(f"""
+                    SELECT count(*) FROM tpcc_acked a
+                      LEFT JOIN {S}.orders o ON (o.o_w_id, o.o_d_id, o.o_id) = (a.w, a.d, a.o_id)
+                      LEFT JOIN {S}.new_order n ON (n.no_w_id, n.no_d_id, n.no_o_id) = (a.w, a.d, a.o_id)
+                      LEFT JOIN LATERAL (SELECT count(*) AS lines FROM {S}.order_line l
+                                          WHERE (l.ol_w_id, l.ol_d_id, l.ol_o_id) = (a.w, a.d, a.o_id)) l ON true
+                     WHERE o.o_id IS NULL OR o.o_ol_cnt <> a.ol_cnt OR l.lines <> a.ol_cnt
+                        OR (n.no_o_id IS NULL AND o.o_carrier_id IS NULL)""")
+        finally:
+            await conn.close()
+
+    async def tpcc_install_functions(self) -> None:
+        conn = await self._connect(timeout_s=10.0)
+        try:
+            await conn.execute(_sql(FUNCTIONS_FILE))
         finally:
             await conn.close()
 

@@ -68,17 +68,18 @@ def test_registering_the_same_class_again_is_harmless():
 
 # --- the tpcc skeleton: registered, not built, refused with the reason ----------------------
 
-def test_tpcc_is_not_built_so_it_is_refused():
-    assert TpccProfile.built is False
-    assert "not built yet" in (hooks.not_built_reason(TPCC_WORKLOAD) or "")
-    with pytest.raises(NotImplementedError, match="not built yet"):
-        hooks.hooks_for(TPCC_WORKLOAD)
+def test_tpcc_is_built_but_allows_only_dry_runs_until_step_7():
+    assert TpccProfile.built is True and TpccProfile.ready_for_faults is False
+    assert hooks.not_built_reason(TPCC_WORKLOAD) is None
+    reason = hooks.fault_runs_reason(TPCC_WORKLOAD)
+    assert reason and "only dry runs (--stop-before-fault)" in reason and "step 7" in reason
+    assert hooks.fault_runs_reason(WORKLOAD) is None                  # the custom workload: no limit
+    assert isinstance(hooks.hooks_for(TPCC_WORKLOAD), TpccProfile)
 
 
 def test_every_skeleton_hook_refuses_and_names_its_build_step():
     p = TpccProfile(TPCC_WORKLOAD)
     calls = [
-        (6, lambda: asyncio.run(p.execute(None, Request("new_order"), None))),
         (7, lambda: asyncio.run(p.consistency_checks(None, Path(".")))),
     ]
     for step, call in calls:
@@ -94,14 +95,23 @@ def test_tpcc_needs_the_tpcc_capability():
 
 # --- the run plan: a tpcc scenario is skipped on an engine without the capability ----------
 
-def test_run_plan_skips_a_tpcc_scenario_on_postgresql_today_with_the_reason():
+def test_run_plan_includes_a_tpcc_scenario_on_postgresql_since_step_6():
     catalog = load_catalog()
     sc = catalog.scenarios["NL-C-01"]
     catalog.scenarios["NL-C-01"] = sc.model_copy(update={"workload": TPCC_WORKLOAD})
     plan, skipped = expand(catalog, load_profile("e2-dedicated-vm"), reference_env_class="E2", only={"NL-C-01"})
-    assert plan == []
-    reasons = {s.scenario_id: s.reason for s in skipped}
-    assert "tpcc_workload" in reasons["NL-C-01"]
+    assert len(plan) == 1 and not skipped
+
+
+def test_run_plan_skips_a_tpcc_scenario_on_an_engine_without_the_capability(monkeypatch):
+    from resilience_tests.control import matrix
+    catalog = load_catalog()
+    sc = catalog.scenarios["NL-C-01"]
+    catalog.scenarios["NL-C-01"] = sc.model_copy(update={"workload": TPCC_WORKLOAD})
+    weaker = frozenset(c for c in capabilities_of("postgresql") if c is not Capability.TPCC_WORKLOAD)
+    monkeypatch.setattr(matrix, "capabilities_of", lambda engine: weaker)
+    plan, skipped = expand(catalog, load_profile("e2-dedicated-vm"), reference_env_class="E2", only={"NL-C-01"})
+    assert plan == [] and "tpcc_workload" in {s.scenario_id: s.reason for s in skipped}["NL-C-01"]
 
 
 def test_run_plan_is_unchanged_for_existing_scenarios():
@@ -159,6 +169,6 @@ def test_every_adapter_has_the_tpcc_interface_group_and_it_refuses_by_default():
         asyncio.run(fake.tpcc_consistency([1, 2, 3]))
 
 
-def test_postgresql_does_not_claim_the_tpcc_capability_yet():
-    # claimed in step 4/6, when the adapter really has the tables, loader and functions
-    assert Capability.TPCC_WORKLOAD not in capabilities_of("postgresql")
+def test_postgresql_claims_the_tpcc_capability_since_step_6():
+    # claimed once the adapter really has the tables, the loader and the five functions
+    assert Capability.TPCC_WORKLOAD in capabilities_of("postgresql")

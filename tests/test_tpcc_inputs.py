@@ -256,6 +256,9 @@ def test_prepare_sets_run_constants_that_obey_clause_2_1_6_1():
         async def tpcc_data_status(self):
             return status
 
+        async def tpcc_install_functions(self):
+            pass
+
         async def tpcc_consistency(self, rules, district_sample=None, seed=None):
             return {r: 0 for r in rules}
 

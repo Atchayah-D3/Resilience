@@ -93,6 +93,9 @@ class FakeTpccAdapter:
     async def tpcc_data_status(self):
         return self.status
 
+    async def tpcc_install_functions(self):
+        self.calls.append(("install_functions",))
+
     async def tpcc_consistency(self, rules, district_sample=None, seed=None):
         self.calls.append((tuple(rules), district_sample))
         return {r: self.consistency.get(r) for r in rules}
@@ -106,7 +109,7 @@ def _profile(warehouses=4):
 def test_prepare_accepts_good_data_and_checks_rules_1_to_4_on_a_sample():
     adapter = FakeTpccAdapter(GOOD)
     facts = asyncio.run(_profile().prepare(adapter))["tpcc_data"]
-    assert adapter.calls == [((1, 2, 3, 4), data.PREPARE_DISTRICT_SAMPLE)]
+    assert adapter.calls == [("install_functions",), ((1, 2, 3, 4), data.PREPARE_DISTRICT_SAMPLE)]
     assert facts["warehouses"] == 4 and facts["consistency"] == {"1": 0, "2": 0, "3": 0, "4": 0}
 
 
