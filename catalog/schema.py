@@ -42,6 +42,8 @@ Capability = Literal[
     "durability_settings",          # flush/commit settings are inspectable
     "list_append_history",          # list-append reads and appends in the marker transaction,
                                     # so Elle can check the recorded history (Arch §10.3)
+    "tpcc_workload",                # the TPC-C-like workload: tables, loader, functions, checks
+                                    # (docs/tpcc-workload-proposal.md)
 ]
 
 # Infrastructure a scenario cannot be run to specification without (docs/infra-requirements.md).

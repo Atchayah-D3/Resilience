@@ -15,6 +15,7 @@ from resilience_tests.adapters.target_resolver import ResolutionError, TargetRes
 from resilience_tests.control.faults import has_fault_behaviour
 from resilience_tests.control.profile import EnvProfile, Node
 from resilience_tests.execution.workload.hooks import not_built_reason as workload_not_built_reason
+from resilience_tests.execution.workload.hooks import required_capabilities as workload_capabilities
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,8 @@ def expand(catalog: Catalog, profile: EnvProfile, *, reference_env_class: str,
             continue
         # A scenario is only meaningful against an engine that can support it. Skipping with a
         # reason beats measuring something the engine cannot do (Arch §8).
-        missing = sorted(set(sc.requires) - engine_can)
+        # ...including what the scenario's workload profile needs (e.g. tpcc_workload)
+        missing = sorted((set(sc.requires) | workload_capabilities(sc.workload)) - engine_can)
         if missing:
             skipped.append(Skipped(sid, f"engine {engine!r} lacks {', '.join(missing)}"))
             continue

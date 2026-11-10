@@ -55,7 +55,7 @@ from resilience_tests.execution.probes.probers import DiskUsageProber, LogTailer
 from resilience_tests.execution.remote import run_once
 from resilience_tests.execution.workload.driver import MeasuredWindow, WorkloadDriver
 from resilience_tests.execution.workload.history_writer import HistoryWriter
-from resilience_tests.execution.workload.hooks import NoProfileHooks, hooks_for
+from resilience_tests.execution.workload.hooks import NoProfileHooks, hooks_for, required_capabilities
 from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals
 from resilience_tests.observability.event_stream import EventStream
 
@@ -315,6 +315,12 @@ class TestOrchestrator:
             # the run plan skips these too; refused here before anything is applied, so a direct
             # run can never report a pass for a fault it did not inject
             raise PhaseAbort(not_built)
+        # the workload profile's own engine needs (the run plan skips these too)
+        workload_missing = sorted(required_capabilities(self.scenario.workload)
+                                  - {c.value for c in self.adapter.capabilities})
+        if workload_missing:
+            raise PhaseAbort(f"engine {self.adapter.engine!r} lacks {', '.join(workload_missing)}, "
+                             f"which workload profile {self.scenario.workload.profile!r} needs")
         lacking = missing_infra(self.scenario, self.profile)
         if lacking:
             # the run plan skips these; refused here too, so a direct run cannot measure a

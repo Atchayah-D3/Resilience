@@ -30,6 +30,7 @@ class Capability(str, Enum):
     PAGE_CHECKSUMS = "page_checksums"
     DURABILITY_SETTINGS = "durability_settings"
     LIST_APPEND_HISTORY = "list_append_history"
+    TPCC_WORKLOAD = "tpcc_workload"
 
 
 class TransactionOutcome(str, Enum):
@@ -462,7 +463,24 @@ class CorruptionSupport:
         return []
 
 
-class BaseDatabaseAdapter(CoreAdapter, SessionFaultSupport, OperationSupport, CorruptionSupport):
+class TpccSupport:
+    """The TPC-C-like workload (docs/tpcc-workload-proposal.md): its tables in the harness's own
+    schema (contract.TPCC_SCHEMA), its loader, its five server-side functions and its
+    consistency checks. All TPC-C SQL lives in the engine's adapter (constitution V), so the
+    `tpcc` profile itself never sees SQL. An engine that implements this group declares
+    Capability.TPCC_WORKLOAD; until then the defaults refuse (TPC-C build steps 4-7)."""
+
+    async def tpcc_data_status(self) -> dict[str, Any]:
+        """Init (step 4): what is loaded -- {loaded, warehouses, loader_version, rows, ...} --
+        so the profile can refuse a run on missing, wrong-sized or changed data."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+    async def tpcc_consistency(self, rules: Sequence[int], customer_sample: int | None = None) -> dict[int, int]:
+        """Validate (step 7): TPC-C consistency rules (Clause 3.3.2) -> number of violations each."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+
+class BaseDatabaseAdapter(CoreAdapter, SessionFaultSupport, OperationSupport, CorruptionSupport, TpccSupport):
     """Per-engine implementation: the core plus every fault-support interface, which is what
     the harness types against. Registered by engine name; selected by the env profile. An
     engine overrides what it supports; everything else keeps the interfaces' defaults, which
