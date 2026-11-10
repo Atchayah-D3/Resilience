@@ -99,8 +99,9 @@ async def _main(a: argparse.Namespace) -> int:
 
     if a.warehouses < 1:
         raise Refused("--warehouses must be at least 1")
-    print(f"loading {a.warehouses} warehouses with {a.jobs} parallel jobs "
-          f"(about {a.warehouses * 0.1:.0f} GB)...", flush=True)
+    jobs = min(a.jobs, a.warehouses)
+    print(f"loading {a.warehouses} warehouse(s) with {jobs} parallel job(s) "
+          f"(about {a.warehouses * 0.11:.1f} GB: about 105 MB per warehouse plus 13 MB of items)...", flush=True)
     result: dict[str, Any] = await adapter.tpcc_load(a.warehouses, jobs=a.jobs, replace=a.replace,
                                                      progress=lambda m: print("  " + m, flush=True), seed=a.seed)
     print(f"loaded {result['warehouses']} warehouses in {result['seconds']:.0f} s, size {_gb(result['size_bytes'])}")

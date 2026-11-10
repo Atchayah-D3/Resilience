@@ -90,6 +90,13 @@ def test_population_rules_of_clause_4_3_3_1(adapter, loaded):
     assert _sql(adapter, f"SELECT max(s_quantity) FROM {s}.stock") <= 100
 
 
+def test_python_and_sql_last_names_are_identical_for_all_1000_numbers(adapter, loaded):
+    """The clerks (Python, inputs.last_name) must look up exactly the names the loader (SQL) wrote."""
+    from resilience_tests.execution.workload.tpcc.inputs import last_name
+    sql = _sql(adapter, f"SELECT array_agg({TPCC_SCHEMA}.last_name(n) ORDER BY n) FROM generate_series(0, 999) n")
+    assert list(sql) == [last_name(n) for n in range(1000)]
+
+
 def test_status_reports_the_load(adapter, loaded):
     st = asyncio.run(adapter.tpcc_data_status())
     assert st["loaded"] and st["warehouses"] == 1 and st["items"] == data.ITEMS

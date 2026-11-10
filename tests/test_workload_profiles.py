@@ -78,8 +78,6 @@ def test_tpcc_is_not_built_so_it_is_refused():
 def test_every_skeleton_hook_refuses_and_names_its_build_step():
     p = TpccProfile(TPCC_WORKLOAD)
     calls = [
-        (5, lambda: p.terminal(0)),
-        (5, lambda: p.next_request(Terminal(0, "all"))),
         (6, lambda: asyncio.run(p.execute(None, Request("new_order"), None))),
         (7, lambda: asyncio.run(p.consistency_checks(None, Path(".")))),
     ]

@@ -35,6 +35,7 @@ class Terminal:
     worker_id: int
     group: str
     home: int | None = None          # TPC-C: the home warehouse
+    district: int | None = None      # TPC-C: the clerk's fixed district for Stock-Level (Clause 2.8.1.1)
 
 
 @dataclass(frozen=True)
