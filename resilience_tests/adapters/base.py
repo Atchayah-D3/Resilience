@@ -12,7 +12,7 @@ capability fails rather than passing on a measurement nobody took.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar
@@ -467,16 +467,29 @@ class TpccSupport:
     """The TPC-C-like workload (docs/tpcc-workload-proposal.md): its tables in the harness's own
     schema (contract.TPCC_SCHEMA), its loader, its five server-side functions and its
     consistency checks. All TPC-C SQL lives in the engine's adapter (constitution V), so the
-    `tpcc` profile itself never sees SQL. An engine that implements this group declares
-    Capability.TPCC_WORKLOAD; until then the defaults refuse (TPC-C build steps 4-7)."""
+    `tpcc` profile itself never sees SQL. An engine declares Capability.TPCC_WORKLOAD only when
+    it implements all of it (build step 6); until then the defaults refuse."""
 
-    async def tpcc_data_status(self) -> dict[str, Any]:
-        """Init (step 4): what is loaded -- {loaded, warehouses, loader_version, rows, ...} --
-        so the profile can refuse a run on missing, wrong-sized or changed data."""
+    async def tpcc_load(self, warehouses: int, *, jobs: int = 4, replace: bool = False,
+                        progress: Callable[[str], None] | None = None, seed: int | None = None) -> dict[str, Any]:
+        """Create and load the TPC-C data (Clause 4.3) with `warehouses` warehouses, check every
+        row count and consistency rule, and only then record the load. Returns what was loaded."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
-    async def tpcc_consistency(self, rules: Sequence[int], customer_sample: int | None = None) -> dict[int, int]:
-        """Validate (step 7): TPC-C consistency rules (Clause 3.3.2) -> number of violations each."""
+    async def tpcc_drop(self) -> bool:
+        """Remove every TPC-C object; True when nothing is left."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+    async def tpcc_data_status(self) -> dict[str, Any]:
+        """What is loaded -- {loaded, warehouses, items, loader_version, loaded_orders,
+        current_orders, ...} or {loaded: False, reason} -- so a run can refuse missing,
+        wrong-sized, grown or differently loaded data."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+    async def tpcc_consistency(self, rules: Sequence[int], district_sample: int | None = None,
+                               seed: int | None = None) -> dict[int, int]:
+        """TPC-C consistency rules (Clause 3.3.2) -> number of violations each. With a district
+        sample, the rules that read large tables look only at that many random districts."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
 

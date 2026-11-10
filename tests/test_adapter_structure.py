@@ -17,7 +17,7 @@ import inspect
 import pytest
 
 from resilience_tests.adapters import base
-from resilience_tests.adapters.postgresql import corruption, host, operations, sessions
+from resilience_tests.adapters.postgresql import corruption, host, operations, sessions, tpcc
 from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
 from tests.test_adapter_seam import FakeAdapter
 from tests.test_safety_ledger_profile import NODE
@@ -26,6 +26,7 @@ MIXINS = {
     sessions.SessionsMixin: base.SessionFaultSupport,
     operations.OperationsMixin: base.OperationSupport,
     corruption.CorruptionMixin: base.CorruptionSupport,
+    tpcc.TpccMixin: base.TpccSupport,
 }
 
 
@@ -46,7 +47,8 @@ def _self_uses(cls: type) -> set[str]:
 
 
 def test_the_interface_groups_do_not_overlap_and_make_up_the_adapter():
-    groups = (base.CoreAdapter, base.SessionFaultSupport, base.OperationSupport, base.CorruptionSupport)
+    groups = (base.CoreAdapter, base.SessionFaultSupport, base.OperationSupport, base.CorruptionSupport,
+              base.TpccSupport)
     seen: set[str] = set()
     for group in groups:
         mine = _declared(group) - {"_abc_impl"}
