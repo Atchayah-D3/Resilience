@@ -233,6 +233,13 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
         result = await self.tpcc_order_check(orders)
         return result["missing"] + result["incomplete"]
 
+    async def tpcc_record_capacity(self, tps: float) -> None:
+        conn = await self._connect(timeout_s=10.0)
+        try:
+            await conn.execute(f"UPDATE {TPCC_META} SET capacity_tps = $1", tps)
+        finally:
+            await conn.close()
+
     async def tpcc_install_functions(self) -> None:
         conn = await self._connect(timeout_s=10.0)
         try:

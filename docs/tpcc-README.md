@@ -1,8 +1,8 @@
 # TPC-C-like workload: what is built so far
 
-Date: 10 November 2026
+Date: 11 November 2026
 Branch: `tpcc-workload`
-Status: **steps 0 to 7 of 11 built and tested; about 60% of the work is done.** TPC-C runs, and can be used in fault scenarios.
+Status: **steps 0 to 8 of 11 built and tested; about 70% of the work is done.** TPC-C runs, can be used in fault scenarios, and can create heavy load across several processes.
 
 This document explains, in plain words, what has been built for the TPC-C-like workload, how
 it was checked, and what is left. The design and the plan are in:
@@ -44,8 +44,8 @@ model of such a load. We build a **TPC-C-like workload inside the existing harne
 | 5 | TPC-C inputs (NURand, the deck of 23 cards, the inputs of each transaction, clerk placement) | ✔ built and tested (pure code, nothing to run on the lab) |
 | 6 | The 5 TPC-C transactions as database functions, and the engine that sends them | ✔ built, tested, **trial passed on the lab** (new target BDB-QA-U22-3: 198 of 200 TPS, p99 10.5 ms) |
 | 7 | RPO and atomicity checks after a fault | ✔ built and tested (including a real crash locally); live kill on the lab waits for sudo on the new target |
-| 8 | Heavy load: worker processes, capacity test | next |
-| 9 | Data reset between scenarios, sdbPool | to do |
+| 8 | Heavy load: worker processes, merged numbers, driver-limited guard, capacity test | ✔ built and tested (including real worker processes against a real database); lab check next |
+| 9 | Data reset between scenarios, sdbPool | next |
 | 10 | HammerDB cross-check, switching the noisy-neighbour scenarios | to do |
 | 11 | Optional clean-up: one engine for all workloads | later, optional |
 
@@ -53,15 +53,16 @@ model of such a load. We build a **TPC-C-like workload inside the existing harne
 
 | Measure | Done |
 |---|---|
-| steps | 8 of 11 (steps 0 to 7) |
-| effort | **about 60%**: still ahead: step 8 (heavy load), step 9 (reset, sdbPool) and step 10 (cross-check, switching the scenarios) |
+| steps | 9 of 11 (steps 0 to 8) |
+| effort | **about 70%**: still ahead: step 9 (reset, sdbPool) and step 10 (cross-check, switching the scenarios) |
 | risk | the biggest risk, whether Python can create enough load, is removed (step 0) |
 
 **What exists now:** TPC-C runs: the five transactions in the database, the engine that sends
 them with the harness's journals and samples (step 6), the inputs (step 5), the data (step 4), the
 registry (step 3) and the fields and names the scenarios need (steps 1 and 2).
-**What is still missing:** heavy load across several processes and the capacity test (step 8),
-the data reset and sdbPool (step 9), and switching the noisy-neighbour scenarios to TPC-C (step 10).
+Heavy load across several worker processes and the capacity test are built (step 8).
+**What is still missing:** the data reset and sdbPool (step 9), and switching the noisy-neighbour
+scenarios to TPC-C (step 10).
 
 ---
 
@@ -279,6 +280,43 @@ ShaktiDB in which four atomicity failures made by hand are each found with the r
 transactions in flight), 0 partial commits, 0 rolled back but kept, 0 consistency violations, and
 872 orders created = 872 New-Orders whose marker survived.
 
+### Step 8: Heavy load (several worker processes) and the capacity test
+
+**Why:** one Python process uses one CPU core, which is enough for about 2,000 TPC-C transactions
+per second (the speed test measured about 4,800 at full use; we plan with a safety margin). The
+noisy-neighbour scenarios need more, so the load is spread over several processes. And a scenario
+must never measure the harness instead of the database.
+
+**What:**
+
+| Part | What it does |
+|---|---|
+| **worker processes** (`tpcc/coordinator.py`) | above 2,000 TPS asked, the harness starts one worker process per 2,000 TPS (at most one per clerk, and one core is left free). Each runs the step 6 engine for its share of the clerks and of the rate, and writes **its own journals** (`marker.0.jrnl`, `acked.0.jrnl`, `aborted.0.jrnl`, then `.1.`, ...). At 200 TPS (today's scenarios) nothing changes: one process, as before |
+| **exact combined numbers** (`tpcc/samples.py`) | every second, each process sends its raw numbers: counts and **every single response time**. The coordinator merges them into one sample. Percentiles (p50, p95, p99) are taken over all response times together, never averaged: the average of two p99 values is not the p99 of all transactions |
+| **the same seconds** | every process ends its 1-second intervals on the same whole second of the machine's clock, so one sample covers the same real second in every process (important around a crash, where RTO is measured) |
+| **the driver-limited guard** | every second, each process's CPU use and how late its timer is are recorded (`driver_load` events). If a process uses 95% or more of a core, or its timer is 0.5 s or more late, for 5 seconds in a row, the run is **stopped as invalid**: the harness, not the database, is the limit. A slow database does not trigger it: clerks waiting for the database use no CPU |
+| **a worker process that dies** | the run is stopped with the reason; its clerks' load silently missing would make a false baseline |
+| **graceful stop** | at the end, each clerk finishes the transaction it is running (at most 5 s), and the last part-second is written as a final sample. So **the sample totals equal the journals exactly**, and fewer transactions end as "unknown" merely because the run ended |
+| **the capacity test** (`tpcc/capacity.py`) | raises the rate in steps (200, ×1.5, ...), 30 s each. A step "kept up" when the database delivered at least 95% of the rate asked **and** TPC-C's response-time rule held (90% of transactions within 5 s; Stock-Level 20 s; Clause 5.2.5.3). The capacity is the best step that kept up; it is stored in the database (`resilience_tpcc.meta`). If the harness was the limit, only a lower bound is reported, never a capacity |
+| the trial command | new option `--processes N`; it now reads every journal file, and fails if fewer orders were checked than New-Orders committed |
+
+**Not built (waiting for a decision):** a scenario rate given as a share of the capacity
+(`rate_fraction_of_capacity`, Framework §7.5). The capacity is measured and stored, ready for it.
+
+**Tests:** 9 for merging and the guard (percentiles from all response times, totals, each process's
+own interval, groups, how many processes, fair split of clerks, the guard firing only after 5 busy
+seconds, a slow database not firing it); 6 for the capacity test's decisions; 1 for the journal
+names; 2 against a real database: **3 worker processes** (RPO 0, nothing rolled back kept, every
+acknowledged order complete, all rules hold, every second has all 3 processes, sample totals =
+journal lines exactly) and **a worker process killed** (the run stops with the reason). Local
+command checks: a 3-process trial passed every check; the capacity test found the laptop database's
+maximum (509 TPS) and stored it, with the worker processes at 26 to 47% of a core.
+
+**Two fixes found by the new tests** (in step 6 code): the last part-second of transactions was not
+in any sample (nothing lost; the journals were complete, only the sample totals were short), and the
+stop could cut a transaction between its "confirmed" journal line and its count. Both fixed by the
+graceful stop.
+
 ---
 
 ## 4. Live verification on the lab
@@ -352,6 +390,10 @@ RESILIENCE_TEST_PG=<host>:<port>/<database>/<user> .venv/bin/python -m pytest te
 
 # a trial of the TPC-C engine on a target (step 6): real load, no fault, then every check
 .venv/bin/python -m resilience_tests.execution.workload.tpcc.trial --env <env> --clerks 16 --rate 200 --seconds 60
+#   --processes 3 runs the same trial in 3 worker processes (step 8)
+
+# the capacity test (step 8): the target's maximum TPS, stored in resilience_tpcc.meta
+.venv/bin/python -m resilience_tests.execution.workload.tpcc.capacity --env <env> --clerks 64
 
 # the speed test (step 0)
 .venv/bin/python -m tools.tpcc_speedtest all --env <env> --target-max-tps <maximum TPS of the target>
@@ -377,13 +419,16 @@ RESILIENCE_TEST_PG=<host>:<port>/<database>/<user> .venv/bin/python -m pytest te
 | `resilience_tests/execution/workload/tpcc/engine.py` | 6 | the TPC-C engine (one process) |
 | `resilience_tests/execution/workload/tpcc/trial.py` | 6 | the trial command |
 | `resilience_tests/execution/workload/tpcc/checks.py` | 7 | the checks after a fault |
+| `resilience_tests/execution/workload/tpcc/coordinator.py` | 8 | several worker processes |
+| `resilience_tests/execution/workload/tpcc/samples.py` | 8 | merging the numbers; the driver-limited guard |
+| `resilience_tests/execution/workload/tpcc/capacity.py` | 8 | the capacity test |
 | `envs/e2-u22-3.yaml` | lab | the new target BDB-QA-U22-3 |
 | `resilience_tests/adapters/postgresql/sql/tpcc_functions.sql` | 6 | the five transactions |
 | `resilience_tests/execution/workload/tpcc/data.py` | 4 | expected sizes and the checks of the loaded data |
 | `resilience_tests/execution/workload/tpcc/load.py` | 4 | the load command |
 | `resilience_tests/adapters/postgresql/tpcc.py` | 4 | loading, status, consistency, drop |
 | `resilience_tests/adapters/postgresql/sql/tpcc_*.sql` | 4 | tables, indexes, loader, consistency rules |
-| `tests/test_workload_contract.py`, `test_workload_additions.py`, `test_workload_profiles.py`, `test_tpcc_data.py`, `test_tpcc_load_db.py`, `test_tpcc_inputs.py`, `test_tpcc_engine.py`, `test_tpcc_functions_db.py`, `test_tpcc_checks.py`, `test_tpcc_speedtest.py` | 0 to 7 | the tests |
+| `tests/test_workload_contract.py`, `test_workload_additions.py`, `test_workload_profiles.py`, `test_tpcc_data.py`, `test_tpcc_load_db.py`, `test_tpcc_inputs.py`, `test_tpcc_engine.py`, `test_tpcc_functions_db.py`, `test_tpcc_checks.py`, `test_tpcc_speedtest.py`, `test_tpcc_samples.py`, `test_tpcc_capacity.py` | 0 to 8 | the tests |
 
 ---
 
@@ -391,6 +436,5 @@ RESILIENCE_TEST_PG=<host>:<port>/<database>/<user> .venv/bin/python -m pytest te
 
 | Step | What | Checkpoint |
 |---|---|---|
-| 8 | worker processes, merged statistics, the driver-limited guard, the capacity test | the capacity test reaches the database's maximum without the harness being the limit |
 | 9 | data reset between scenarios, sdbPool | the reset gives back correct data |
 | 10 | HammerDB cross-check; the noisy-neighbour scenarios switch to `profile: tpcc` | numbers within the agreed range; every switched scenario passes |

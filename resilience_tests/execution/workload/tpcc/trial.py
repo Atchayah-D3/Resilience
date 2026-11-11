@@ -35,7 +35,14 @@ from resilience_tests.adapters import postgresql  # noqa: F401  (registers the a
 from resilience_tests.adapters.base import adapter_for
 from resilience_tests.control.profile import load_profile
 from resilience_tests.execution.workload import contract
-from resilience_tests.execution.workload.markers import ABORTED_JOURNAL, ACKED_JOURNAL, MarkerJournals, diff_from_journals, read_journal
+from resilience_tests.execution.workload.markers import (
+    ABORTED_JOURNAL,
+    ACKED_JOURNAL,
+    MarkerJournals,
+    diff_from_journals,
+    journal_paths,
+    read_journal,
+)
 from resilience_tests.execution.workload.tpcc import inputs
 from resilience_tests.execution.workload.tpcc.load import Refused, check_target
 from resilience_tests.execution.workload.tpcc.profile import TpccProfile
@@ -80,7 +87,9 @@ def verdicts(summary: dict[str, Any]) -> list[tuple[str, bool, str]]:
         ("RPO 0, no phantom", summary.get("rpo_txn") == 0 and summary.get("phantom") == 0,
          f"lost {summary.get('rpo_txn')}, phantom {summary.get('phantom')}"),
         ("no rolled-back transaction kept", summary.get("aborted_kept") == 0, f"{summary.get('aborted_kept')}"),
-        ("every acknowledged New-Order complete", summary.get("orders_incomplete") == 0,
+        ("every acknowledged New-Order complete",
+         summary.get("orders_incomplete") == 0
+         and (summary.get("orders_checked") or 0) >= summary["commits"].get(contract.NEW_ORDER, 0) > 0,
          f"{summary.get('orders_checked')} checked, {summary.get('orders_incomplete')} incomplete"),
         ("consistency rules 1-10, 12 hold", bool(summary.get("rules")) and not any(summary["rules"].values()),
          json.dumps(summary.get("rules"))),
@@ -102,6 +111,7 @@ def _args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--rate", type=float, default=200.0, help="declared TPS (all types together)")
     ap.add_argument("--seconds", type=float, default=60.0)
     ap.add_argument("--lock-timeout", help="session setting for every clerk, e.g. 5s")
+    ap.add_argument("--processes", type=int, help="worker processes (default: by rate, one per 2,000 TPS)")
     ap.add_argument("--out", help="evidence folder (default: <driver_host.run_dir>/tpcc-trial-<time>)")
     return ap.parse_args(argv)
 
@@ -130,7 +140,7 @@ async def _main(a: argparse.Namespace) -> int:
     profile = TpccProfile(w)
     prepared = await profile.prepare(adapter)
     stream, journals = EventStream(out / "events.jsonl"), MarkerJournals(out)
-    drv = profile.make_driver(adapter, journals, stream)
+    drv = profile.make_driver(adapter, journals, stream, processes=a.processes)
     await drv.start()
     await asyncio.wait_for(drv.wait_until_ready(), 30)
     drv.begin_window()
@@ -145,11 +155,13 @@ async def _main(a: argparse.Namespace) -> int:
 
     samples = [e.data for e in stream.events() if e.kind == "sample"]
     summary = summarize(samples, window.duration_s, a.rate)
-    summary.update({"p50_ms": window.p50_ms, "p99_ms": window.p99_ms, "prepare": prepared})
+    summary.update({"p50_ms": window.p50_ms, "p99_ms": window.p99_ms, "prepare": prepared,
+                    "processes": getattr(drv, "processes", 1)})
     db = await adapter.marker_ids()
     diff, torn = diff_from_journals(out, db)
-    aborted = read_journal(out / ABORTED_JOURNAL).records if (out / ABORTED_JOURNAL).exists() else []
-    orders = [r for r in read_journal(out / ACKED_JOURNAL).records if "o_id" in r]
+    # every journal file: one per worker process when the engine ran in several processes
+    aborted = [r for p in journal_paths(out, ABORTED_JOURNAL) for r in read_journal(p).records]
+    orders = [r for p in journal_paths(out, ACKED_JOURNAL) for r in read_journal(p).records if "o_id" in r]
     incomplete = await adapter.tpcc_orders_incomplete(orders)
     summary.update({"rpo_txn": diff.rpo_txn if not torn else None, "phantom": len(diff.phantom),
                     "indeterminate_txn": len(diff.indeterminate), "aborted_kept": len({r["uuid"] for r in aborted} & db),
@@ -157,7 +169,10 @@ async def _main(a: argparse.Namespace) -> int:
                     "rules": await adapter.tpcc_consistency([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])})
     checks = verdicts(summary)
     (out / "summary.json").write_text(json.dumps({"summary": summary, "checks": checks}, indent=2, default=str) + "\n")
-    print(f"\n{window.tps:.0f} TPS, p50 {summary['p50_ms']:.1f} ms, p99 {summary['p99_ms']:.1f} ms")
+    load = [e.data for e in stream.events() if e.kind == "driver_load"]
+    summary["max_cpu_share"] = max((c for d in load for c in d["cpu_share"]), default=None)
+    print(f"\n{window.tps:.0f} TPS, p50 {summary['p50_ms']:.1f} ms, p99 {summary['p99_ms']:.1f} ms, "
+          f"{summary['processes']} worker process(es), busiest at {summary['max_cpu_share'] or 0:.0%} of a core")
     for name, ok, detail in checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")
     passed = all(ok for _, ok, _ in checks)

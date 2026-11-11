@@ -11,6 +11,8 @@ so it may be used for real fault runs. Build steps (docs/tpcc-build-plan.md):
 
 from __future__ import annotations
 
+import json
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,7 @@ from resilience_tests.execution.workload.markers import (
     read_journal,
 )
 from resilience_tests.execution.workload.tpcc import checks, data, inputs
+from resilience_tests.execution.workload.tpcc.samples import choose_processes
 from resilience_tests.execution.workload.tpcc.terminals import place_clerks
 from resilience_tests.execution.workload.profiles.base import (
     Request,
@@ -135,11 +138,17 @@ class TpccProfile(WorkloadProfile):
         outcome, journal, sqlstate = await session.tpcc_execute(request.txn_type, request.inputs, marker)
         return Result(outcome=outcome, journal=journal, sqlstate=sqlstate)
 
-    def make_driver(self, adapter: Any, journals: Any, stream: Any) -> Any:
+    def make_driver(self, adapter: Any, journals: Any, stream: Any, processes: int | None = None) -> Any:
+        """One process (engine.py) up to samples.PLANNED_TPS_PER_PROCESS; above it, several
+        worker processes under a coordinator (step 8). `processes` overrides the choice."""
+        from resilience_tests.execution.workload.tpcc.coordinator import TpccCoordinator
         from resilience_tests.execution.workload.tpcc.engine import TpccWorkloadDriver
         if self.constants is None:
             raise RuntimeError("the run's NURand constants are not set: prepare() must run first")
-        return TpccWorkloadDriver(adapter, self.workload, journals, stream, self)
+        n = processes or choose_processes(self.workload.rate_tps, self.workload.concurrency, os.cpu_count() or 1)
+        if n <= 1:
+            return TpccWorkloadDriver(adapter, self.workload, journals, stream, self)
+        return TpccCoordinator(adapter, self.workload, journals, stream, self, n)
 
     async def consistency_checks(self, adapter: Any, run_dir: Path) -> dict[str, Any]:
         """Validate: label every write transaction from the evidence (tpcc/checks.py) and return
@@ -186,7 +195,35 @@ class TpccProfile(WorkloadProfile):
             orders_after=(status or {}).get("current_orders"),
             rules=rules, torn_aborted_lines=torn)
         measures, facts, reasons = checks.evaluate(ev)
+        # context only: a driver-limited run already stopped with the workload's failure (abort)
+        facts["driver_load"] = _driver_load(run_dir / "events.jsonl") or "the run's events could not be read"
         if problems:
             facts["errors"] = problems
             reasons = {m: f"{why} ({'; '.join(problems)})" for m, why in reasons.items()}
         return {**measures, "_facts": facts, "_not_measured": reasons}
+
+
+def _driver_load(events: Path) -> dict[str, Any] | None:
+    """From the run's events: was the harness ever the limit, and how busy were its processes."""
+    try:
+        lines = events.read_text().splitlines()
+    except OSError:
+        return None
+    limited, max_cpu, max_lag, processes = False, 0.0, 0.0, 1
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("source") != "workload":
+            continue
+        d = e.get("data", {})
+        if e.get("kind") == "driver_load":
+            max_cpu = max([max_cpu, *d.get("cpu_share", [])])
+            max_lag = max([max_lag, *d.get("loop_lag_s", [])])
+        elif e.get("kind") == "fatal" and d.get("driver_limited"):
+            limited = True
+        elif e.get("kind") == "start":
+            processes = d.get("processes", 1)
+    return {"driver_limited": limited, "max_cpu_share": round(max_cpu, 3), "max_loop_lag_s": round(max_lag, 3),
+            "processes": processes}

@@ -233,8 +233,8 @@ def _sample(no=99, p=99, os_=10, d=10, sl=10, no_business=1, errors=0, indetermi
 def _checked(**changes):
     samples = [_sample(**changes) for _ in range(60)]
     s = trial.summarize(samples, 60.0, 228.0)
-    s.update({"rpo_txn": 0, "phantom": 0, "aborted_kept": 0, "orders_checked": 600, "orders_incomplete": 0,
-              "rules": {1: 0, 4: 0}})
+    s.update({"rpo_txn": 0, "phantom": 0, "aborted_kept": 0, "orders_checked": s["commits"]["new_order"],
+              "orders_incomplete": 0, "rules": {1: 0, 4: 0}})
     return {name: ok for name, ok, _ in trial.verdicts(s)}, s
 
 
@@ -258,9 +258,19 @@ def test_trial_fails_for_each_reason():
     assert not {n: ok for n, ok, _ in trial.verdicts({**s, "rules": {}})}["consistency rules 1-10, 12 hold"]
 
 
+def test_trial_fails_when_fewer_orders_were_checked_than_new_orders_committed():
+    # Step 8: with several worker processes the orders are in acked.<n>.jrnl; a trial that read
+    # only acked.jrnl would check 0 orders and find 0 incomplete -- that must fail, not pass.
+    s = _checked()[1]
+    for checked in (0, s["commits"]["new_order"] - 1):
+        assert not {n: ok for n, ok, _ in trial.verdicts({**s, "orders_checked": checked})}[
+            "every acknowledged New-Order complete"], checked
+
+
 def _verdicts(samples, seconds=10.0, rate=1.0):
     s = trial.summarize(samples, seconds, rate)
-    s.update({"rpo_txn": 0, "phantom": 0, "aborted_kept": 0, "orders_checked": 1, "orders_incomplete": 0, "rules": {1: 0}})
+    s.update({"rpo_txn": 0, "phantom": 0, "aborted_kept": 0, "orders_checked": s["commits"]["new_order"],
+              "orders_incomplete": 0, "rules": {1: 0}})
     return {n: ok for n, ok, _ in trial.verdicts(s)}
 
 

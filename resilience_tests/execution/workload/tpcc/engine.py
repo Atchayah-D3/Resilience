@@ -1,4 +1,6 @@
-"""The TPC-C engine in one process (TPC-C build step 6; several processes follow in step 8).
+"""The TPC-C engine in one process (TPC-C build step 6). With several processes (step 8,
+coordinator.py) each process runs one of these for its share of the clerks and the rate, and
+hands its raw numbers to the coordinator instead of writing samples itself.
 
 It offers the same interface as the custom workload's driver (contract.WorkloadDriverContract),
 so the orchestrator, the phases and the analysis use it unchanged. Per clerk and transaction:
@@ -23,8 +25,10 @@ Latency is recorded for every attempt, committed or not, as the custom driver do
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import Counter
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from catalog.schema import Workload
@@ -36,37 +40,51 @@ from resilience_tests.execution.workload.driver import (
     TXN_TIMEOUT_S,
     MeasuredWindow,
     RateLimiter,
-    _group_stats,
     _Window,
     percentile,
     p99,
 )
+from resilience_tests.execution.workload.tpcc.samples import DriverLoadWatch, merge_raws
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.execution.workload.profiles.base import Request, Terminal, WorkloadProfile
 from resilience_tests.observability.event_stream import EventStream
 
 SAMPLE_INTERVAL_S = 1.0
+STOP_GRACE_S = 5.0          # at stop, each clerk may finish its running transaction for this long
 
 
 class TpccWorkloadDriver:
     def __init__(self, adapter: BaseDatabaseAdapter, workload: Workload, journals: MarkerJournals,
-                 stream: EventStream, profile: WorkloadProfile) -> None:
+                 stream: EventStream | None, profile: WorkloadProfile, *,
+                 worker_ids: Sequence[int] | None = None, rate_tps: float | None = None,
+                 raw_sink: Callable[[dict[str, Any]], None] | None = None) -> None:
+        """One process: all clerks, the scenario's rate, samples written to `stream`. One of
+        several processes (coordinator.py): `worker_ids` (its clerks), `rate_tps` (its share of
+        the rate) and `raw_sink` (where its raw numbers go each interval)."""
         if workload.tpcc is None:
             raise ValueError("the TPC-C engine needs workload.tpcc")
+        if stream is None and raw_sink is None:
+            raise ValueError("the TPC-C engine needs a stream or a raw sink")
         self.adapter = adapter
         self.workload = workload
         self.journals = journals
         self.stream = stream
+        self.raw_sink = raw_sink
         self.profile = profile
-        self.limiter = RateLimiter(workload.rate_tps)
+        self.limiter = RateLimiter(workload.rate_tps if rate_tps is None else rate_tps)
         self.session_settings = dict(workload.session)
-        self.terminals: list[Terminal] = [profile.terminal(i) for i in range(workload.concurrency)]
+        ids = list(range(workload.concurrency)) if worker_ids is None else list(worker_ids)
+        self.terminals: dict[int, Terminal] = {i: profile.terminal(i) for i in ids}
+        self.load_watch = DriverLoadWatch()
+        self._seq = 0
+        self._last_t: float | None = None
+        self._cpu_last = 0.0
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         self._window = _Window()
         self._types = {t: _Window() for t in contract.TPCC_TYPES}
         self._business = Counter()
-        self._groups = {g: _Window() for g in dict.fromkeys(t.group for t in self.terminals)}
+        self._groups = {g: _Window() for g in dict.fromkeys(t.group for t in self.terminals.values())}
         self._measure: _Window | None = None
         self._measure_t0 = 0.0
         self.window_t0_ns = 0
@@ -76,14 +94,14 @@ class TpccWorkloadDriver:
     # --- the driver interface (contract.WorkloadDriverContract) ----------------------------
 
     async def start(self) -> None:
-        self.stream.emit("workload", "start", profile=self.workload.profile, concurrency=self.workload.concurrency,
-                         rate_tps=self.workload.rate_tps, warehouses=self.workload.tpcc.warehouses)
-        self._tasks = [asyncio.create_task(self._worker(i), name=f"tpcc-clerk-{i}")
-                       for i in range(self.workload.concurrency)]
+        if self.stream is not None:
+            self.stream.emit("workload", "start", profile=self.workload.profile, concurrency=self.workload.concurrency,
+                             rate_tps=self.workload.rate_tps, warehouses=self.workload.tpcc.warehouses, processes=1)
+        self._tasks = [asyncio.create_task(self._worker(i), name=f"tpcc-clerk-{i}") for i in self.terminals]
         self._tasks.append(asyncio.create_task(self._sampler(), name="tpcc-sampler"))
 
     async def wait_until_ready(self, poll_s: float = 0.1) -> None:
-        while self.connected_workers < self.workload.concurrency and self.failure is None:
+        while self.connected_workers < len(self.terminals) and self.failure is None:
             await asyncio.sleep(poll_s)
 
     def begin_window(self) -> None:
@@ -104,11 +122,22 @@ class TpccWorkloadDriver:
             connect_failures=w.connect_failures, p50_ms=percentile(lat, 0.50), p95_ms=percentile(lat, 0.95))
 
     async def stop(self) -> None:
+        """Graceful: no new transaction starts; each clerk finishes the one it is running, for at
+        most STOP_GRACE_S (a clerk stuck on a database that does not answer is then cancelled,
+        and its transaction stays unknown). So a transaction is not cut between its
+        acknowledgement line and its count, and fewer end as unknown merely because the run ended."""
         self._stop.set()
-        for t in self._tasks:
+        clerks, others = self._tasks[:-1], self._tasks[-1:]
+        for t in others:
             t.cancel()
+        if clerks:
+            _done, pending = await asyncio.wait(clerks, timeout=STOP_GRACE_S)
+            for t in pending:
+                t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        self.stream.emit("workload", "stop")
+        self._publish_last_interval()
+        if self.stream is not None:
+            self.stream.emit("workload", "stop")
 
     # --- clerks ----------------------------------------------------------------------------------
 
@@ -118,10 +147,14 @@ class TpccWorkloadDriver:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 -- the measuring instrument failed: recorded, the run aborts
-            if self.failure is None:
-                self.failure = f"tpcc clerk {worker_id}: {type(exc).__name__}: {exc}"
-                self.stream.emit("workload", "fatal", worker=worker_id, error=self.failure)
-            self._stop.set()
+            self._fail(f"tpcc clerk {worker_id}: {type(exc).__name__}: {exc}", worker=worker_id)
+
+    def _fail(self, why: str, **detail: Any) -> None:
+        if self.failure is None:
+            self.failure = why
+            if self.stream is not None:
+                self.stream.emit("workload", "fatal", error=why, **detail)
+        self._stop.set()
 
     async def _connect(self) -> DatabaseSession:
         if self.session_settings:
@@ -159,6 +192,8 @@ class TpccWorkloadDriver:
 
     async def _one_transaction(self, session: DatabaseSession, terminal: Terminal) -> DatabaseSession | None:
         await self.limiter.acquire()
+        if self._stop.is_set():                 # stopping: start nothing new
+            return session
         req: Request = self.profile.next_request(terminal)
         marker: tuple[int, str] | None = None
         journal_ms = 0.0
@@ -231,31 +266,67 @@ class TpccWorkloadDriver:
                 w.journal_ms.append(journal_ms)
 
     async def _sampler(self) -> None:
-        """One sample per interval, over the interval actually measured (as the custom driver)."""
-        last = time.monotonic()
+        """One interval at a time, over the interval actually measured (as the custom driver):
+        the raw numbers, this process's CPU use and loop delay, then a sample (one process) or a
+        hand-over to the coordinator (several). The driver-limited guard watches every interval."""
+        self._last_t = last = time.monotonic()
+        self._cpu_last = cpu_last = time.process_time()
         while not self._stop.is_set():
-            await asyncio.sleep(SAMPLE_INTERVAL_S)
-            now = time.monotonic()
+            if self.raw_sink is not None:
+                # one of several processes: end every interval on a whole second of the system's
+                # monotonic clock (shared by all processes), so the coordinator merges the same
+                # real second of every process
+                target = (math.floor(last / SAMPLE_INTERVAL_S) + 1) * SAMPLE_INTERVAL_S
+                await asyncio.sleep(max(0.0, target - time.monotonic()))
+            else:
+                target = last + SAMPLE_INTERVAL_S
+                await asyncio.sleep(SAMPLE_INTERVAL_S)
+            now, cpu_now = time.monotonic(), time.process_time()
             elapsed, last = now - last, now
-            w, self._window = self._window, _Window()
-            types, self._types = self._types, {t: _Window() for t in contract.TPCC_TYPES}
-            business, self._business = self._business, Counter()
-            groups, self._groups = self._groups, {g: _Window() for g in self._groups}
-            lat = w.latencies_ms or []
-            self.stream.emit(
-                "workload", "sample", interval_s=elapsed, commits=w.commits,
-                tps=w.commits / elapsed if elapsed > 0 else 0.0,
-                p99_ms=p99(lat), journal_p99_ms=p99(w.journal_ms or []),
-                p50_ms=percentile(lat, 0.50), p95_ms=percentile(lat, 0.95),
-                errors=w.errors, indeterminate=w.indeterminate, drops=w.drops,
-                reconnects=w.reconnects, connect_failures=w.connect_failures,
-                **{contract.BY_TYPE: {t: _tpcc_type_stats(tw, elapsed, business[t]) for t, tw in types.items()},
-                   contract.BY_GROUP: {g: _group_stats(gw, elapsed) for g, gw in groups.items()}},
-            )
+            cpu_share, cpu_last = ((cpu_now - cpu_last) / elapsed if elapsed > 0 else 0.0), cpu_now
+            self._last_t, self._cpu_last = last, cpu_last
+            self._publish(self._raw_interval(elapsed, cpu_share, max(0.0, now - target)))
+            if self.stream is not None:
+                lag = max(0.0, now - target)
+                self.stream.emit("workload", "driver_load", cpu_share=[round(cpu_share, 3)], loop_lag_s=[round(lag, 3)])
+                limited = self.load_watch.update([cpu_share], [lag])
+                if limited:
+                    self._fail(limited, driver_limited=True)
 
+    def _publish(self, raw: dict[str, Any]) -> None:
+        if self.raw_sink is not None:
+            self.raw_sink(raw)
+        if self.stream is not None:
+            self.stream.emit("workload", "sample", **merge_raws([raw]))
 
-def _tpcc_type_stats(w: _Window, elapsed: float, business_rollbacks: int) -> dict[str, Any]:
-    lat = w.latencies_ms or []
-    return {"commits": w.commits, "tps": w.commits / elapsed if elapsed > 0 else 0.0,
-            "p90_ms": percentile(lat, 0.90), "p99_ms": p99(lat), "errors": w.errors,
-            "business_rollbacks": business_rollbacks}
+    def _publish_last_interval(self) -> None:
+        """At stop: the part-second since the last sample, so every acknowledged transaction is
+        in exactly one sample (the sample totals then equal the acknowledgement journal)."""
+        if self._last_t is None:
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_t
+        if elapsed <= 0:
+            return
+        cpu = (time.process_time() - self._cpu_last) / elapsed
+        self._last_t = None
+        self._publish(self._raw_interval(elapsed, cpu, 0.0))
+
+    def _raw_interval(self, elapsed: float, cpu_share: float, loop_lag_s: float) -> dict[str, Any]:
+        w, self._window = self._window, _Window()
+        types, self._types = self._types, {t: _Window() for t in contract.TPCC_TYPES}
+        business, self._business = self._business, Counter()
+        groups, self._groups = self._groups, {g: _Window() for g in self._groups}
+        self._seq += 1
+        return {
+            "seq": self._seq, "t_end_ns": time.monotonic_ns(),
+            "second": round(time.monotonic() / SAMPLE_INTERVAL_S), "elapsed": elapsed,
+            "cpu_share": cpu_share, "loop_lag_s": loop_lag_s,
+            "totals": {"commits": w.commits, "errors": w.errors, "indeterminate": w.indeterminate, "drops": w.drops,
+                       "reconnects": w.reconnects, "connect_failures": w.connect_failures},
+            "latencies": list(w.latencies_ms or []), "journal_ms": list(w.journal_ms or []),
+            "types": {t: {"commits": tw.commits, "errors": tw.errors, "business_rollbacks": business[t],
+                          "latencies": list(tw.latencies_ms or [])} for t, tw in types.items()},
+            "groups": {g: {"commits": gw.commits, "errors": gw.errors, "indeterminate": gw.indeterminate,
+                           "drops": gw.drops, "latencies": list(gw.latencies_ms or [])} for g, gw in groups.items()},
+        }

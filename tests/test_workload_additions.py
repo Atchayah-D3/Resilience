@@ -212,3 +212,30 @@ def test_a_missing_journal_is_an_error_never_a_perfect_rpo(files):
             _write(d / name, records)
         with pytest.raises(FileNotFoundError):
             diff_from_journals(d, ["a"])
+
+
+def test_each_worker_process_writes_its_own_journals_and_all_are_read(tmp_path):
+    """Step 8: MarkerJournals(index=n) writes marker.n.jrnl / acked.n.jrnl / aborted.n.jrnl;
+    without an index the names are exactly as before; journal_paths finds them all."""
+    import asyncio
+
+    from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals, journal_paths
+
+    async def go():
+        for idx in (None, 0, 1):
+            j = MarkerJournals(tmp_path, index=idx)
+            seq, uid = j.next_marker()
+            await j.written(seq, uid, 1.0)
+            await j.acknowledged(uid, 2.0)
+            await j.aborted("x" + uid, 3.0)
+            j.close()
+            yield uid
+    async def collect():
+        return [u async for u in go()]
+    uids = asyncio.run(collect())
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["aborted.0.jrnl", "aborted.1.jrnl", "aborted.jrnl", "acked.0.jrnl", "acked.1.jrnl",
+                     "acked.jrnl", "marker.0.jrnl", "marker.1.jrnl", "marker.jrnl"]
+    assert [p.name for p in journal_paths(tmp_path, "acked.jrnl")] == ["acked.jrnl", "acked.0.jrnl", "acked.1.jrnl"]
+    diff, torn = diff_from_journals(tmp_path, set(uids[:2]))         # the third process's commit is missing
+    assert torn == 0 and diff.rpo_txn == 1

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 from collections import Counter
 
@@ -317,7 +318,10 @@ def test_the_checks_after_a_fault_find_every_kind_of_half_saved_transaction(adap
     clean, facts, reasons = split_checks(asyncio.run(profile.consistency_checks(adapter, tmp_path)))
     assert reasons == {}, reasons
     assert clean["partial_commits"] == 0 and clean["aborted_markers_present"] == 0
-    assert clean["tpcc_consistency_violations"] == 0 and clean["indeterminate_txn"] == 0, (clean, facts)
+    assert clean["tpcc_consistency_violations"] == 0, (clean, facts)
+    # the stop cancels any transaction still in progress: each is "unknown" (never lost, never
+    # committed) -- exactly those written but neither confirmed nor rolled back, at most one per clerk
+    assert clean["indeterminate_txn"] == facts["written"] - facts["acked"] - facts["aborted"] <= 4, (clean, facts)
 
     acked = read_journal(tmp_path / "acked.jrnl").records
     orders = [r for r in acked if "o_id" in r]
@@ -348,3 +352,100 @@ def test_the_checks_after_a_fault_find_every_kind_of_half_saved_transaction(adap
     assert parts["unexplained_order_count"] == -1                       # case 4
     assert broken["partial_commits"] == 3                               # cases 1, 2 and 4
     assert broken["tpcc_consistency_violations"] > 0                    # rules 4 and 6 see case 1 too
+
+
+def test_several_worker_processes_lose_nothing_and_their_numbers_add_up(adapter, tmp_path):
+    """Step 8: the same engine in 3 worker processes under the coordinator (12 clerks, 450 TPS,
+    6 s) against the real database. Each process writes its own journals; the checks read them
+    all. Afterwards: RPO 0, no phantom, nothing rolled back kept, every acknowledged New-Order
+    complete, the rules hold, every sample has all 3 processes, and the sample totals equal the
+    acknowledgement journals (nothing counted twice or lost in the merge)."""
+    from resilience_tests.execution.workload.markers import (
+        ABORTED_JOURNAL, ACKED_JOURNAL, MarkerJournals, diff_from_journals, journal_paths, read_journal)
+    from resilience_tests.execution.workload.tpcc.coordinator import TpccCoordinator
+    from resilience_tests.observability.event_stream import EventStream
+
+    asyncio.run(adapter.tpcc_load(2, jobs=2, replace=True, seed=11))   # the step 7 test leaves broken data on purpose
+    asyncio.run(adapter.prepare_harness_state())
+    w = Workload(profile="tpcc", concurrency=12, transaction_markers=True, rate_tps=450, tpcc={"warehouses": 2})
+    profile = TpccProfile(w)
+    asyncio.run(profile.prepare(adapter))
+
+    async def go():
+        stream, journals = EventStream(tmp_path / "events.jsonl"), MarkerJournals(tmp_path)
+        drv = profile.make_driver(adapter, journals, stream, processes=3)
+        assert isinstance(drv, TpccCoordinator)
+        await drv.start()
+        await asyncio.wait_for(drv.wait_until_ready(), 60)
+        ready_s = time.monotonic()
+        drv.begin_window()
+        await asyncio.sleep(6)
+        window = drv.end_window()
+        stop_s = time.monotonic()
+        await drv.stop()
+        journals.close()
+        stream.close()
+        return drv, window, list(stream.events()), ready_s, stop_s
+
+    drv, window, events, ready_s, stop_s = asyncio.run(go())
+    assert drv.failure is None, drv.failure
+    assert window.tps > 300, window
+    assert len(journal_paths(tmp_path, ACKED_JOURNAL)) == 4              # acked.jrnl (empty) + one per process
+    db = asyncio.run(adapter.marker_ids())
+    diff, torn = diff_from_journals(tmp_path, db)
+    assert torn == 0 and diff.rpo_txn == 0 and not diff.phantom and not diff.unjournalled_ack
+    aborted = [r for p in journal_paths(tmp_path, ABORTED_JOURNAL) for r in read_journal(p).records]
+    assert aborted == [] or not ({r["uuid"] for r in aborted} & db)
+    acked = [r for p in journal_paths(tmp_path, ACKED_JOURNAL) for r in read_journal(p).records]
+    orders = [r for r in acked if "o_id" in r]
+    assert orders and asyncio.run(adapter.tpcc_orders_incomplete(orders)) == 0
+    rules = asyncio.run(adapter.tpcc_consistency([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]))
+    assert rules == {r: 0 for r in rules}, rules
+    samples = [e.data for e in events if e.kind == "sample"]
+    loads = [e.data for e in events if e.kind == "driver_load"]
+    start = next(e.data for e in events if e.kind == "start")
+    assert start["processes"] == 3 and start["clerks_per_process"] == [4, 4, 4]
+    # every second between "all processes ready" and the stop has all 3 processes (before it a
+    # process may still be starting; the stop's last part-second may come from some only)
+    inside = [d for d in loads if ready_s + 1 < d["second"] < stop_s - 1]
+    assert samples and len(inside) >= 4 and all(d["processes_reporting"] == 3 for d in inside), loads
+    # every committed write transaction is in a sample once: sample totals = acknowledgement journal lines
+    written = sum(s["by_type"][t]["commits"] for s in samples for t in (NEW_ORDER, PAYMENT, DELIVERY))
+    assert written == len(acked), (written, len(acked))
+    assert all(set(s["by_type"]) == {NEW_ORDER, PAYMENT, ORDER_STATUS, DELIVERY, STOCK_LEVEL} for s in samples)
+
+
+def test_a_worker_process_that_dies_stops_the_run(adapter, tmp_path):
+    """Step 8: if one worker process is killed, the coordinator records the failure (the
+    orchestrator then aborts the run): its clerks' load silently missing would be a false baseline."""
+    import os as _os
+    import signal
+
+    from resilience_tests.execution.workload.markers import MarkerJournals
+    from resilience_tests.observability.event_stream import EventStream
+
+    asyncio.run(adapter.tpcc_load(2, jobs=2, replace=True, seed=11))   # the step 7 test leaves broken data on purpose
+    asyncio.run(adapter.prepare_harness_state())
+    w = Workload(profile="tpcc", concurrency=4, transaction_markers=True, rate_tps=100, tpcc={"warehouses": 2})
+    profile = TpccProfile(w)
+    asyncio.run(profile.prepare(adapter))
+
+    async def go():
+        stream, journals = EventStream(tmp_path / "events.jsonl"), MarkerJournals(tmp_path)
+        drv = profile.make_driver(adapter, journals, stream, processes=2)
+        await drv.start()
+        await asyncio.wait_for(drv.wait_until_ready(), 60)
+        _os.kill(drv._procs[1].pid, signal.SIGKILL)
+        for _ in range(40):
+            if drv.failure:
+                break
+            await asyncio.sleep(0.25)
+        failure = drv.failure
+        await drv.stop()
+        journals.close()
+        stream.close()
+        return failure, list(stream.events())
+
+    failure, events = asyncio.run(go())
+    assert failure and "worker process 1 exited unexpectedly" in failure, failure
+    assert any(e.kind == "fatal" and e.data.get("worker_process") == 1 for e in events)

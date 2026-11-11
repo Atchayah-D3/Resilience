@@ -115,10 +115,13 @@ class MarkerJournals:
     are added to a line, e.g. the TPC-C transaction type, or the order number of a New-Order
     for the per-order check after a fault; without them each line is exactly as before."""
 
-    def __init__(self, run_dir: Path) -> None:
+    def __init__(self, run_dir: Path, index: int | None = None) -> None:
+        """`index`: one worker process of several writes marker.<index>.jrnl and so on (the
+        TPC-C engine in several processes); without it the names are exactly as before."""
         self.run_dir = run_dir
-        self.marker = DurableJournal(run_dir / MARKER_JOURNAL)
-        self.acked = DurableJournal(run_dir / ACKED_JOURNAL)
+        self._name = (lambda base: base) if index is None else (lambda base: base.replace(".jrnl", f".{index}.jrnl"))
+        self.marker = DurableJournal(run_dir / self._name(MARKER_JOURNAL))
+        self.acked = DurableJournal(run_dir / self._name(ACKED_JOURNAL))
         self._aborted: DurableJournal | None = None
         self._seq = 0
 
@@ -136,7 +139,7 @@ class MarkerJournals:
         """A sure rollback: the server answered that the transaction did not happen. Never
         written for an unknown outcome -- that stays a marker line with no other line."""
         if self._aborted is None:
-            self._aborted = DurableJournal(self.run_dir / ABORTED_JOURNAL)
+            self._aborted = DurableJournal(self.run_dir / self._name(ABORTED_JOURNAL))
         await self._aborted.append({"uuid": uuid, "t_abort": t_abort, **extra})
 
     def close(self) -> None:

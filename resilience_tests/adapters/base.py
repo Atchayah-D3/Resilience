@@ -503,6 +503,10 @@ class TpccSupport:
         have exactly ol_cnt lines. 0 = every one is complete."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
+    async def tpcc_record_capacity(self, tps: float) -> None:
+        """Store the target's measured maximum TPS (the capacity test, build step 8) in the meta row."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
     async def tpcc_install_functions(self) -> None:
         """Create or replace the five TPC-C transaction functions (before every run, so a newer
         harness brings its functions without reloading the data)."""
