@@ -138,7 +138,8 @@ def group_of_workers(workload: Workload) -> list[str]:
 def _type_stats(w: _Window, elapsed: float) -> dict:
     lat = w.latencies_ms or []
     return {"commits": w.commits, "tps": w.commits / elapsed if elapsed > 0 else 0.0,
-            "p90_ms": percentile(lat, 0.90), "p99_ms": p99(lat), "errors": w.errors,
+            "p50_ms": percentile(lat, 0.50), "p90_ms": percentile(lat, 0.90), "p99_ms": p99(lat),
+            "max_ms": max(lat) if lat else None, "errors": w.errors,
             "business_rollbacks": 0}   # the custom workload has no expected rollbacks
 
 

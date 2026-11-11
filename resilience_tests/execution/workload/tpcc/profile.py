@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ NOT_BUILT = "the tpcc workload profile is not built yet (docs/tpcc-build-plan.md
 # Fixed random seed: every run of the same scenario sends the same sequence of transactions
 # (proposal 7.11, "repeatable"). Each clerk draws from its own generator, seeded from this.
 SEED = 51_105
+RESET_JOBS = 4               # parallel loaders for a reload before a run (as used on the lab)
 
 
 class TpccDataError(RuntimeError):
@@ -76,6 +78,48 @@ class TpccProfile(WorkloadProfile):
 
     def required_capabilities(self) -> set[Capability]:
         return {Capability.TPCC_WORKLOAD}
+
+    async def reset_data(self, adapter: Any, extend_phase: Any = None) -> dict[str, Any]:
+        """Init, after the target checks (build step 9, option A): reload the data -- back to
+        exactly the loaded state -- when it has grown past data.RESET_GROWTH, fails a consistency
+        rule, was loaded by another loader version, or its tables' columns changed. Nothing is
+        reset when the data is missing or has another number of warehouses: prepare() then
+        refuses the run with the load command. Every reset is recorded and disclosed."""
+        assert self.workload.tpcc is not None
+        warehouses = self.workload.tpcc.warehouses
+        status = await adapter.tpcc_data_status()
+        if not data.resettable(status, warehouses):
+            return {}
+        columns = await adapter.tpcc_columns()
+        rules = None
+        if status.get("loader_version") == data.LOADER_VERSION:      # the rules' SQL comes with the loader
+            rules = await adapter.tpcc_consistency(data.PREPARE_RULES, district_sample=data.PREPARE_DISTRICT_SAMPLE)
+        reasons = data.reset_reasons(status, columns, rules)
+        before = {"growth": data.growth(status), "size_bytes": status.get("size_bytes")}
+        if not reasons:
+            return {"tpcc_reset": {"reloaded": False, **before}}
+        budget = data.reload_budget_s(status)
+        if extend_phase is not None and budget is not None:
+            extend_phase(budget, f"TPC-C data reload (twice the {status['load_seconds']:.0f} s this target's "
+                                 f"last load took, plus {data.RELOAD_EXTRA_S:.0f} s)")
+        capacity = status.get("capacity_tps")
+        started = time.monotonic()
+        load = await adapter.tpcc_load(warehouses, jobs=RESET_JOBS, replace=True)
+        if capacity is not None:
+            await adapter.tpcc_record_capacity(capacity)    # same target, same size: still its capacity
+        checkpoint_error = await adapter.tpcc_checkpoint()
+        seconds = time.monotonic() - started
+        after = await adapter.tpcc_data_status()
+        disclosures = [f"The TPC-C data was reloaded before this run ({'; '.join(reasons)}); the reload took "
+                       f"{seconds:.0f} s and passed every row count and all 12 consistency rules."]
+        if checkpoint_error:
+            disclosures.append(f"After the reload the harness could not run a CHECKPOINT ({checkpoint_error}): "
+                               "the baseline may include the database writing the reloaded data to disk.")
+        return {"tpcc_reset": {"reloaded": True, "reasons": reasons, "seconds": round(seconds, 1),
+                               "load_seconds": round(load["seconds"], 1), "before": before,
+                               "after": {"growth": data.growth(after), "size_bytes": after.get("size_bytes")},
+                               "checkpoint": checkpoint_error or "done", "capacity_kept": capacity},
+                "_disclosures": disclosures}
 
     async def prepare(self, adapter: Any) -> dict[str, Any]:
         """Init: refuse the run unless the loaded data is present, has the scenario's number of

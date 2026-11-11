@@ -28,6 +28,26 @@ LINE_COUNT_TOLERANCE = 0.01            # order lines are random in number: withi
 # NEEDS SIGN-OFF (docs/tpcc-workload-proposal.md 7.8).
 GROWTH_LIMIT = 1.5
 
+# Reset before a scenario run (TPC-C build step 9, "option A": reload until a snapshot reset
+# exists). A scenario run reloads the data -- back to exactly the loaded state -- when the orders
+# have grown past this share, so runs start from comparable data. Below GROWTH_LIMIT, so a
+# scenario never meets the refusal. NEEDS SIGN-OFF (docs/tpcc-workload-proposal.md 7.8).
+RESET_GROWTH = 1.2
+
+# Columns of each TPC-C table as the loader makes them (Clause 1.3). A table with another number
+# of live columns (e.g. one added by a scenario and not removed) is reset. Dropped columns still
+# count towards PostgreSQL's limit of 1,600 columns per table, so a table is recreated before its
+# dropped columns reach DROPPED_COLUMN_LIMIT (noisy-neighbour scenario 3 adds and drops a column
+# of `history` each run; docs/noisy-neighbour-scenarios-1-2-3-test-plans.md 4.3).
+EXPECTED_COLUMNS = {"warehouse": 9, "district": 11, "customer": 21, "history": 8, "new_order": 3,
+                    "orders": 8, "order_line": 10, "item": 5, "stock": 17}
+DROPPED_COLUMN_LIMIT = 1_000
+
+# A reload is bounded by twice the load time this target measured (stored in the meta row), plus
+# the checks; never by a number chosen without a measurement of the target.
+RELOAD_MARGIN = 2.0
+RELOAD_EXTRA_S = 120.0
+
 # Consistency rules (Clause 3.3.2). Before every run (init): rules 1-3 over everything (cheap)
 # and rule 4 on a sample of districts. After loading: every rule over everything; rule 11 holds
 # only right after a load.
@@ -103,6 +123,50 @@ def data_problems(status: Mapping[str, Any], warehouses: int) -> list[str]:
         problems.append(f"the orders have grown to {g:.2f} times their loaded size (limit {GROWTH_LIMIT}); "
                         "reset or reload the data")
     return problems
+
+
+def resettable(status: Mapping[str, Any], warehouses: int) -> bool:
+    """A reset gives back the loaded state; it does not create or resize the data set. Missing
+    data or another number of warehouses is a setup step (disk space, time) for a person: the
+    run is refused with the load command instead (data_problems)."""
+    return bool(status.get("loaded")) and status.get("warehouses") == warehouses and status.get("items") == ITEMS
+
+
+def reset_reasons(status: Mapping[str, Any], columns: Mapping[str, Mapping[str, int]] | None,
+                  rules: Mapping[int, int | None] | None) -> list[str]:
+    """Why the loaded data should be reloaded before this run (empty: use it as it is). Call only
+    when resettable(). Something that cannot be read is a reason too: never assumed fine."""
+    reasons = []
+    if status.get("loader_version") != LOADER_VERSION:
+        reasons.append(f"loaded by loader version {status.get('loader_version')}, this harness uses {LOADER_VERSION}")
+    g = growth(status)
+    if g is None:
+        reasons.append("the growth of the data cannot be measured")
+    elif g > RESET_GROWTH:
+        reasons.append(f"the orders have grown to {g:.2f} times their loaded size (reset at {RESET_GROWTH})")
+    if rules is None:
+        reasons.append("the consistency rules could not be checked")
+    else:
+        reasons += consistency_problems(rules)
+    if columns is None:
+        reasons.append("the table columns could not be read")
+    else:
+        for table, want in EXPECTED_COLUMNS.items():
+            c = columns.get(table)
+            if c is None:
+                reasons.append(f"table {table} is missing")
+                continue
+            if c["live"] != want:
+                reasons.append(f"table {table} has {c['live']} columns, the loader makes {want}")
+            if c["dropped"] >= DROPPED_COLUMN_LIMIT:
+                reasons.append(f"table {table} has {c['dropped']} dropped columns (recreated at {DROPPED_COLUMN_LIMIT})")
+    return reasons
+
+
+def reload_budget_s(status: Mapping[str, Any]) -> float | None:
+    """Seconds to allow for a reload: from the load time this target measured. None: unknown."""
+    seconds = status.get("load_seconds")
+    return RELOAD_MARGIN * float(seconds) + RELOAD_EXTRA_S if seconds else None
 
 
 def consistency_problems(results: Mapping[int, int | None]) -> list[str]:

@@ -78,7 +78,8 @@ def test_sample_fields_are_exactly_what_the_driver_emits(monkeypatch):
 def test_type_and_group_stats_reuse_the_top_level_names():
     top = set(c.SAMPLE_FIELDS)
     assert set(c.GroupStats.__annotations__) <= top
-    assert set(c.TypeStats.__annotations__) - {"p90_ms", "business_rollbacks"} <= top
+    assert set(c.TypeStats.__annotations__) - {"p90_ms", "max_ms", "business_rollbacks"} <= top
+    assert {"p50_ms", "p99_ms", "max_ms"} <= set(c.TypeStats.__annotations__)     # step 9: per-type p50, slowest
 
 
 # --- 3. groups -----------------------------------------------------------------------------

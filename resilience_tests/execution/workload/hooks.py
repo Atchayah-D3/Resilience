@@ -22,6 +22,9 @@ from resilience_tests.execution.workload.profiles import WorkloadProfile, profil
 class NoProfileHooks:
     """The hooks of the custom workload: nothing to prepare, nothing extra to check."""
 
+    async def reset_data(self, adapter: Any, extend_phase: Any = None) -> dict[str, Any]:
+        return {}
+
     async def prepare(self, adapter: Any) -> dict[str, Any]:
         return {}
 

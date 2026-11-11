@@ -144,6 +144,8 @@ class TestOrchestrator:
         self.not_measured: dict[str, str] = {}
         self._abort_reason: str | None = None
         self._current_phase: asyncio.Task[Any] | None = None
+        self._phase_bound: asyncio.Timeout | None = None     # the running phase's bound (extendable)
+        self._phase_extra_s = 0.0
         self._lock_fh: Any = None
         self._workload_failure: str | None = None
         self.cycle_t0s: list[int] = []          # one T0 per crash cycle (Framework NL-C-05)
@@ -244,7 +246,8 @@ class TestOrchestrator:
         self._current_phase = task
         try:
             try:
-                async with asyncio.timeout(self._phase_budget(name)):
+                async with asyncio.timeout(self._phase_budget(name)) as bound:
+                    self._phase_bound, self._phase_extra_s = bound, 0.0
                     detail = await task
             except asyncio.CancelledError:
                 current = asyncio.current_task()
@@ -257,7 +260,7 @@ class TestOrchestrator:
             if not swallow:
                 raise
         except TimeoutError:
-            rec.outcome, rec.error = "timeout", f"phase exceeded {self._phase_budget(name)} s"
+            rec.outcome, rec.error = "timeout", f"phase exceeded {self._phase_budget(name) + self._phase_extra_s:.0f} s"
             if not swallow:
                 raise PhaseAbort(f"{name}: {rec.error}") from None
         except Exception as exc:
@@ -267,6 +270,16 @@ class TestOrchestrator:
         finally:
             rec.duration_s = time.monotonic() - t
             self.stream.emit("orchestrator", "phase_end", phase=name, outcome=rec.outcome, error=rec.error)
+
+    def _extend_phase(self, seconds: float, why: str) -> None:
+        """More time for the running phase, for work whose length comes from a measurement of
+        this target (a workload data reload). Still bounded; recorded in the evidence."""
+        assert self.stream is not None and self._phase_bound is not None
+        when = self._phase_bound.when()
+        if when is not None:
+            self._phase_bound.reschedule(when + seconds)
+        self._phase_extra_s += seconds
+        self.stream.emit("orchestrator", "phase_extended", seconds=round(seconds, 1), why=why)
 
     def _refuse_if_already_faulted(self) -> None:
         """Refuse to start on a node that still carries an injection from an earlier run.
@@ -400,6 +413,11 @@ class TestOrchestrator:
             )
         # Profile hooks (docs/tpcc-contract.md §6): the custom workload's do nothing.
         self.workload_hooks = hooks_for(self.scenario.workload)
+        # after the target checks above: a reset writes to the target
+        reset = await self.workload_hooks.reset_data(self.adapter, self._extend_phase)
+        if reset:
+            self.disclosures.extend(reset.pop("_disclosures", []))
+            self.facts["workload_reset"] = reset
         prepared = await self.workload_hooks.prepare(self.adapter)
         if prepared:
             self.facts["workload_prepare"] = prepared

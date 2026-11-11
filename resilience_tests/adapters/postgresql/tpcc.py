@@ -48,6 +48,7 @@ else:
 SQL_DIR = Path(__file__).with_name("sql")
 SETUP_FILES = ("tpcc_schema.sql", "tpcc_load.sql", "tpcc_consistency.sql", "tpcc_functions.sql")
 INDEX_FILE = "tpcc_indexes.sql"
+DROP_LOCK_TIMEOUT = "30s"     # dropping the schema for a reload waits at most this long for locks
 FUNCTIONS_FILE = "tpcc_functions.sql"
 
 # --- one TPC-C transaction = one call (build step 6) --------------------------------------
@@ -141,7 +142,11 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                     raise RuntimeError(f"schema {TPCC_SCHEMA} already exists; load with replace (--replace) "
                                        "to drop and load it again")
                 say(f"dropping the existing schema {TPCC_SCHEMA}")
+                # a session left holding a lock on a TPC-C table (e.g. by a crashed run) makes the
+                # drop fail with a clear error instead of waiting until the phase bound
+                await conn.execute(f"SET lock_timeout = '{DROP_LOCK_TIMEOUT}'")
                 await conn.execute(f"DROP SCHEMA {TPCC_SCHEMA} CASCADE")
+                await conn.execute("RESET lock_timeout")
             for name in SETUP_FILES:
                 await conn.execute(_sql(name))
             await conn.execute(f"SELECT {TPCC_SCHEMA}.load_items($1)", data.ITEMS)
@@ -232,6 +237,31 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
     async def tpcc_orders_incomplete(self, orders: Sequence[Mapping[str, Any]]) -> int:
         result = await self.tpcc_order_check(orders)
         return result["missing"] + result["incomplete"]
+
+    async def tpcc_columns(self) -> dict[str, dict[str, int]]:
+        conn = await self._connect(timeout_s=10.0)
+        try:
+            rows = await conn.fetch(
+                "SELECT c.relname, count(*) FILTER (WHERE NOT a.attisdropped) AS live, "
+                "count(*) FILTER (WHERE a.attisdropped) AS dropped "
+                "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = $1 AND c.relkind = 'r' AND a.attnum > 0 GROUP BY c.relname", TPCC_SCHEMA)
+            return {r["relname"]: {"live": int(r["live"]), "dropped": int(r["dropped"])} for r in rows}
+        finally:
+            await conn.close()
+
+    async def tpcc_checkpoint(self) -> str | None:
+        """CHECKPOINT after a reload, so the database's writing of the new data is done before the
+        baseline. Returns None, or why it could not run (PostgreSQL 15+: pg_checkpoint needed)."""
+        conn = await self._connect(timeout_s=10.0, command_timeout=None)
+        try:
+            await conn.execute("CHECKPOINT")
+            return None
+        except asyncpg.PostgresError as exc:
+            return f"{type(exc).__name__}: {exc}"
+        finally:
+            await conn.close()
 
     async def tpcc_record_capacity(self, tps: float) -> None:
         conn = await self._connect(timeout_s=10.0)

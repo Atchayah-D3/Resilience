@@ -85,8 +85,11 @@ class TypeStats(TypedDict):
 
     commits: int
     tps: float
+    p50_ms: float | None          # the typical response time (noisy-neighbour plans: p50/p99 per type)
     p90_ms: float | None          # TPC-C's response-time rule is on the 90th percentile (Clause 5.2.5.3)
     p99_ms: float | None
+    max_ms: float | None          # the slowest response in the interval (e.g. the worst Payment while
+                                  # a schema change holds the lock queue, noisy-neighbour scenario 3)
     errors: int
     business_rollbacks: int       # expected rollbacks (TPC-C: 1% of New-Orders); never an error
 
@@ -240,11 +243,17 @@ TPCC_META = f"{TPCC_SCHEMA}.meta"            # warehouses, loader version, capac
 class ProfileHooks(Protocol):
     """Called by the orchestrator for every profile; the custom workload's hooks do nothing.
 
+    reset_data          init phase, after the target checks and before prepare: put the profile's
+                        data back to its loaded state when needed (TPC-C: reload, build step 9).
+                        `extend_phase(seconds, why)` asks for more time in the init phase for it.
+                        Returns evidence; `_disclosures` lines go into the report
     prepare             init phase: the data the profile needs is present, the right size and
                         consistent; raises with the reason otherwise (the run is refused)
     consistency_checks  validate phase: profile-specific checks after recovery; returns
                         measure name -> value (e.g. partial_commits, tpcc_consistency_violations)
     """
+
+    async def reset_data(self, adapter: Any, extend_phase: Any = None) -> dict[str, Any]: ...
 
     async def prepare(self, adapter: Any) -> dict[str, Any]: ...
 

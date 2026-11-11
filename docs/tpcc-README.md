@@ -2,7 +2,7 @@
 
 Date: 11 November 2026
 Branch: `tpcc-workload`
-Status: **steps 0 to 8 of 11 built and tested; about 70% of the work is done.** TPC-C runs, can be used in fault scenarios, and can create heavy load across several processes.
+Status: **steps 0 to 9 of 11 built and tested (step 9 without sdbPool); about 80% of the work is done.** TPC-C runs, can be used in fault scenarios, creates heavy load across several processes, and resets its data before a run.
 
 This document explains, in plain words, what has been built for the TPC-C-like workload, how
 it was checked, and what is left. The design and the plan are in:
@@ -44,8 +44,8 @@ model of such a load. We build a **TPC-C-like workload inside the existing harne
 | 5 | TPC-C inputs (NURand, the deck of 23 cards, the inputs of each transaction, clerk placement) | ✔ built and tested (pure code, nothing to run on the lab) |
 | 6 | The 5 TPC-C transactions as database functions, and the engine that sends them | ✔ built, tested, **trial passed on the lab** (new target BDB-QA-U22-3: 198 of 200 TPS, p99 10.5 ms) |
 | 7 | RPO and atomicity checks after a fault | ✔ built and tested (including a real crash locally); live kill on the lab waits for sudo on the new target |
-| 8 | Heavy load: worker processes, merged numbers, driver-limited guard, capacity test | ✔ built and tested (including real worker processes against a real database); lab check next |
-| 9 | Data reset between scenarios, sdbPool | next |
+| 8 | Heavy load: worker processes, merged numbers, driver-limited guard, capacity test | ✔ built, tested, **verified on the lab** (capacity of the new target: 1,473 TPS at 64 clerks; the harness was not the limit) |
+| 9 | Data reset before a run (reload, until a snapshot reset exists); p50 and slowest time per type | ✔ built and tested; lab dry run next. sdbPool: only if the lead decides it |
 | 10 | HammerDB cross-check, switching the noisy-neighbour scenarios | to do |
 | 11 | Optional clean-up: one engine for all workloads | later, optional |
 
@@ -53,16 +53,18 @@ model of such a load. We build a **TPC-C-like workload inside the existing harne
 
 | Measure | Done |
 |---|---|
-| steps | 9 of 11 (steps 0 to 8) |
-| effort | **about 70%**: still ahead: step 9 (reset, sdbPool) and step 10 (cross-check, switching the scenarios) |
+| steps | 10 of 11 (steps 0 to 9) |
+| effort | **about 80%**: still ahead: `sudo_mode` for the new target with the step 7 live proof, the 320-warehouse load, and step 10 (cross-check, switching the scenarios) |
 | risk | the biggest risk, whether Python can create enough load, is removed (step 0) |
 
 **What exists now:** TPC-C runs: the five transactions in the database, the engine that sends
 them with the harness's journals and samples (step 6), the inputs (step 5), the data (step 4), the
 registry (step 3) and the fields and names the scenarios need (steps 1 and 2).
-Heavy load across several worker processes and the capacity test are built (step 8).
-**What is still missing:** the data reset and sdbPool (step 9), and switching the noisy-neighbour
-scenarios to TPC-C (step 10).
+Heavy load across several worker processes and the capacity test are built (step 8), and the
+data is reset before a run (step 9).
+**What is still missing:** running the harness's sudo commands the way the new target allows
+(`sudo_mode`), the step 7 live proof, the 320-warehouse load, and step 10 (HammerDB cross-check,
+switching the noisy-neighbour scenarios to TPC-C). sdbPool waits for the lead's decision.
 
 ---
 
@@ -317,6 +319,36 @@ in any sample (nothing lost; the journals were complete, only the sample totals 
 stop could cut a transaction between its "confirmed" journal line and its count. Both fixed by the
 graceful stop.
 
+### Step 9: The reset before a run, and p50 and slowest time per type
+
+**Why:** every run adds orders, and a scenario may change a table (noisy-neighbour scenario 3 adds
+a column to `history` and removes it). Runs are comparable only if each starts from the same data.
+Option A was chosen: **reload the data**, until a disk snapshot reset is possible.
+
+**What** (`tpcc/profile.py` `reset_data`, `tpcc/data.py` `reset_reasons`):
+
+| | |
+|---|---|
+| **when** | in the init phase, **after** the harness has checked it is connected to the right target (hostname and sentinel row). Not in phase 0 "reset": that phase runs before the target check, and a reload writes gigabytes |
+| **reload when** | the orders have grown past **1.2 times** the loaded size (NEEDS SIGN-OFF); a consistency rule (1 to 4) fails or cannot be checked; the data was loaded by another loader version; a table's columns differ from the loader's (a column left behind); a table has **1,000 dropped columns** (scenario 3's rule: PostgreSQL allows 1,600 columns per table, dropped ones included) |
+| **never** | creates or resizes the data: missing data or another number of warehouses is refused with the load command, because loading a new size is a deliberate setup step (disk space, time) |
+| **time** | init has a 180 s limit; a reload takes longer (16 warehouses: about 215 s). Before reloading, the harness extends init's limit by **twice the load time this target measured last time** plus 120 s, and records `phase_extended` in the events. The phase stays bounded |
+| **after the reload** | the stored capacity is written back (same target, same size); a `CHECKPOINT` runs so the database's writing of the new data is done before the baseline (if the role may not run it, that is disclosed); a lock timeout of 30 s on the drop, so a session left holding a lock gives a clear error instead of a long wait |
+| **evidence** | `workload_reset` in the results (reasons, time, growth before and after, checkpoint) and a line in the report's disclosures |
+
+**Per transaction type**, each sample now also has `p50_ms` (the typical time) and `max_ms` (the
+slowest response in that second), as the noisy-neighbour plans ask ("p50/p99 per transaction
+type", "the worst Payment response"). Added to the contract; the custom workload reports them too.
+
+**Not built:** sdbPool (waits for the lead's decision; the environment file's `client` entry is
+where it would go). A snapshot reset can later replace the reload without changing the scenarios.
+
+**Tests:** 21 without a database (each reason to reset, the limits, the reload bound, what is
+recorded, a checkpoint that cannot run, another size refused; and in the orchestrator: a reset
+longer than init's limit completes when it asks for time, and is stopped when it does not); 1
+against a real database (a column left in `history` is found, the reload restores the columns and
+dropped-column count, keeps the capacity, runs the checkpoint, and prepare accepts the data).
+
 ---
 
 ## 4. Live verification on the lab
@@ -422,6 +454,7 @@ RESILIENCE_TEST_PG=<host>:<port>/<database>/<user> .venv/bin/python -m pytest te
 | `resilience_tests/execution/workload/tpcc/coordinator.py` | 8 | several worker processes |
 | `resilience_tests/execution/workload/tpcc/samples.py` | 8 | merging the numbers; the driver-limited guard |
 | `resilience_tests/execution/workload/tpcc/capacity.py` | 8 | the capacity test |
+| `tests/test_tpcc_reset.py` | 9 | the reset before a run |
 | `envs/e2-u22-3.yaml` | lab | the new target BDB-QA-U22-3 |
 | `resilience_tests/adapters/postgresql/sql/tpcc_functions.sql` | 6 | the five transactions |
 | `resilience_tests/execution/workload/tpcc/data.py` | 4 | expected sizes and the checks of the loaded data |
@@ -436,5 +469,5 @@ RESILIENCE_TEST_PG=<host>:<port>/<database>/<user> .venv/bin/python -m pytest te
 
 | Step | What | Checkpoint |
 |---|---|---|
-| 9 | data reset between scenarios, sdbPool | the reset gives back correct data |
+| `sudo_mode` | run the harness's sudo commands directly, without `-n` and `sh`, on the new target only | step 7 live proof: NL-C-01 with `--tpcc-warehouses 16` passes |
 | 10 | HammerDB cross-check; the noisy-neighbour scenarios switch to `profile: tpcc` | numbers within the agreed range; every switched scenario passes |

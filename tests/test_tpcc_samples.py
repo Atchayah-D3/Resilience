@@ -38,6 +38,9 @@ def test_percentiles_come_from_all_latencies_together_never_from_averaging():
     assert s["p99_ms"] != (p99(fast) + p99(slow)) / 2                # the average (50.5) would be wrong
     assert s["p50_ms"] == 2.0                                        # the 100th of 200 values
     assert s[contract.BY_TYPE][contract.NEW_ORDER]["p99_ms"] == 100.0
+    assert s[contract.BY_TYPE][contract.NEW_ORDER]["p50_ms"] == 2.0          # step 9: per-type p50
+    assert s[contract.BY_TYPE][contract.NEW_ORDER]["max_ms"] == 100.0        # step 9: the slowest response
+    assert s[contract.BY_TYPE][contract.PAYMENT]["max_ms"] is None           # no Payment in this interval
 
 
 def test_totals_add_up_and_tps_uses_each_process_own_interval():

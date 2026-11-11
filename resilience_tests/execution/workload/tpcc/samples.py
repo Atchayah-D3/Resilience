@@ -73,7 +73,8 @@ def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None) -> 
         commits = sum(part["commits"] for part in parts)
         by_type[t] = {"commits": commits,
                       "tps": _rate(raws, lambda r, t=t: r["types"].get(t, {}).get("commits", 0)),
-                      "p90_ms": percentile(tl, 0.90), "p99_ms": p99(tl),
+                      "p50_ms": percentile(tl, 0.50), "p90_ms": percentile(tl, 0.90), "p99_ms": p99(tl),
+                      "max_ms": max(tl) if tl else None,
                       "errors": sum(part["errors"] for part in parts),
                       "business_rollbacks": sum(part["business_rollbacks"] for part in parts)}
     by_group: dict[str, Any] = {}

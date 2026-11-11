@@ -503,6 +503,14 @@ class TpccSupport:
         have exactly ol_cnt lines. 0 = every one is complete."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
+    async def tpcc_columns(self) -> dict[str, dict[str, int]]:
+        """Live and dropped columns of each TPC-C table (the reset before a run, build step 9)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+    async def tpcc_checkpoint(self) -> str | None:
+        """Flush the reloaded data to disk before the baseline; None, or why it could not run."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
     async def tpcc_record_capacity(self, tps: float) -> None:
         """Store the target's measured maximum TPS (the capacity test, build step 8) in the meta row."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")

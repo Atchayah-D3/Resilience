@@ -75,8 +75,8 @@ together, so the existing analysis works for every workload:
 
 ```json
 "by_type": {
-  "new_order": {"commits": 270, "tps": 270.0, "p90_ms": 6.1, "p99_ms": 41.0, "errors": 0, "business_rollbacks": 3},
-  "payment":   {"commits": 258, "tps": 258.0, "p90_ms": 3.2, "p99_ms": 22.0, "errors": 0, "business_rollbacks": 0}
+  "new_order": {"commits": 270, "tps": 270.0, "p50_ms": 2.4, "p90_ms": 6.1, "p99_ms": 41.0, "max_ms": 63.0, "errors": 0, "business_rollbacks": 3},
+  "payment":   {"commits": 258, "tps": 258.0, "p50_ms": 1.3, "p90_ms": 3.2, "p99_ms": 22.0, "max_ms": 30.5, "errors": 0, "business_rollbacks": 0}
 },
 "by_group": {
   "colliding":     {"commits": 30,  "tps": 30.0,  "p50_ms": 900.0, "p95_ms": 4800.0, "p99_ms": 5000.0, "errors": 2, "indeterminate": 0, "drops": 0},
@@ -86,11 +86,13 @@ together, so the existing analysis works for every workload:
 
 | Field | Keys | Inside |
 |---|---|---|
-| `by_type` | `new_order`, `payment`, `order_status`, `delivery`, `stock_level` (the custom workload: `marker`) | `commits`, `tps`, `p90_ms`, `p99_ms`, `errors`, `business_rollbacks` |
+| `by_type` | `new_order`, `payment`, `order_status`, `delivery`, `stock_level` (the custom workload: `marker`) | `commits`, `tps`, `p50_ms`, `p90_ms`, `p99_ms`, `max_ms`, `errors`, `business_rollbacks` |
 | `by_group` | the group names of the scenario file (no groups: `all`) | `commits`, `tps`, `p50_ms`, `p95_ms`, `p99_ms`, `errors`, `indeterminate`, `drops` |
 
 The names inside are the same as the top-level names. `p90_ms` is added per type because TPC-C's
-response-time rule is on the 90th percentile (Clause 5.2.5.3).
+response-time rule is on the 90th percentile (Clause 5.2.5.3). `p50_ms` and `max_ms` (the slowest
+response in the interval) were added in build step 9 for the noisy-neighbour plans ("p50/p99 per
+transaction type", "the worst Payment response" in scenario 3).
 
 **Before TPC-C exists**, the custom workload fills `by_type` with one entry (`marker`) and
 `by_group` with one entry (`all`), or one per declared group. A measurement written against
@@ -176,6 +178,7 @@ Example: scenario 4's batch job updates `TPCC_STOCK` rows of warehouse 7.
 
 | Hook | Called in | Does |
 |---|---|---|
+| `reset_data(adapter, extend_phase)` | init, after the target checks | puts the profile's data back to its loaded state when needed (TPC-C: reload when grown past 1.2 times, a consistency rule fails, another loader version, or table columns changed). May ask for more init time, measured from the target's last load. Recorded under `workload_reset` and disclosed (build step 9) |
 | `prepare(adapter)` | init | checks the profile's data is present, the right size and consistent; otherwise the run is refused with the reason |
 | `consistency_checks(adapter, run_dir)` | validate | profile-specific checks after recovery; returns measure name → value |
 

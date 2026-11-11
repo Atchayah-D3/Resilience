@@ -449,3 +449,34 @@ def test_a_worker_process_that_dies_stops_the_run(adapter, tmp_path):
     failure, events = asyncio.run(go())
     assert failure and "worker process 1 exited unexpectedly" in failure, failure
     assert any(e.kind == "fatal" and e.data.get("worker_process") == 1 for e in events)
+
+
+def test_the_reset_before_a_run_reloads_changed_data_and_keeps_the_capacity(adapter):
+    """Step 9 on a real database: a column added to `history` and not removed (as noisy-neighbour
+    scenario 3 does when its cleanup fails) makes the reset reload the data. Afterwards the
+    columns are as the loader makes them, the dropped-column count is back to 0, the growth is
+    1.0, the stored capacity is kept, a CHECKPOINT ran, and prepare accepts the data."""
+    from resilience_tests.execution.workload.tpcc import data as tdata
+
+    asyncio.run(adapter.tpcc_load(2, jobs=2, replace=True, seed=11))
+    asyncio.run(adapter.tpcc_record_capacity(321.5))
+    q(adapter, f"ALTER TABLE {S}.history ADD COLUMN nn3_test integer")
+    q(adapter, f"ALTER TABLE {S}.history ADD COLUMN nn3_gone integer")
+    q(adapter, f"ALTER TABLE {S}.history DROP COLUMN nn3_gone")
+    cols = asyncio.run(adapter.tpcc_columns())
+    assert cols["history"] == {"live": 9, "dropped": 1}
+
+    w = Workload(profile="tpcc", concurrency=4, transaction_markers=True, rate_tps=10, tpcc={"warehouses": 2})
+    profile = TpccProfile(w)
+    asked = []
+    out = asyncio.run(profile.reset_data(adapter, lambda s, why: asked.append(s)))
+    r = out["tpcc_reset"]
+    assert r["reloaded"] and any("history has 9 columns" in x for x in r["reasons"]), r
+    assert asked and r["checkpoint"] == "done" and r["capacity_kept"] == 321.5
+    cols = asyncio.run(adapter.tpcc_columns())
+    assert {t: c["live"] for t, c in cols.items() if t in tdata.EXPECTED_COLUMNS} == tdata.EXPECTED_COLUMNS
+    assert all(c["dropped"] == 0 for c in cols.values())
+    status = asyncio.run(adapter.tpcc_data_status())
+    assert status["capacity_tps"] == 321.5 and tdata.growth(status) == 1.0
+    assert asyncio.run(profile.reset_data(adapter))["tpcc_reset"]["reloaded"] is False    # now clean
+    asyncio.run(profile.prepare(adapter))                                                 # accepted
