@@ -13,7 +13,7 @@ import shlex
 import time
 
 from resilience_tests.control.profile import Node
-from resilience_tests.execution.remote import RemoteHost, as_user
+from resilience_tests.execution.remote import RemoteHost, privileged
 
 q = shlex.quote  # profile fields reach root shell commands as literals, never as syntax
 
@@ -62,9 +62,9 @@ def psql_command(node: Node, *statements: str) -> str:
     # An explicit database: without -d, psql connects to a database named after the OS
     # user, which need not exist. The statements here are cluster-wide, so any database
     # serves; the harness database is the one the profile guarantees.
-    args = " ".join(f"-c {shlex.quote(s)}" for s in statements)
-    return as_user(node.os_user, f"cd /tmp && {q(node.pg_bin + '/psql')} -X -v ON_ERROR_STOP=1 "
-                                 f"-p {node.db.port} -d {q(node.db.dbname)} -At {args}")
+    args = [a for s in statements for a in ("-c", s)]
+    return privileged(node.ssh, [f"{node.pg_bin}/psql", "-X", "-v", "ON_ERROR_STOP=1", "-p", str(node.db.port),
+                                 "-d", node.db.dbname, "-At", *args], user=node.os_user, cwd="/tmp")
 
 
 async def unit_property(host: RemoteHost, node: Node, prop: str) -> str:

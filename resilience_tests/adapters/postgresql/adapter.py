@@ -9,7 +9,6 @@ methods for particular faults are mixed in from corruption.py, operations.py and
 from __future__ import annotations
 
 import re
-import shlex
 from collections.abc import Mapping
 from typing import Any
 
@@ -47,7 +46,7 @@ from resilience_tests.adapters.postgresql.sessions import (  # noqa: F401  (re-e
 )
 from resilience_tests.adapters.postgresql.tpcc import TpccMixin, call_tpcc  # TPC-C SQL (build steps 4, 6)
 from resilience_tests.control.profile import DbEndpoint, Node
-from resilience_tests.execution.remote import RemoteHost, as_user
+from resilience_tests.execution.remote import RemoteHost, privileged
 
 HARNESS_DDL = """
 CREATE SCHEMA IF NOT EXISTS resilience;
@@ -338,10 +337,13 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
     def _psql_as_os_user(self, sql: str, *, tuples_only: bool = True) -> str:
         """psql over SSH as the cluster's OS user: a superuser on the local socket, which is
         what reads and acts on other roles' sessions."""
-        flags = "-X -At -v ON_ERROR_STOP=1" if tuples_only else "-X -v ON_ERROR_STOP=1"
-        return as_user(self.node.os_user,
-                       f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} {flags} -p {self.node.db.port} "
-                       f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(sql)}")
+        flags = ["-X", "-At", "-v", "ON_ERROR_STOP=1"] if tuples_only else ["-X", "-v", "ON_ERROR_STOP=1"]
+        return self._as_os_user(["psql", *flags, "-p", str(self.node.db.port), "-d", self.node.db.dbname, "-c", sql])
+
+    def _as_os_user(self, argv: list[str]) -> str:
+        """One of the engine's own programs (argv[0] in pg_bin), run on the target as the
+        cluster's OS user from /tmp, in the form the environment allows (remote.privileged)."""
+        return privileged(self.node.ssh, [f"{self.node.pg_bin}/{argv[0]}", *argv[1:]], user=self.node.os_user, cwd="/tmp")
 
     async def session(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0,
                       settings: Mapping[str, str] | None = None) -> DatabaseSession:
@@ -363,12 +365,10 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
         self.harness_grants = []
         try:
             async with RemoteHost(self.node.ssh) as host:
-                grant_cmd = (
-                    f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -p {self.node.db.port} "
-                    f"-d {shlex.quote(self.node.db.dbname)} -c "
-                    f"{shlex.quote(f'GRANT pg_checkpoint, pg_read_all_stats TO {self.node.db.user};')}"
-                )
-                r = await host.run(as_user(self.node.os_user, grant_cmd), timeout_s=10.0, check=False)
+                grant_cmd = self._as_os_user([
+                    "psql", "-X", "-p", str(self.node.db.port), "-d", self.node.db.dbname, "-c",
+                    f"GRANT pg_checkpoint, pg_read_all_stats TO {self.node.db.user};"])
+                r = await host.run(grant_cmd, timeout_s=10.0, check=False)
                 if r.exit_status == 0:
                     self.harness_grants = ["pg_checkpoint", "pg_read_all_stats"]
         except Exception:
@@ -401,11 +401,10 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
         `corrupt_pages` lists every page the checker could not read, so the caller can tell
         whether it found THE damaged page rather than merely something."""
         node = self.node
-        command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
-                   f"-d {shlex.quote(node.db.dbname)} --relation={shlex.quote(relation)}"
-                   + (" --heapallindexed" if heapallindexed else ""))
+        command = self._as_os_user(["pg_amcheck", "-p", str(node.db.port), "-d", node.db.dbname,
+                                    f"--relation={relation}"] + (["--heapallindexed"] if heapallindexed else []))
         async with RemoteHost(node.ssh) as host:
-            result = await host.run(as_user(node.os_user, command), timeout_s=timeout_s, check=False)
+            result = await host.run(command, timeout_s=timeout_s, check=False)
         output = (result.stdout + result.stderr).strip()
         noticed = bool(_AMCHECK_FINDING_RE.search(output) or _INVALID_PAGE_RE.search(output)
                        or "checksum" in output.lower())
@@ -537,9 +536,9 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
         async with RemoteHost(node.ssh) as host:
             missing = []
             for db in databases:
-                probe = (f"cd /tmp && {shlex.quote(node.pg_bin + '/psql')} -X -At -p {node.db.port} "
-                         f"-d {shlex.quote(db)} -c {shlex.quote(AMCHECK_INSTALLED_SQL)}")
-                r = await host.run(as_user(node.os_user, probe), timeout_s=AMCHECK_PROBE_TIMEOUT_S, check=False)
+                probe = self._as_os_user(["psql", "-X", "-At", "-p", str(node.db.port), "-d", db,
+                                          "-c", AMCHECK_INSTALLED_SQL])
+                r = await host.run(probe, timeout_s=AMCHECK_PROBE_TIMEOUT_S, check=False)
                 if r.exit_status != 0 or r.stdout.strip() != "1":
                     missing.append(db)
             if missing:
@@ -547,11 +546,10 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
                     f"amcheck is not installed in {missing}; the operator installs it by hand "
                     "(CREATE EXTENSION amcheck) -- the harness does not modify target databases"
                 )
-            db_args = " ".join(f"-d {shlex.quote(db)}" for db in databases)
-            exclude = "".join(f" --exclude-relation={shlex.quote(r)}" for r in self.integrity_exclusions)
-            command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
-                       f"{db_args} --heapallindexed{exclude}")
-            result = await host.run(as_user(node.os_user, command), timeout_s=timeout_s, check=False)
+            db_args = [a for db in databases for a in ("-d", db)]
+            exclude = [f"--exclude-relation={r}" for r in self.integrity_exclusions]
+            command = self._as_os_user(["pg_amcheck", "-p", str(node.db.port), *db_args, "--heapallindexed", *exclude])
+            result = await host.run(command, timeout_s=timeout_s, check=False)
         output = result.stdout + result.stderr
         if result.exit_status not in (0, 2):
             # 1 = could not run: we do not know whether the data is sound. Fail closed.
@@ -596,11 +594,9 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
                         "SELECT name, setting FROM pg_file_settings "
                         "WHERE sourcefile LIKE '%postgresql.auto.conf' AND error IS NULL;"
                     )
-                    cmd = (
-                        f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -At -F '=' -p {self.node.db.port} "
-                        f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(sql_cmd)}"
-                    )
-                    r = await host.run(as_user(self.node.os_user, cmd), timeout_s=15.0, check=False)
+                    cmd = self._as_os_user(["psql", "-X", "-At", "-F", "=", "-p", str(self.node.db.port),
+                                            "-d", self.node.db.dbname, "-c", sql_cmd])
+                    r = await host.run(cmd, timeout_s=15.0, check=False)
                     if r.exit_status == 0 and r.stdout:
                         for line in r.stdout.strip().splitlines():
                             if "=" in line:

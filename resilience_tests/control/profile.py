@@ -34,6 +34,16 @@ class SSHEndpoint(_Model):
     host: str
     port: int = Field(gt=0, lt=65536)
     user: str
+    # How this account runs a program with higher rights (execution/remote.py `privileged`).
+    # sudo_shell: true  = through `sudo ... sh -c '...'` (the original form)
+    #             false = the program itself, by full path, no shell -- for sudo policies that
+    #                     forbid shells (e.g. BDB-QA-U22-3); commands that need a shell are then
+    #                     refused by the target and the run stops with that error
+    # sudo_noninteractive: true  = `sudo -n` (never wait for a password)
+    #                      false = plain `sudo`, for sites whose sudo signs the account in
+    #                      automatically (with no terminal, sudo still cannot ask: it fails at once)
+    sudo_shell: bool = True
+    sudo_noninteractive: bool = True
 
 
 class DbEndpoint(_Model):

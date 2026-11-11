@@ -33,7 +33,7 @@ from resilience_tests.execution.injectors.os_ssh import (  # noqa: F401  (re-exp
     unit_property,
     unit_stop_mode,
 )
-from resilience_tests.execution.remote import RemoteHost, as_root
+from resilience_tests.execution.remote import RemoteCommandError, RemoteHost, as_root, privileged
 
 q = shlex.quote  # profile fields reach root shell commands as literals, never as syntax
 
@@ -107,16 +107,24 @@ def _sql_literal(value: str) -> str:
 
 
 async def postmaster_pid(host: RemoteHost, node: Node) -> int | None:
-    result = await host.run(as_root(f"head -1 {q(node.pgdata + '/postmaster.pid')}"),
+    result = await host.run(privileged(node.ssh, ["head", "-1", f"{node.pgdata}/postmaster.pid"]),
                             timeout_s=SSH_TIMEOUT_S, check=False)
     text = result.stdout.strip()
     return int(text) if text.isdigit() else None
 
 
-async def proc_stat(host: RemoteHost, pid: int) -> str:
-    # as root: the SSH user cannot reliably inspect a process owned by the database user
-    return (await host.run(as_root(f"cat /proc/{pid}/stat 2>/dev/null || true"),
-                           timeout_s=SSH_TIMEOUT_S, check=False)).stdout
+async def proc_stat(host: RemoteHost, node: Node, pid: int) -> str:
+    """/proc/<pid>/stat, or "" when the process does not exist. As root: the SSH user cannot
+    reliably inspect a process owned by the database user. A read that FAILED (e.g. sudo
+    refused) raises: empty output means "process gone", and a refused read must never
+    confirm a kill."""
+    result = await host.run(privileged(node.ssh, ["cat", f"/proc/{pid}/stat"]),
+                            timeout_s=SSH_TIMEOUT_S, check=False)
+    if result.exit_status == 0:
+        return result.stdout
+    if "No such file or directory" in result.stderr:
+        return ""
+    raise RemoteCommandError(node.ssh.host, f"cat /proc/{pid}/stat", result)
 
 
 async def auto_conf_value(host: RemoteHost, node: Node) -> str | None:
@@ -137,10 +145,10 @@ async def ensure_service_running(node: Node) -> dict[str, Any]:
         # scenarios do) stays `failed`, and systemd refuses `start` until the failure is
         # cleared. Without this both the revert and the kill switch are powerless to put
         # the service back.
-        reset = await host.run(as_root(f"systemctl reset-failed {q(node.service)}"),
+        reset = await host.run(privileged(node.ssh, ["systemctl", "reset-failed", node.service]),
                                timeout_s=SSH_TIMEOUT_S, check=False)
         remaining = max(SSH_TIMEOUT_S, deadline - time.monotonic())
-        await host.run(as_root(f"systemctl start {q(node.service)}"), timeout_s=remaining, check=False)
+        await host.run(privileged(node.ssh, ["systemctl", "start", node.service]), timeout_s=remaining, check=False)
         state = await settled_state(host, node, deadline)
         reset_failed_issued = reset.exit_status == 0
     if state != "active":
@@ -233,7 +241,7 @@ class _ProcessKill(_ProcessFault):
         pid = await postmaster_pid(host, node)
         if pid is None:
             raise DriverNotAvailable(f"{node.name}: no postmaster.pid in {node.pgdata}")
-        before = parse_proc_stat(await proc_stat(host, pid))
+        before = parse_proc_stat(await proc_stat(host, node, pid))
         if before is None:
             raise DriverNotAvailable(f"{node.name}: postmaster.pid names {pid}, which is not running")
         return pid, before
@@ -286,7 +294,7 @@ class _ProcessKill(_ProcessFault):
             postmaster = int(lines[1]) if len(lines) > 1 and lines[1].isdigit() else None
             before = parse_proc_stat(lines[2] if len(lines) > 2 else "")
             deadline = time.monotonic() + KILL_CONFIRM_TIMEOUT_S
-            while before is not None and not process_gone(before, await proc_stat(host, pid)):
+            while before is not None and not process_gone(before, await proc_stat(host, node, pid)):
                 if time.monotonic() >= deadline:
                     raise RuntimeError(f"{node.name}: pid {pid} still alive {KILL_CONFIRM_TIMEOUT_S} s after SIGKILL")
                 await asyncio.sleep(KILL_CONFIRM_POLL_S)
@@ -301,10 +309,10 @@ class _ProcessKill(_ProcessFault):
 
     async def _kill_on(self, host: RemoteHost, node: Node, pid: int, before: tuple[str, str], *,
                        pre_armed: bool) -> dict[str, Any]:
-        await host.run(as_root(f"systemctl kill -s SIGKILL {q(node.service)}"), timeout_s=SSH_TIMEOUT_S)
+        await host.run(privileged(node.ssh, ["systemctl", "kill", "-s", "SIGKILL", node.service]), timeout_s=SSH_TIMEOUT_S)
         t0_mono_ns = time.monotonic_ns()
         deadline = time.monotonic() + KILL_CONFIRM_TIMEOUT_S
-        while not process_gone(before, await proc_stat(host, pid)):
+        while not process_gone(before, await proc_stat(host, node, pid)):
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"{node.name}: postmaster {pid} still alive {KILL_CONFIRM_TIMEOUT_S} s after SIGKILL")
             await asyncio.sleep(KILL_CONFIRM_POLL_S)
@@ -348,7 +356,7 @@ class _ServiceRestart(_ProcessFault):
         when the service happened to come back. Preflight has verified the unit's stop action
         is a fast shutdown."""
         async with RemoteHost(node.ssh) as host:
-            await host.run(as_root(f"systemctl restart --no-block {q(node.service)}"), timeout_s=SSH_TIMEOUT_S)
+            await host.run(privileged(node.ssh, ["systemctl", "restart", "--no-block", node.service]), timeout_s=SSH_TIMEOUT_S)
             t0_mono_ns = time.monotonic_ns()
         return {"action": f"systemctl restart {node.service}", "t0_mono_ns": t0_mono_ns}
 

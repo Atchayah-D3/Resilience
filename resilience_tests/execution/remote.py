@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 from types import TracebackType
 
@@ -26,6 +27,29 @@ class RemoteResult:
     stderr: str
 
 
+def privileged(endpoint: SSHEndpoint, argv: Sequence[str], *, user: str | None = None,
+               cwd: str | None = None) -> str:
+    """The command line that runs ONE program (`argv`, full path) with higher rights on the
+    target: as root, or as `user`, after changing to `cwd`. The form follows the environment
+    file (SSHEndpoint.sudo_shell, sudo_noninteractive):
+
+        sudo_shell true   sudo -n -u postgres -- sh -c 'cd /tmp && /usr/.../pg_amcheck -p 5434 ...'
+        sudo_shell false  cd /tmp && sudo -u postgres -- /usr/.../pg_amcheck -p 5434 ...
+
+    Without a shell, only the program runs with higher rights; `cd` runs as the SSH user."""
+    if not argv:
+        raise ValueError("no program to run")
+    sudo = ["sudo"] + (["-n"] if endpoint.sudo_noninteractive else []) + (["-u", user] if user else [])
+    program = shlex.join(argv)
+    goto = f"cd {shlex.quote(cwd)} && " if cwd else ""
+    if endpoint.sudo_shell:
+        return f"{shlex.join(sudo)} -- sh -c {shlex.quote(goto + program)}"
+    return f"{goto}{shlex.join(sudo)} -- {program}"
+
+
+# The original forms, kept for the commands that need a shell (pipes, `||`, a check and a kill
+# in one command). On an account whose sudo forbids shells the target refuses them, and the
+# caller sees that error: nothing is run.
 def as_user(user: str, command: str) -> str:
     """Run `command` as another OS user via non-interactive sudo."""
     return f"sudo -n -u {shlex.quote(user)} -- sh -c {shlex.quote(command)}"

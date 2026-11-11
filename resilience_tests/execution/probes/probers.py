@@ -13,14 +13,13 @@ PatroniProber and EtcdWatcher belong to the clustered tiers and arrive with them
 from __future__ import annotations
 
 import asyncio
-import shlex
 import time
 
 import asyncssh
 
 from resilience_tests.adapters.base import BaseDatabaseAdapter, DatabaseSession
 from resilience_tests.control.profile import DbEndpoint, Node
-from resilience_tests.execution.remote import RemoteHost, as_root
+from resilience_tests.execution.remote import RemoteHost, privileged
 from resilience_tests.observability.event_stream import EventStream
 
 WRITE_PROBE_INTERVAL_S = 0.2  # Fig. 6
@@ -153,7 +152,7 @@ class LogTailer:
             await asyncio.gather(self._task, return_exceptions=True)
 
     async def _loop(self) -> None:
-        command = as_root(f"tail -n0 -F {shlex.quote(self.node.log_file)}")
+        command = privileged(self.node.ssh, ["tail", "-n0", "-F", self.node.log_file])
         while not self._stop.is_set():
             pause = LOG_RECONNECT_PAUSE_S
             try:
@@ -195,7 +194,7 @@ class DiskUsageProber:
             await asyncio.gather(self._task, return_exceptions=True)
 
     async def _loop(self) -> None:
-        command = as_root(f"df -P {shlex.quote(self.node.pgdata)}")
+        command = privileged(self.node.ssh, ["df", "-P", self.node.pgdata])
         while True:
             try:
                 async with RemoteHost(self.node.ssh, connect_timeout_s=PROBE_ATTEMPT_TIMEOUT_S * 3) as host:

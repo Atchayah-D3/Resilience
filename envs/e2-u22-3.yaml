@@ -40,7 +40,9 @@ nodes:
   - name: shaktidb-standalone
     role: standalone
     topology_role: primary
-    ssh: {host: 10.11.21.14, port: 5015, user: sivasankari}
+    # This account's sudo forbids shells and signs it in automatically (no `-n`): programs are
+    # run directly, by full path (execution/remote.py `privileged`)
+    ssh: {host: 10.11.21.14, port: 5015, user: sivasankari, sudo_shell: false, sudo_noninteractive: false}
     db: {host: 10.11.21.14, port: 5434, dbname: resilience, user: harness}
     client: {host: 10.11.21.14, port: 5434, dbname: resilience, user: harness}
     pgdata: /var/lib/resilience/pgdata
