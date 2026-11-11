@@ -27,6 +27,9 @@ WRITE_PROBE_INTERVAL_S = 0.2  # Fig. 6
 READ_PROBE_INTERVAL_S = 0.2  # Fig. 6
 PROBE_ATTEMPT_TIMEOUT_S = 1.0  # a probe attempt is bounded (Arch §15); it may span several ticks
 LOG_RECONNECT_PAUSE_S = 1.0
+# The log tail command itself failed (e.g. `sudo -n` refused): it will fail again at once, so
+# retry slowly -- not one SSH login per second on the target -- and record why each time.
+LOG_UNAVAILABLE_PAUSE_S = 30.0
 DISK_PROBE_INTERVAL_S = 5.0  # disk fills over minutes; a 5 s reading is ample for an abort
 
 
@@ -152,15 +155,25 @@ class LogTailer:
     async def _loop(self) -> None:
         command = as_root(f"tail -n0 -F {shlex.quote(self.node.log_file)}")
         while not self._stop.is_set():
+            pause = LOG_RECONNECT_PAUSE_S
             try:
                 async with RemoteHost(self.node.ssh, connect_timeout_s=PROBE_ATTEMPT_TIMEOUT_S * 3) as host:
                     self.stream.emit("log_tailer", "connected", node=self.node.name)
                     async with host.process(command) as proc:
                         async for line in proc.stdout:
-                            self.stream.emit("log_tailer", "log_line", node=self.node.name, line=line.rstrip("\n"))
+                            text = line.rstrip("\n")
+                            if text:            # tail never sends a real empty line; an empty read is no evidence
+                                self.stream.emit("log_tailer", "log_line", node=self.node.name, line=text)
+                        # `tail -F` only ends if it could not run: say why, never "connected" and silent
+                        done = await proc.wait()
+                        why = (done.stderr or "").strip().splitlines()
+                        self.stream.emit("log_tailer", "unavailable", node=self.node.name,
+                                         exit_status=done.exit_status, error=why[0][:300] if why else None)
+                        if done.exit_status not in (0, None):
+                            pause = LOG_UNAVAILABLE_PAUSE_S
             except (OSError, asyncssh.Error, TimeoutError) as exc:
                 self.stream.emit("log_tailer", "disconnected", node=self.node.name, error=type(exc).__name__)
-            await asyncio.sleep(LOG_RECONNECT_PAUSE_S)
+            await asyncio.sleep(pause)
 
 
 class DiskUsageProber:

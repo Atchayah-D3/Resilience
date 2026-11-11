@@ -702,6 +702,13 @@ class TestOrchestrator:
         if self.safety.standing_aborts() and not any(e.kind == "disk_usage" for e in events):
             self.disclosures.append("The standing disk abort never received a reading from the target, so it "
                                     "could not have stopped this run (see disk_usage_unavailable events).")
+        log_failures = [e for e in events if e.source == "log_tailer" and e.kind == "unavailable"]
+        if log_failures and not any(e.kind == "log_line" for e in events):
+            reason = next((e.data.get("error") for e in log_failures if e.data.get("error")), None)
+            self.disclosures.append("The database log could not be read during this run"
+                                    + (f" ({reason})" if reason else "")
+                                    + ": times taken from the log (detection, recovery start) are not measured "
+                                      "for that reason, not because the engine wrote nothing.")
 
         expect_outage = self.fault_behaviour.expects_outage
         slo_t0 = self._slo_t0()
