@@ -68,23 +68,27 @@ def test_registering_the_same_class_again_is_harmless():
 
 # --- the tpcc skeleton: registered, not built, refused with the reason ----------------------
 
-def test_tpcc_is_built_but_allows_only_dry_runs_until_step_7():
-    assert TpccProfile.built is True and TpccProfile.ready_for_faults is False
+def test_tpcc_is_built_and_ready_for_fault_runs_since_step_7():
+    assert TpccProfile.built is True and TpccProfile.ready_for_faults is True
     assert hooks.not_built_reason(TPCC_WORKLOAD) is None
-    reason = hooks.fault_runs_reason(TPCC_WORKLOAD)
-    assert reason and "only dry runs (--stop-before-fault)" in reason and "step 7" in reason
+    assert hooks.fault_runs_reason(TPCC_WORKLOAD) is None
     assert hooks.fault_runs_reason(WORKLOAD) is None                  # the custom workload: no limit
     assert isinstance(hooks.hooks_for(TPCC_WORKLOAD), TpccProfile)
 
 
-def test_every_skeleton_hook_refuses_and_names_its_build_step():
-    p = TpccProfile(TPCC_WORKLOAD)
-    calls = [
-        (7, lambda: asyncio.run(p.consistency_checks(None, Path(".")))),
-    ]
-    for step, call in calls:
-        with pytest.raises(NotImplementedError, match=f"step {step}"):
-            call()
+def test_a_profile_not_ready_for_faults_allows_only_dry_runs(monkeypatch):
+    class DryOnly(TpccProfile):
+        ready_for_faults = False
+    monkeypatch.setitem(profiles_base._PROFILES, "tpcc", DryOnly)
+    reason = hooks.fault_runs_reason(TPCC_WORKLOAD)
+    assert reason and "only dry runs (--stop-before-fault)" in reason
+
+
+def test_no_tpcc_hook_refuses_as_not_built_any_more():
+    import inspect
+    from resilience_tests.execution.workload.tpcc import profile as tpcc_profile_module
+    src = inspect.getsource(tpcc_profile_module.TpccProfile)
+    assert "NOT_BUILT.format" not in src                              # every step 3 placeholder is filled
 
 
 def test_tpcc_needs_the_tpcc_capability():

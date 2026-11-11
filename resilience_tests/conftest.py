@@ -15,3 +15,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
                 help="dry run: execute reset..pre_fault only, never inject, never produce a verdict")
     g.addoption("--reference-class", action="store", default="E2",
                 help="reference environment class for env-insensitive scenarios (Arch §14: E2)")
+    g.addoption("--tpcc-warehouses", action="store", type=int, default=None,
+                help="run the scenarios with the TPC-C workload (this many loaded warehouses) in place of "
+                     "their own; disclosed in every report (TPC-C build steps 7, 10)")

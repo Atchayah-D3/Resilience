@@ -491,6 +491,12 @@ class TpccSupport:
         """Remove every TPC-C object; True when nothing is left."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
+    async def tpcc_order_check(self, orders: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+        """The per-order check, in detail: of these New-Orders ({w, d, o_id, ol_cnt} each),
+        `missing` have no order row at all, `incomplete` have an order row but not exactly ol_cnt
+        lines, or no new-order row although no Delivery has touched them. checked = all given."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
     async def tpcc_orders_incomplete(self, orders: Sequence[Mapping[str, Any]]) -> int:
         """The per-order check: of these acknowledged New-Orders ({w, d, o_id, ol_cnt} each, from
         the "committed" journal), how many are missing, or lack their new-order row, or do not

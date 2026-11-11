@@ -62,6 +62,7 @@ from resilience_tests.execution.workload.hooks import (
     hooks_for,
     make_workload_driver,
     required_capabilities,
+    split_checks,
 )
 from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals
 from resilience_tests.observability.event_stream import EventStream
@@ -89,6 +90,8 @@ class TargetBusy(RuntimeError):
 class RunOptions:
     target_is_disposable: bool = False
     stop_before_fault: bool = False
+    # disclosed in the report when the run changed the scenario (e.g. --tpcc-warehouses)
+    workload_note: str | None = None
 
 
 @dataclass
@@ -322,6 +325,8 @@ class TestOrchestrator:
             # the run plan skips these too; refused here before anything is applied, so a direct
             # run can never report a pass for a fault it did not inject
             raise PhaseAbort(not_built)
+        if self.options.workload_note:
+            self.disclosures.append(self.options.workload_note)
         # a workload whose checks after a fault are not built yet may only be dry-run
         dry_only = fault_runs_reason(self.scenario.workload)
         if dry_only and not self.options.stop_before_fault:
@@ -847,7 +852,16 @@ class TestOrchestrator:
             m.update(during_measures)
 
         m.update(await self.fault_behaviour.measure(events))
-        m.update(await self.workload_hooks.consistency_checks(self.adapter, self.run_dir))
+        # The workload profile's own checks after the fault (TPC-C: partial commits, rolled-back
+        # transactions kept, consistency rules). A check it could not run is NOT_MEASURED, with why.
+        measures, workload_facts, workload_reasons = split_checks(
+            await self.workload_hooks.consistency_checks(self.adapter, self.run_dir))
+        m.update(measures)
+        for name, why in workload_reasons.items():
+            m[name] = NOT_MEASURED
+            self.not_measured[name] = why
+        if workload_facts:
+            self.facts["workload_checks"] = workload_facts
 
         # Anything the scenario declared but the harness could not produce stays absent, and
         # the evaluator fails any predicate that needs it (never a default pass).

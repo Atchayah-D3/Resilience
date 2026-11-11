@@ -17,6 +17,7 @@ from catalog.schema import load_catalog
 from resilience_tests.control.matrix import RunPlanItem, expand
 from resilience_tests.control.orchestrator import RunOptions, run_item
 from resilience_tests.control.profile import load_profile
+from resilience_tests.execution.workload.hooks import tpcc_override_note, with_tpcc_workload
 from resilience_tests.reporting.html import render_run
 
 
@@ -32,6 +33,11 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         raise pytest.UsageError("catalog does not load: " + "; ".join(f"{e.path.name}: {e.message}" for e in catalog.errors))
     profile = load_profile(env)
     only = set(metafunc.config.getoption("--scenario")) or None
+    warehouses = metafunc.config.getoption("--tpcc-warehouses")
+    if warehouses:
+        for sid, sc in list(catalog.scenarios.items()):
+            if only is None or sid in only:
+                catalog.scenarios[sid] = with_tpcc_workload(sc, warehouses)
     plan, skipped = expand(catalog, profile, reference_env_class=metafunc.config.getoption("--reference-class"), only=only)
     params = [pytest.param(item, id=item.run_key) for item in plan]
     params += [pytest.param(None, id=s.scenario_id, marks=pytest.mark.skip(reason=s.reason)) for s in skipped]
@@ -41,9 +47,11 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 def test_scenario(plan_item: RunPlanItem, request: pytest.FixtureRequest) -> None:
     cfg = request.config
     profile = load_profile(cfg.getoption("--env"))
+    warehouses = cfg.getoption("--tpcc-warehouses")
     options = RunOptions(
         target_is_disposable=cfg.getoption("--target-is-disposable"),
         stop_before_fault=cfg.getoption("--stop-before-fault"),
+        workload_note=tpcc_override_note(warehouses) if warehouses else None,
     )
     results = asyncio.run(run_item(plan_item, profile, options))
     props = request.node.user_properties

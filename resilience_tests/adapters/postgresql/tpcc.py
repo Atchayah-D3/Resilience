@@ -204,9 +204,9 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
         finally:
             await conn.close()
 
-    async def tpcc_orders_incomplete(self, orders: Sequence[Mapping[str, Any]]) -> int:
+    async def tpcc_order_check(self, orders: Sequence[Mapping[str, Any]]) -> dict[str, int]:
         if not orders:
-            return 0
+            return {"checked": 0, "missing": 0, "incomplete": 0}
         rows = [(int(o["w"]), int(o["d"]), int(o["o_id"]), int(o["ol_cnt"])) for o in orders]
         conn = await self._connect(timeout_s=10.0, command_timeout=None)
         try:
@@ -214,18 +214,24 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                 await conn.execute("CREATE TEMP TABLE tpcc_acked (w int, d int, o_id int, ol_cnt int) ON COMMIT DROP")
                 await conn.copy_records_to_table("tpcc_acked", records=rows)
                 # A New-Order can be delivered afterwards (new_order row gone, carrier set): that is
-                # complete too. Incomplete = no order, a wrong line count, or a missing new_order
-                # row on an order no Delivery has touched.
-                return await conn.fetchval(f"""
-                    SELECT count(*) FROM tpcc_acked a
+                # complete too. Missing = no order row. Incomplete = an order row with a wrong line
+                # count, or no new_order row on an order no Delivery has touched.
+                row = await conn.fetchrow(f"""
+                    SELECT count(*) FILTER (WHERE o.o_id IS NULL) AS missing,
+                           count(*) FILTER (WHERE o.o_id IS NOT NULL AND (o.o_ol_cnt <> a.ol_cnt OR l.lines <> a.ol_cnt
+                                                  OR (n.no_o_id IS NULL AND o.o_carrier_id IS NULL))) AS incomplete
+                      FROM tpcc_acked a
                       LEFT JOIN {S}.orders o ON (o.o_w_id, o.o_d_id, o.o_id) = (a.w, a.d, a.o_id)
                       LEFT JOIN {S}.new_order n ON (n.no_w_id, n.no_d_id, n.no_o_id) = (a.w, a.d, a.o_id)
                       LEFT JOIN LATERAL (SELECT count(*) AS lines FROM {S}.order_line l
-                                          WHERE (l.ol_w_id, l.ol_d_id, l.ol_o_id) = (a.w, a.d, a.o_id)) l ON true
-                     WHERE o.o_id IS NULL OR o.o_ol_cnt <> a.ol_cnt OR l.lines <> a.ol_cnt
-                        OR (n.no_o_id IS NULL AND o.o_carrier_id IS NULL)""")
+                                          WHERE (l.ol_w_id, l.ol_d_id, l.ol_o_id) = (a.w, a.d, a.o_id)) l ON true""")
+                return {"checked": len(rows), "missing": int(row["missing"]), "incomplete": int(row["incomplete"])}
         finally:
             await conn.close()
+
+    async def tpcc_orders_incomplete(self, orders: Sequence[Mapping[str, Any]]) -> int:
+        result = await self.tpcc_order_check(orders)
+        return result["missing"] + result["incomplete"]
 
     async def tpcc_install_functions(self) -> None:
         conn = await self._connect(timeout_s=10.0)

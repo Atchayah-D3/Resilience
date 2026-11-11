@@ -29,6 +29,38 @@ class NoProfileHooks:
         return {}
 
 
+def split_checks(result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    """A profile's consistency_checks() result -> (measures, facts, not_measured reasons).
+
+    "_facts" holds the details for the evidence; "_not_measured" maps a measure to why it could
+    not be taken. Such a measure is NOT MEASURED in the verdict (never 0), whatever value the
+    profile may also have returned for it."""
+    measures = {k: v for k, v in result.items() if not k.startswith("_")}
+    facts = dict(result.get("_facts") or {})
+    reasons = {str(k): str(v) for k, v in (result.get("_not_measured") or {}).items()}
+    for name in reasons:
+        measures.pop(name, None)
+    return measures, facts, reasons
+
+
+def with_tpcc_workload(scenario: Any, warehouses: int) -> Any:
+    """The scenario with the TPC-C workload in place of its own (same clerks, rate, groups and
+    session settings; `warehouses` must match the loaded data). For trying a scenario on TPC-C
+    before it is switched for good (TPC-C build steps 7 and 10). The run discloses it. A
+    list-append history is not kept with TPC-C, so a scenario that needs Elle then fails its
+    Elle criterion rather than passing without it."""
+    w = scenario.workload
+    data = {**w.model_dump(), "profile": "tpcc", "history": "none",
+            "tpcc": {"warehouses": warehouses, "home_warehouse": {}}}
+    return scenario.model_copy(update={"workload": Workload(**data)})
+
+
+def tpcc_override_note(warehouses: int) -> str:
+    return (f"Workload replaced for this run: the TPC-C workload (profile tpcc, {warehouses} warehouses) ran in "
+            "place of the scenario's own workload, with the same clerks, rate and session settings "
+            "(--tpcc-warehouses). The scenario file was not changed.")
+
+
 def not_built_reason(workload: Workload) -> str | None:
     cls = profile_class(workload.profile)
     if cls is not None and not cls.built:

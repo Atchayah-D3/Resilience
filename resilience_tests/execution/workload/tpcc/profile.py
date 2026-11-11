@@ -1,14 +1,12 @@
 """The `tpcc` workload profile: TPC-C 5.11-like transactions (docs/tpcc-workload-proposal.md).
 
-Registered in step 3; it runs since step 6. Until step 7 builds its checks after a fault,
-`ready_for_faults = False`: only dry runs (--stop-before-fault) are allowed, so no fault is
-injected whose effect on the TPC-C data could not be judged. Build steps
-(docs/tpcc-build-plan.md):
+Registered in step 3; it runs since step 6; since step 7 its checks after a fault are built,
+so it may be used for real fault runs. Build steps (docs/tpcc-build-plan.md):
 
     step 4  prepare(): the TPC-C data is loaded, the right size and consistent   (done)
     step 5  terminal(), next_request(): clerk placement and the TPC-C inputs (pure code)   (done)
     step 6  execute(): one server-side function call per transaction; the engine   (done)
-    step 7  consistency_checks(): RPO, per-order check, consistency rules after the fault
+    step 7  consistency_checks(): RPO, per-order check, consistency rules after the fault   (done)
 """
 
 from __future__ import annotations
@@ -26,7 +24,14 @@ from resilience_tests.execution.workload.contract import (
     STOCK_LEVEL,
     TPCC_READ_ONLY_TYPES,
 )
-from resilience_tests.execution.workload.tpcc import data, inputs
+from resilience_tests.execution.workload.markers import (
+    ABORTED_JOURNAL,
+    ACKED_JOURNAL,
+    MARKER_JOURNAL,
+    journal_paths,
+    read_journal,
+)
+from resilience_tests.execution.workload.tpcc import checks, data, inputs
 from resilience_tests.execution.workload.tpcc.terminals import place_clerks
 from resilience_tests.execution.workload.profiles.base import (
     Request,
@@ -51,12 +56,13 @@ class TpccDataError(RuntimeError):
 class TpccProfile(WorkloadProfile):
     name = "tpcc"
     built = True
-    ready_for_faults = False     # becomes True with step 7 (checks after a fault)
+    ready_for_faults = True      # step 7: the checks after a fault are built
 
     def __init__(self, workload: Any, seed: int = SEED) -> None:
         super().__init__(workload)
         self.seed = seed
         self.constants: inputs.RunConstants | None = None      # set by prepare() from the loaded data
+        self.orders_at_prepare: int | None = None                # sum(D_NEXT_O_ID - 1) at prepare, for step 7
         self._terminals: list[Terminal] | None = None
         self._clerks: dict[int, tuple[random.Random, inputs.Deck]] = {}
 
@@ -84,6 +90,7 @@ class TpccProfile(WorkloadProfile):
         if problems:
             raise TpccDataError("the TPC-C data cannot be used: " + "; ".join(problems))
         consts = self.set_run_constants(status["c_last_load"])
+        self.orders_at_prepare = status.get("current_orders")
         return {"tpcc_data": {
             "run_constants": {"c_last": consts.c_last, "c_id": consts.c_id, "ol_i_id": consts.ol_i_id,
                               "c_last_load": status["c_last_load"]},
@@ -135,4 +142,51 @@ class TpccProfile(WorkloadProfile):
         return TpccWorkloadDriver(adapter, self.workload, journals, stream, self)
 
     async def consistency_checks(self, adapter: Any, run_dir: Path) -> dict[str, Any]:
-        raise NotImplementedError(NOT_BUILT.format(step=7))
+        """Validate: label every write transaction from the evidence (tpcc/checks.py) and return
+        the measures, plus "_facts" (the labels in detail) and "_not_measured" (why a measure
+        could not be taken). A part that fails to run is NOT MEASURED, never 0."""
+        written, acked, aborted, torn = {}, {}, {}, 0
+        for p in journal_paths(run_dir, MARKER_JOURNAL):
+            written.update({r["uuid"]: r.get("type", "") for r in read_journal(p).records})
+        for p in journal_paths(run_dir, ACKED_JOURNAL):
+            acked.update({r["uuid"]: r for r in read_journal(p).records})
+        for p in journal_paths(run_dir, ABORTED_JOURNAL):
+            j = read_journal(p)
+            aborted.update({r["uuid"]: r for r in j.records})
+            torn += j.torn_lines
+
+        problems: list[str] = []
+
+        async def attempt(what: str, call: Any) -> Any:
+            try:
+                return await call
+            except Exception as exc:  # noqa: BLE001 -- recorded; the measure is then not measured
+                problems.append(f"{what}: {type(exc).__name__}: {exc}")
+                return None
+
+        db = await attempt("markers", adapter.marker_ids())
+        acked_check = lost_check = None
+        if db is not None:
+            acked_check = await attempt("per-order check", adapter.tpcc_order_check(
+                checks.new_order_lines(acked, set(acked) & db)))
+            lost_check = await attempt("per-order check of lost New-Orders", adapter.tpcc_order_check(
+                checks.new_order_lines(acked, set(acked) - db)))
+        status = await attempt("order count", adapter.tpcc_data_status())
+        rules: dict[int, int | None] = {}
+        full = await attempt("consistency rules", adapter.tpcc_consistency(checks.RULES_ALL_DATA))
+        sampled = await attempt("consistency rules (sample)", adapter.tpcc_consistency(
+            checks.RULES_SAMPLED, district_sample=checks.SAMPLE_DISTRICTS, seed=self.seed))
+        rules.update(full or {})
+        rules.update(sampled or {})
+
+        ev = checks.Evidence(
+            written=written, acked=acked, aborted=aborted, db=db,
+            acked_order_check=acked_check, lost_order_check=lost_check,
+            orders_before=self.orders_at_prepare,
+            orders_after=(status or {}).get("current_orders"),
+            rules=rules, torn_aborted_lines=torn)
+        measures, facts, reasons = checks.evaluate(ev)
+        if problems:
+            facts["errors"] = problems
+            reasons = {m: f"{why} ({'; '.join(problems)})" for m, why in reasons.items()}
+        return {**measures, "_facts": facts, "_not_measured": reasons}

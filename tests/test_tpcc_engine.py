@@ -199,8 +199,13 @@ def test_the_custom_workload_keeps_its_own_driver():
     assert isinstance(drv, driver_mod.WorkloadDriver)
 
 
-def test_a_fault_run_with_tpcc_is_refused_before_anything_is_applied(env):  # noqa: F811
-    """Until step 7 builds the checks after a fault, a tpcc scenario may only be dry-run."""
+def test_a_fault_run_with_a_profile_not_ready_for_faults_is_refused_before_anything_is_applied(env, monkeypatch):  # noqa: F811
+    """A profile whose checks after a fault are not built may only be dry-run (tpcc was, until step 7)."""
+    from resilience_tests.execution.workload.profiles import base as profiles_base
+
+    class DryOnly(TpccProfile):
+        ready_for_faults = False
+    monkeypatch.setitem(profiles_base._PROFILES, "tpcc", DryOnly)
     sc = scenario("NL-C-01")
     sc = sc.model_copy(update={"workload": _workload()})
     item = RunPlanItem(scenario=sc, env_class=env.env_class, role="standalone", node=env.nodes[0])

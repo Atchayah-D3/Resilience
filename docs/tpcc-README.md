@@ -2,7 +2,7 @@
 
 Date: 10 November 2026
 Branch: `tpcc-workload`
-Status: **steps 0 to 6 of 11 built and tested; about 50% of the work is done.** TPC-C now runs (dry runs only until step 7).
+Status: **steps 0 to 7 of 11 built and tested; about 60% of the work is done.** TPC-C runs, and can be used in fault scenarios.
 
 This document explains, in plain words, what has been built for the TPC-C-like workload, how
 it was checked, and what is left. The design and the plan are in:
@@ -42,9 +42,9 @@ model of such a load. We build a **TPC-C-like workload inside the existing harne
 | 3 | Profile registry and TPC-C skeleton | ✔ built, tested, **live-verified** |
 | 4 | TPC-C tables, loader, consistency rules, check before every run | ✔ built, tested, **loaded on the lab** (1 warehouse) |
 | 5 | TPC-C inputs (NURand, the deck of 23 cards, the inputs of each transaction, clerk placement) | ✔ built and tested (pure code, nothing to run on the lab) |
-| 6 | The 5 TPC-C transactions as database functions, and the engine that sends them | ✔ built and tested locally; trial on the lab to do |
-| 7 | RPO and atomicity checks after a fault | next |
-| 8 | Heavy load: worker processes, capacity test | to do |
+| 6 | The 5 TPC-C transactions as database functions, and the engine that sends them | ✔ built, tested, **trial passed on the lab** (new target BDB-QA-U22-3: 198 of 200 TPS, p99 10.5 ms) |
+| 7 | RPO and atomicity checks after a fault | ✔ built and tested (including a real crash locally); live kill on the lab waits for sudo on the new target |
+| 8 | Heavy load: worker processes, capacity test | next |
 | 9 | Data reset between scenarios, sdbPool | to do |
 | 10 | HammerDB cross-check, switching the noisy-neighbour scenarios | to do |
 | 11 | Optional clean-up: one engine for all workloads | later, optional |
@@ -53,16 +53,15 @@ model of such a load. We build a **TPC-C-like workload inside the existing harne
 
 | Measure | Done |
 |---|---|
-| steps | 7 of 11 (steps 0 to 6) |
-| effort | **about 50%**: step 6, the biggest step, is done; still ahead: step 7 (the checks after a fault) and step 8 (heavy load) |
+| steps | 8 of 11 (steps 0 to 7) |
+| effort | **about 60%**: still ahead: step 8 (heavy load), step 9 (reset, sdbPool) and step 10 (cross-check, switching the scenarios) |
 | risk | the biggest risk, whether Python can create enough load, is removed (step 0) |
 
 **What exists now:** TPC-C runs: the five transactions in the database, the engine that sends
 them with the harness's journals and samples (step 6), the inputs (step 5), the data (step 4), the
 registry (step 3) and the fields and names the scenarios need (steps 1 and 2).
-**What is still missing:** the checks after a fault (step 7) and heavy load across several
-processes (step 8). Until step 7, a scenario with `profile: tpcc` may only be dry-run
-(`--stop-before-fault`); a real fault run is refused before anything touches the database.
+**What is still missing:** heavy load across several processes and the capacity test (step 8),
+the data reset and sdbPool (step 9), and switching the noisy-neighbour scenarios to TPC-C (step 10).
 
 ---
 
@@ -243,6 +242,43 @@ fault run with `tpcc` refused before anything is applied), and 9 against a real 
 4.4 / 4.3 / 4.4%; 0 errors, 0 unknown; RPO 0; 3,400 orders all complete; all rules hold;
 business rollbacks 0.94%.
 
+### Step 7: The checks after a fault
+
+**Why:** this is what TPC-C is for in this project: after a crash, proving that no committed
+transaction was lost **and none was half-saved**.
+
+**What** (`tpcc/checks.py`, the profile's `consistency_checks`): from the journals and the database,
+every write transaction gets one label:
+
+| Marker in the database | Its TPC-C rows | Label |
+|---|---|---|
+| yes | complete | committed and kept |
+| no | none | **lost** (the harness's `rpo_txn`) |
+| yes | missing or incomplete | **partial commit** |
+| no | present | **partial commit**, not only "lost" |
+| a "rolled back" line, but the marker is in the database | | **rolled back but kept** |
+
+How each case is found: the per-order check for acknowledged and lost New-Orders (now telling
+"missing" from "incomplete"); for New-Orders with an unknown outcome, the number of orders created
+during the run must equal the New-Orders whose marker survived; for Payment and Delivery, the
+consistency rules (1 to 9 on all data, 10 and 12 on a sample of 20 districts). Unknown outcomes are
+now exact: sure rollbacks are journaled and no longer counted as unknown. Two rare limits are stated
+in the code (two opposite failures of unknown New-Orders cancel out in the count; one case can be
+counted twice, which only over-counts).
+
+New measures: `partial_commits`, `aborted_markers_present`, `tpcc_consistency_violations`, and an
+exact `indeterminate_txn`. A check that cannot run makes its measure **not measured**, with the
+reason; never 0. `tpcc` is now ready for real fault runs.
+
+A run option tries any scenario with the TPC-C workload before the scenarios are switched for good:
+`--tpcc-warehouses N` (disclosed in the report; the scenario file is not changed).
+
+**Tests:** 27 without a database (every label, every "not measured" reason); 1 against a real
+ShaktiDB in which four atomicity failures made by hand are each found with the right label; and a
+**real crash** locally (immediate shutdown during TPC-C load): RPO 0, 7 unknown outcomes (the
+transactions in flight), 0 partial commits, 0 rolled back but kept, 0 consistency violations, and
+872 orders created = 872 New-Orders whose marker survived.
+
 ---
 
 ## 4. Live verification on the lab
@@ -340,12 +376,14 @@ RESILIENCE_TEST_PG=<host>:<port>/<database>/<user> .venv/bin/python -m pytest te
 | `resilience_tests/execution/workload/tpcc/inputs.py`, `terminals.py` | 5 | the TPC-C inputs and clerk placement |
 | `resilience_tests/execution/workload/tpcc/engine.py` | 6 | the TPC-C engine (one process) |
 | `resilience_tests/execution/workload/tpcc/trial.py` | 6 | the trial command |
+| `resilience_tests/execution/workload/tpcc/checks.py` | 7 | the checks after a fault |
+| `envs/e2-u22-3.yaml` | lab | the new target BDB-QA-U22-3 |
 | `resilience_tests/adapters/postgresql/sql/tpcc_functions.sql` | 6 | the five transactions |
 | `resilience_tests/execution/workload/tpcc/data.py` | 4 | expected sizes and the checks of the loaded data |
 | `resilience_tests/execution/workload/tpcc/load.py` | 4 | the load command |
 | `resilience_tests/adapters/postgresql/tpcc.py` | 4 | loading, status, consistency, drop |
 | `resilience_tests/adapters/postgresql/sql/tpcc_*.sql` | 4 | tables, indexes, loader, consistency rules |
-| `tests/test_workload_contract.py`, `test_workload_additions.py`, `test_workload_profiles.py`, `test_tpcc_data.py`, `test_tpcc_load_db.py`, `test_tpcc_inputs.py`, `test_tpcc_engine.py`, `test_tpcc_functions_db.py`, `test_tpcc_speedtest.py` | 0 to 6 | the tests |
+| `tests/test_workload_contract.py`, `test_workload_additions.py`, `test_workload_profiles.py`, `test_tpcc_data.py`, `test_tpcc_load_db.py`, `test_tpcc_inputs.py`, `test_tpcc_engine.py`, `test_tpcc_functions_db.py`, `test_tpcc_checks.py`, `test_tpcc_speedtest.py` | 0 to 7 | the tests |
 
 ---
 
@@ -353,7 +391,6 @@ RESILIENCE_TEST_PG=<host>:<port>/<database>/<user> .venv/bin/python -m pytest te
 
 | Step | What | Checkpoint |
 |---|---|---|
-| 7 | the checks after a fault: RPO over all journals, the per-order check, the consistency rules, "partial commit" labels | a live kill with `profile: tpcc`: 0 lost, 0 partial commits |
 | 8 | worker processes, merged statistics, the driver-limited guard, the capacity test | the capacity test reaches the database's maximum without the harness being the limit |
 | 9 | data reset between scenarios, sdbPool | the reset gives back correct data |
 | 10 | HammerDB cross-check; the noisy-neighbour scenarios switch to `profile: tpcc` | numbers within the agreed range; every switched scenario passes |

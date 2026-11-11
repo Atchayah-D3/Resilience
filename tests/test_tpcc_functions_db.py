@@ -266,12 +266,20 @@ def test_the_engine_runs_real_tpcc_load_and_loses_nothing(adapter, tmp_path):
     rules = asyncio.run(adapter.tpcc_consistency([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]))
     assert rules == {r: 0 for r in rules}, rules
     assert asyncio.run(adapter.tpcc_orders_incomplete(acked_orders)) == 0      # the per-order check
-    # ...and it catches a half-saved order: remove one line of one acknowledged order
+    # ...and it catches a half-saved order: remove one line of one acknowledged order (then put
+    # it back, so the tests after this one start from consistent data)
     o = acked_orders[0]
-    q(adapter, f"DELETE FROM {S}.order_line WHERE ol_w_id=$1 AND ol_d_id=$2 AND ol_o_id=$3 AND ol_number=1",
-      o["w"], o["d"], o["o_id"])
-    assert asyncio.run(adapter.tpcc_orders_incomplete(acked_orders)) == 1
-    assert asyncio.run(adapter.tpcc_orders_incomplete([{**o, "o_id": 99_999}])) == 1   # an order that never existed
+    where = f"ol_w_id={int(o['w'])} AND ol_d_id={int(o['d'])} AND ol_o_id={int(o['o_id'])} AND ol_number=1"
+    q(adapter, f"CREATE TABLE {S}.test_hold AS SELECT * FROM {S}.order_line WHERE {where}")
+    q(adapter, f"DELETE FROM {S}.order_line WHERE {where}")
+    try:
+        assert asyncio.run(adapter.tpcc_orders_incomplete(acked_orders)) == 1
+        assert asyncio.run(adapter.tpcc_order_check([o]))["incomplete"] == 1
+        assert asyncio.run(adapter.tpcc_order_check([{**o, "o_id": 99_999}]))["missing"] == 1   # never existed
+    finally:
+        q(adapter, f"INSERT INTO {S}.order_line SELECT * FROM {S}.test_hold")
+        q(adapter, f"DROP TABLE {S}.test_hold")
+    assert asyncio.run(adapter.tpcc_orders_incomplete(acked_orders)) == 0
     seen = Counter()
     for s in samples:
         for t, st in s["by_type"].items():
@@ -279,3 +287,64 @@ def test_the_engine_runs_real_tpcc_load_and_loses_nothing(adapter, tmp_path):
     assert all(seen[t] > 0 for t in (NEW_ORDER, PAYMENT, ORDER_STATUS, DELIVERY, STOCK_LEVEL)), seen
     assert sum(s["errors"] for s in samples) == 0 and sum(s["indeterminate"] for s in samples) == 0
     _json.dumps(samples)
+
+
+def test_the_checks_after_a_fault_find_every_kind_of_half_saved_transaction(adapter, tmp_path):
+    """Step 7 on a real database: a clean run gives 0 everywhere; then four different atomicity
+    failures are made by hand, and each must be found with its own label."""
+    import json as _json
+
+    from resilience_tests.execution.workload.hooks import split_checks
+    from resilience_tests.execution.workload.markers import MarkerJournals, read_journal
+    from resilience_tests.observability.event_stream import EventStream
+
+    asyncio.run(adapter.prepare_harness_state())
+    w = Workload(profile="tpcc", concurrency=4, transaction_markers=True, rate_tps=100, tpcc={"warehouses": 2})
+    profile = TpccProfile(w)
+    asyncio.run(profile.prepare(adapter))
+
+    async def go():
+        stream, journals = EventStream(tmp_path / "events.jsonl"), MarkerJournals(tmp_path)
+        drv = profile.make_driver(adapter, journals, stream)
+        await drv.start()
+        await asyncio.wait_for(drv.wait_until_ready(), 10)
+        await asyncio.sleep(4)
+        await drv.stop()
+        journals.close()
+        stream.close()
+    asyncio.run(go())
+
+    clean, facts, reasons = split_checks(asyncio.run(profile.consistency_checks(adapter, tmp_path)))
+    assert reasons == {}, reasons
+    assert clean["partial_commits"] == 0 and clean["aborted_markers_present"] == 0
+    assert clean["tpcc_consistency_violations"] == 0 and clean["indeterminate_txn"] == 0, (clean, facts)
+
+    acked = read_journal(tmp_path / "acked.jrnl").records
+    orders = [r for r in acked if "o_id" in r]
+    payments = [r for r in acked if "o_id" not in r]
+    assert len(orders) >= 2 and payments
+    one, two = orders[0], orders[1]
+    # 1. an acknowledged New-Order lost one of its lines (marker kept, rows incomplete)
+    q(adapter, f"DELETE FROM {S}.order_line WHERE ol_w_id=$1 AND ol_d_id=$2 AND ol_o_id=$3 AND ol_number=1",
+      one["w"], one["d"], one["o_id"])
+    # 2. an acknowledged New-Order lost its marker but kept its rows
+    q(adapter, "DELETE FROM resilience.markers WHERE uuid = $1", uuid.UUID(two["uuid"]))
+    # 3. a transaction the journal says was rolled back is in the database
+    q(adapter, "SELECT 1")  # (no-op: the payment below is committed; its uuid is added to the rolled-back journal)
+    with open(tmp_path / "aborted.jrnl", "a") as fh:
+        fh.write(_json.dumps({"uuid": payments[0]["uuid"], "business_rollback": False, "sqlstate": "40P01"}) + "\n")
+    # 4. an unknown New-Order kept its marker but created no order
+    ghost = str(uuid.uuid4())
+    with open(tmp_path / "marker.jrnl", "a") as fh:
+        fh.write(_json.dumps({"seq": 999_999, "uuid": ghost, "t_pre": 0, "type": NEW_ORDER}) + "\n")
+    q(adapter, "INSERT INTO resilience.markers (uuid, seq) VALUES ($1, 999999)", uuid.UUID(ghost))
+
+    broken, facts, reasons = split_checks(asyncio.run(profile.consistency_checks(adapter, tmp_path)))
+    assert reasons == {}, reasons
+    parts = facts["partial_commit_parts"]
+    assert parts["acknowledged_order_incomplete"] == 1                 # case 1
+    assert parts["lost_but_rows_present"] == 1 and facts["lost"] == 1   # case 2: a partial commit, not just a loss
+    assert broken["aborted_markers_present"] == 1                       # case 3
+    assert parts["unexplained_order_count"] == -1                       # case 4
+    assert broken["partial_commits"] == 3                               # cases 1, 2 and 4
+    assert broken["tpcc_consistency_violations"] > 0                    # rules 4 and 6 see case 1 too
