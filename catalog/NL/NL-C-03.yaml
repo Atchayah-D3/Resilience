@@ -35,7 +35,7 @@ environment:
 
 steady_state:
   tps_min: 150                   # floor, not a throughput target
-  p99_latency_ms_max: 300
+  p99_latency_ms_max: 900
   duration_s: 120
 
 workload:

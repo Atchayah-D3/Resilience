@@ -1,0 +1,143 @@
+# NL-N-I03a -- Lock pile-up behind a schema change, run 3a: the schema change carries a lock timeout (judged) (internal NL-N scenario; not a row of
+# Framework §10.6, which lists 8 NL-N rows and no lock pile-up).
+#
+# A schema change needs the strongest lock on its table. While it waits for that lock -- or holds
+# it while it rewrites the table -- every new query on the table queues behind it. The workload
+# is the TPC-C-like workload (Scenario 3 document, section 1) and the table is TPC-C's stock:
+# New-Order and Stock-Level use it (the table users); Payment, Order-Status and Delivery do not
+# (the others). Latency is timed from when each transaction should have started, after a 5-minute
+# unmeasured warm-up and a 2-minute baseline. The TPC-C data must be loaded on the target first
+# (python -m resilience_tests.execution.workload.tpcc.load --warehouses N, N = workload.tpcc.warehouses).
+#
+# Run 3a: a long read holds the table; 1 minute later ADD COLUMN is issued with lock_timeout = 5 s.
+# The protection under test: the schema change gives up (SQLSTATE 55P03) and the queue clears
+# within its timeout, without crashing or restarting the server and without losing a commit.
+#
+# Judged -- the eight checks of the Scenario 3 document (section 9, run 3a), all NEEDS SIGN-OFF
+# (the document's numbers are proposals until its 3-run pilot; the Framework gives no bound):
+#   1 fault_confirmed: the chain (schema change blocked by the read, a workload session blocked
+#     by the schema change) seen within 3 s
+#   2 ddl_lock_timeout_fired (SQLSTATE 55P03)
+#   3 longest_table_wait_s <= 6.0: the longest a table user waited (5 s timeout + 1 s); and
+#     queue_freeze_s <= 6.0, the time the schema change itself was pending
+#   4 other_tables_tps_lost_pct <= 10: what the others lost over the minute after the schema change
+#   5 blocker_visible: the server names the schema change and what it waits for
+#   6 rto_to_slo_s <= 60: back to normal (TPS >= 95% of baseline, p99 <= 1.5x, 60 s straight --
+#     the document's working definition) within 60 s of the queue clearing
+#   7 probe_column_absent: the probe column is gone after the run (and cleanup's revert keeps the
+#     ledger entry outstanding while one is left); harness_sessions_left == 0 (table 20)
+#   8 rpo_txn == 0, corruption_count == 0, structural_integrity_errors == 0 (Framework §16.3),
+#     partial_commits == 0 and tpcc_consistency_violations == 0 (TPC-C: no damaged data)
+# Also judged: settings_unchanged (document 2.3 cleanup check).
+# Also gated: server_crash_restarts == 0. oltp_tps_ratio / oltp_p99_ratio (Framework §10.6
+# contention acceptance) are reported, not gated: the hold includes the queue by design.
+# lock_waits_logged (the server's own lock-wait lines; needs log_lock_waits on) is reported.
+#
+# Every setting is a SESSION setting on the pile-up's own two sessions (tagged by
+# application_name); the server's configuration is never written. Cleanup and the kill switch
+# end the tagged sessions and drop the probe column the schema change added.
+id: NL-N-I03a
+name: Lock pile-up behind a schema change -- lock timeout set
+tier: node_local
+category: NL-N
+applies_to: [standalone]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false
+
+steady_state:
+  tps_min: 45
+  p99_latency_ms_max: 3000
+  duration_s: 120                # the document: 2 minutes of undisturbed baseline
+  warmup_s: 300                  # the document (table 0): 5 minutes of warm-up, not measured
+
+workload:
+  profile: tpcc                  # the document: TPC-C-like workload, New-Order ... Stock-Level
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 60                  # NEEDS SIGN-OFF: the document asks ~60% of the target's measured
+                                 # maximum (tpcc.capacity); set it from that result
+  latency_from: intended_start   # the document: latency from when the transaction should have started
+  tpcc:
+    warehouses: 64              # must equal the loaded data (standard size: 5 per clerk)
+
+fault:
+  type: lock_pileup
+  driver: os_ssh
+  target: primary
+  duration: 120.0                # upper bound on the hold; it ends as soon as the queue clears (~65 s)
+  lock_pileup:
+    blocker: long_read
+    ddl: add_column
+    ddl_lock_timeout_s: 5.0
+    ddl_after_s: 60.0              # the document: the schema change arrives at minute 1
+    table: tpcc_stock              # the document: ALTER TABLE stock ADD COLUMN ...
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:
+  - transactional_markers
+  - structural_integrity_check
+  - tpcc_workload
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - rto_to_slo_s
+  - corruption_count
+  - structural_integrity_errors
+  - starts_unattended
+  - fault_confirmed
+  - oltp_tps_ratio
+  - oltp_p99_ratio
+  - ddl_lock_timeout_fired
+  - ddl_completed
+  - queue_freeze_s
+  - queue_max_sessions
+  - blocker_visible
+  - longest_table_wait_s
+  - other_tables_tps_lost_pct
+  - writer_max_stall_s
+  - server_crash_restarts
+  - lock_waits_logged            # reported: the server's lock-wait log lines (log_lock_waits on)
+  - probe_column_absent          # document check 7 / table 20: the probe column is gone after the run
+  - harness_sessions_left        # document table 20: no harness session left on the server
+  - settings_unchanged           # document 2.3 cleanup check: settings equal what was recorded
+  - partial_commits              # TPC-C: transactions only partly kept (atomicity)
+  - tpcc_consistency_violations  # TPC-C consistency rules after the fault
+  - aborted_markers_present      # reported: rolled-back transactions whose marker was kept
+
+accept:
+  - fault_confirmed == true
+  - ddl_lock_timeout_fired == true
+  - queue_freeze_s <= 6.0
+  - longest_table_wait_s <= 6.0       # document check 3: users of the table wait at most 6 s
+  - other_tables_tps_lost_pct <= 10   # document check 4: the others lose at most 10% over 1 minute
+  - blocker_visible == true
+  - rto_to_slo_s <= 60                # document check 6: back to normal within 60 s of the queue clearing
+  - server_crash_restarts == 0
+  - rpo_txn == 0
+  - corruption_count == 0
+  - structural_integrity_errors == 0
+  - partial_commits == 0              # document check 8: no damaged data (TPC-C atomicity)
+  - tpcc_consistency_violations == 0  # document check 8: no damaged data (TPC-C consistency rules)
+  - probe_column_absent == true       # document check 7
+  - harness_sessions_left == 0        # document table 20
+  - settings_unchanged == true        # document 2.3 cleanup check
+
+priority: P0                     # Scenario 3 document: impact 4
+
+description: >
+  A long read holds the contended table and a schema change with a 5 s lock timeout queues behind
+  it, freezing every table user behind the schema change. The schema change must give up when its
+  timeout fires, table users must wait at most 6 s, the other work must lose at most 10% of its
+  throughput, service must be back to normal within 60 s, and the server must neither crash nor
+  lose a committed transaction. Internal scenario of category NL-N (Framework §10.6).

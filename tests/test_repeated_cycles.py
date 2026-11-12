@@ -382,7 +382,7 @@ def test_corruption_after_the_cycles_fails_the_run(env, footprints, monkeypatch)
 def test_the_summary_shows_every_cycle_not_just_the_ratio(env, footprints):
     from resilience_tests.analysis.report import render_summary
 
-    text = render_summary(run_cycles(env))
+    text = render_summary(run_cycles(env), sections=[])
     assert "per cycle (T0 -> first accepted write)" in text
     assert text.count("  cycle ") == 3
     assert "s per cycle" in text and "bytes per live row" in text
@@ -449,13 +449,16 @@ def test_the_harness_never_retunes_the_server_for_nl_c_05(env, footprints, monke
     bloat figure described a server configuration the customer does not run."""
     observed: list[str] = []
 
-    async def observe(self, fault_type):
-        observed.append(fault_type)
-        return {}
+    def recorder(name):
+        async def observe(self):
+            observed.append(name)
+            return {}
+        return observe
 
-    monkeypatch.setattr(OutageAdapter, "observe_fault_settings", observe)
+    for name in ("observe_idle_transaction_settings", "observe_autovacuum_settings"):
+        monkeypatch.setattr(OutageAdapter, name, recorder(name))
     results = run_cycles(env)
-    assert observed == ["process_kill"]
+    assert observed == []   # a kill reads no settings, and writes none
     assert "scenario_tuning" not in results["facts"]
     assert not any("tuning" in d.lower() for d in results["disclosures"])
 

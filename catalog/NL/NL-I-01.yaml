@@ -2,7 +2,7 @@
 # Fault injection: corrupt a byte in the heap file.
 # Acceptance: detected on read; the error identifies the relation and block.
 #
-# Integrity property (Framework §2.2): corruption is always detected and surfaced, never
+# Integrity property (Framework §1.1, §2.2): corruption is always detected and surfaced, never
 # silent -- conditional on data_checksums=on, which the harness refuses to run without
 # (Framework §3.5, §16.2). Tools per Arch §10.1: pg_checksums (offline checksum verification)
 # proves the fault; pg_amcheck is the structural checker for heap corruption.

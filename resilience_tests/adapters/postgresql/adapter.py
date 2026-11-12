@@ -1,16 +1,16 @@
 """PostgreSQL adapter (Arch §8) -- serves ShaktiDB and standalone PostgreSQL.
 
-Everything PostgreSQL-specific lives here: asyncpg, SQL, the error taxonomy, pg_amcheck,
-page-checksum counters and the durability settings. The rest of the harness knows none of it.
+Everything PostgreSQL-specific lives in this package: asyncpg, SQL, the error taxonomy,
+pg_amcheck, page-checksum counters and the durability settings. The rest of the harness knows
+none of it. This module holds the core (connections, markers, settings, integrity); the
+methods for particular faults are mixed in from corruption.py, operations.py and sessions.py.
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 import re
-import shlex
-import time
-from collections.abc import Sequence
+from collections.abc import Mapping
 from typing import Any
 
 import asyncpg
@@ -24,8 +24,35 @@ from resilience_tests.adapters.base import (
     TransactionOutcome,
     register_adapter,
 )
+from resilience_tests.adapters.postgresql.corruption import (  # noqa: F401  (re-exported)
+    CORRUPTION_TARGET,
+    _INVALID_PAGE_RE,
+    CorruptionMixin,
+)
+from resilience_tests.adapters.postgresql.operations import (  # noqa: F401  (re-exported)
+    AVAC_ANY_WORKER_SQL,
+    AVAC_SETTINGS,
+    AVAC_MAKE_DEAD,
+    AVAC_RELATIONS_SQL,
+    AVAC_TABLE,
+    AVAC_WORKERS_SQL,
+    CIC_INDEX_QUALIFIED,
+    recovery_redo_start_lsn,
+    OperationsMixin,
+)
+from resilience_tests.adapters.postgresql.sessions import (  # noqa: F401  (re-exported)
+    CONTENDED_RELNAME,
+    CONTENDED_ROWS,
+    CONTENDED_SCHEMA,
+    CONTENDED_TABLE,
+    IDLE_SESSION_APPLICATION_NAME,
+    LOCK_PILEUP_APPLICATION_NAMES,
+    SessionsMixin,
+    parse_pg_interval_s,
+)
+from resilience_tests.adapters.postgresql.tpcc import TpccMixin, call_tpcc  # TPC-C SQL (build steps 4, 6)
 from resilience_tests.control.profile import DbEndpoint, Node
-from resilience_tests.execution.remote import RemoteHost, as_user
+from resilience_tests.execution.remote import RemoteHost, privileged
 
 HARNESS_DDL = """
 CREATE SCHEMA IF NOT EXISTS resilience;
@@ -111,107 +138,35 @@ ELLE_READ = "SELECT v FROM resilience.elle_lists WHERE k = $1"
 ELLE_APPEND = ("INSERT INTO resilience.elle_lists AS l (k, v) VALUES ($1, ARRAY[$2::bigint]) "
                "ON CONFLICT (k) DO UPDATE SET v = l.v || $2::bigint")
 
-# NL-C-03 (Framework §10.2): "kill -9 during a 10M-row INSERT". The kill is sent once the
-# child table has demonstrably grown by BULK_IN_FLIGHT_BYTES inside the open transaction --
-# far enough in that partial rows exist on disk, far from the end so the INSERT cannot finish
-# first. Whether it did is checked after recovery anyway: a committed transaction would leave
-# rows visible and fail the scenario.
-BULK_ROWS = 10_000_000
-BULK_PARENT_ID = 1
-BULK_IN_FLIGHT_BYTES = 64 * 1024 * 1024
-BULK_CONFIRM_TIMEOUT_S = 60.0
-BULK_INSERT = ("INSERT INTO resilience.bulk_child (id, parent_id, payload) "
-               "SELECT g, $1, 'nl-c-03' FROM generate_series(1, $2) g")
 
-# NL-C-06: the index is built on its own table, large enough that the build is still running
-# when the kill lands, and never on a table other scenarios write to.
-CIC_TABLE = "resilience.cic_target"
-CIC_INDEX = "cic_nlc06_idx"               # created in the table's schema
-CIC_INDEX_QUALIFIED = f"resilience.{CIC_INDEX}"
-CIC_ROWS = 2_000_000
-CIC_CONFIRM_TIMEOUT_S = 30.0
-# fault.during: checkpoint (NL-C-02). The harness's own CHECKPOINT runs at full speed; with
-# little changed data it can complete before the kill arrives, and the run is then aborted
-# because it tested an ordinary crash. Just before the CHECKPOINT the harness updates every
-# row of this harness-owned table, so the checkpoint has a known amount of data to write.
-# Sized from the server's shared_buffers so the changed pages stay in memory and are written
-# by the checkpoint itself. fillfactor 50 and no index keep each update on its own page, so
-# the table is rewritten in place on every run rather than growing.
-CKPT_TABLE = "resilience.checkpoint_ballast"
-CKPT_FRACTION_OF_SHARED_BUFFERS = 0.25
-CKPT_BYTES_PER_ROW = 500               # a ~250-byte row on a half-filled page
-CKPT_DDL = (f"CREATE TABLE IF NOT EXISTS {CKPT_TABLE} (id bigint NOT NULL, v bigint NOT NULL DEFAULT 0, "
-            "pad text NOT NULL) WITH (fillfactor = 50)")
-CKPT_SEED = f"INSERT INTO {CKPT_TABLE} (id, pad) SELECT g, repeat('b', 200) FROM generate_series(1, $1) g"
-SHARED_BUFFERS_BYTES_SQL = ("SELECT setting::bigint * current_setting('block_size')::bigint "
-                            "FROM pg_settings WHERE name = 'shared_buffers'")
-
-CIC_DDL = f"CREATE TABLE IF NOT EXISTS {CIC_TABLE} (id bigint NOT NULL, k text NOT NULL)"
-CIC_SEED = f"INSERT INTO {CIC_TABLE} (id, k) SELECT g, md5(g::text) FROM generate_series(1, $1) g"
-CIC_BUILD = f"CREATE INDEX CONCURRENTLY {CIC_INDEX} ON {CIC_TABLE} (k)"
-CIC_INDEX_STATE = """
-SELECT i.indisvalid, i.indisready
-  FROM pg_index i
-  JOIN pg_class c ON c.oid = i.indexrelid
-  JOIN pg_namespace n ON n.oid = c.relnamespace
- WHERE n.nspname = 'resilience' AND c.relname = $1
-"""
 # A previous version of NL-C-06 built its index on resilience.markers; removed if still there.
 LEGACY_CIC_INDEX = "resilience.idx_nlc06_concurrent"
 
-# NL-R-04: flood sessions carry this application_name, so a revert -- even from a kill switch
-# in another process -- can find and terminate exactly them and nothing else.
-FLOOD_APPLICATION_NAME = "resilience-flood"
-FLOOD_CONNECT_TIMEOUT_S = 3.0
-FLOOD_RECOVERY_TIMEOUT_S = 10.0
 
-# NL-M-03 (Framework §10.7): a harness-owned table whose autovacuum lasts seconds, so a worker
-# can be caught alive and killed. With the deployment's own settings a vacuum of the small
-# churn table ends in milliseconds -- faster than the kill can arrive. These storage options
-# are the harness table's own (a harness object, disclosed), never global configuration:
-# threshold 1,000 dead rows with no scale factor, and a cost delay that paces the vacuum.
-AVAC_TABLE = "resilience.avac_target"
-AVAC_ROWS = 1_000_000
-AVAC_DDL = f"CREATE TABLE IF NOT EXISTS {AVAC_TABLE} (id bigint PRIMARY KEY, v int NOT NULL DEFAULT 0)"
-AVAC_OPTIONS = {"autovacuum_vacuum_threshold": "1000", "autovacuum_vacuum_scale_factor": "0",
-                "autovacuum_vacuum_cost_delay": "20", "autovacuum_vacuum_cost_limit": "200"}
-AVAC_SEED = f"INSERT INTO {AVAC_TABLE} (id) SELECT g FROM generate_series(1, $1) g"
-# a quarter of the rows per round, a different quarter each time: dead tuples on every page
-AVAC_MAKE_DEAD = f"UPDATE {AVAC_TABLE} SET v = v + 1 WHERE id % 4 = $1"
-AVAC_TITLE_MARKER = "autovacuum worker"   # PostgreSQL's process title for the worker
-AVAC_POLL_S = 0.05
-AVAC_WAIT_SLACK_S = 30.0                  # worker wait = 2 x naptime + this
-AVAC_VERIFY_NAPTIMES = 3                  # "permanently" = 3 x naptime + vacuum time (clarified)
-AVAC_VERIFY_SAMPLE_S = 2.0
-AVAC_VERIFY_CAP_S = 900.0                 # half the profiles' validate bound
-# A running autovacuum VACUUM (not ANALYZE-only) of this instance, with the relation it is on.
-AVAC_WORKERS_SQL = """
-SELECT a.pid, a.query, p.phase, p.relid::regclass::text AS relation
-  FROM pg_stat_activity a
-  JOIN pg_stat_progress_vacuum p ON p.pid = a.pid
- WHERE a.backend_type = 'autovacuum worker'
+# NL-N-I03: the contended table (sessions.py names it). Created and seeded only when a scenario
+# declares workload.contended_share, and kept between runs. Every column a pile-up's schema
+# change adds and drops again keeps its slot (PostgreSQL never reuses one; a table has at most
+# 1,600), so the table is rebuilt once the slots used pass CONTENDED_MAX_ATTRIBUTES.
+CONTENDED_DDL = f"""
+CREATE SCHEMA IF NOT EXISTS {CONTENDED_SCHEMA};
+CREATE TABLE IF NOT EXISTS {CONTENDED_TABLE} (
+    id         bigint PRIMARY KEY,
+    val        bigint NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+)
 """
-AVAC_ANY_WORKER_SQL = "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'autovacuum worker'"
-# Per relation: dead tuples, the deployment's (or the table's own) vacuum threshold, and
-# whether autovacuum ran after the given database-clock instant.
-AVAC_RELATIONS_SQL = """
-WITH g AS (
-  SELECT current_setting('autovacuum_vacuum_threshold')::float8 AS th,
-         current_setting('autovacuum_vacuum_scale_factor')::float8 AS sf)
-SELECT s.schemaname || '.' || s.relname AS relation,
-       s.n_dead_tup AS dead,
-       coalesce((SELECT split_part(o, '=', 2)::float8 FROM unnest(c.reloptions) o
-                  WHERE o LIKE 'autovacuum_vacuum_threshold=%'), g.th)
-     + coalesce((SELECT split_part(o, '=', 2)::float8 FROM unnest(c.reloptions) o
-                  WHERE o LIKE 'autovacuum_vacuum_scale_factor=%'), g.sf)
-       * greatest(c.reltuples, 0) AS threshold,
-       (s.last_autovacuum IS NOT NULL AND s.last_autovacuum >= $1) AS vacuumed_after
-  FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid, g
-"""
-AVAC_SETTINGS = ("autovacuum", "track_counts", "autovacuum_naptime", "autovacuum_max_workers",
-                 "autovacuum_vacuum_cost_delay", "autovacuum_vacuum_cost_limit",
-                 "autovacuum_vacuum_threshold", "autovacuum_vacuum_scale_factor",
-                 "restart_after_crash", "update_process_title")
+SEED_CONTENDED = (f"INSERT INTO {CONTENDED_TABLE} (id) SELECT g FROM generate_series(1, $1) g "
+                  "ON CONFLICT (id) DO NOTHING")
+CONTENDED_ATTRIBUTES_SQL = ("SELECT count(*) FROM pg_attribute "
+                            f"WHERE attrelid = '{CONTENDED_TABLE}'::regclass AND attnum > 0")
+CONTENDED_MAX_ATTRIBUTES = 1_000
+# One transaction of a table user: the marker insert, plus a read and an update of one row. The
+# transaction's own lock and statement timeouts are cleared, so a wait it meets is measured as
+# latency rather than ended by whatever timeout the role or server carries.
+CONTENDED_NO_TIMEOUTS = ("SET LOCAL lock_timeout = 0", "SET LOCAL statement_timeout = 0")
+CONTENDED_READ = f"SELECT val FROM {CONTENDED_TABLE} WHERE id = $1"
+CONTENDED_UPDATE = f"UPDATE {CONTENDED_TABLE} SET val = val + 1, updated_at = clock_timestamp() WHERE id = $1"
+
 
 DURABILITY_SETTINGS = ["data_checksums", "fsync", "synchronous_commit", "full_page_writes",
                        "wal_sync_method", "server_version"]
@@ -270,25 +225,6 @@ SELECT coalesce(sum(size)::bigint, 0)                            AS wal_bytes,
 REDO_DISTANCE_SQL = ("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), redo_lsn)::bigint "
                      "FROM pg_control_checkpoint()")
 
-# NL-M-05: the injected idle session carries this application_name, so it -- and only it --
-# can be found and ended again, by cleanup or by the kill switch after a harness crash.
-IDLE_SESSION_APPLICATION_NAME = "resilience-harness-idle"
-TERMINATE_IDLE_SESSIONS_SQL = ("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
-                               "WHERE application_name = $1 AND pid <> pg_backend_pid()")
-IDLE_CONFIRM_TIMEOUT_S = 5.0
-VACUUM_PROBE_TIMEOUT_S = 120.0
-_DEAD_NOT_REMOVABLE_RE = re.compile(r"(\d+) are dead but not yet removable")
-_REMOVABLE_CUTOFF_RE = re.compile(r"removable cutoff: (\d+)")
-
-# NL-I (fault type data_corruption): the harness-owned relation the fault corrupts. Its own
-# table, so a byte is only ever flipped in data the harness created; never markers, never
-# operator data. autovacuum is off on it so nothing in the background reads the damaged page
-# before the harness does -- the first read is the one that is measured.
-CORRUPTION_TARGET = "resilience.corruption_target"
-CORRUPTION_TARGET_ROWS = 2_000          # ~35 pages: a page in the middle is surely populated
-CORRUPTION_BYTE_FROM_PAGE_END = 64      # inside the tuple area, far from the page header
-# PostgreSQL: "invalid page in block 17 of relation base/16384/16400" (SQLSTATE XX001)
-_INVALID_PAGE_RE = re.compile(r"invalid page in block (\d+) of relation (\S+)")
 
 _SAME_AS_CONNECT: Any = object()  # sentinel: bound statements by the connect timeout
 
@@ -311,47 +247,41 @@ def checksum_failures_since(baseline: ChecksumStats | None, now: ChecksumStats) 
     return total
 
 
-# Written by the replacement postmaster at the start of crash recovery, e.g.
-# "LOG:  redo starts at 0/3000108". The LSN is the redo point recovery replays from.
-_REDO_STARTS_RE = re.compile(r"redo starts at ([0-9A-Fa-f]+)/([0-9A-Fa-f]+)")
-
-
-def parse_pg_interval_s(val: str | None) -> float:
-    """Parse PostgreSQL interval strings such as '30s', '1min', '2h', '500ms', '0' into seconds."""
-    if not val:
-        return 0.0
-    val = str(val).strip().lower()
-    if val in ("0", "disabled", "off", "none"):
-        return 0.0
-    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)?$", val)
-    if not m:
-        return 0.0
-    num = float(m.group(1))
-    unit = m.group(2) or "s"
-    if unit in ("ms", "millisecond", "milliseconds"):
-        return num / 1000.0
-    elif unit in ("s", "sec", "second", "seconds"):
-        return num
-    elif unit in ("min", "m", "minute", "minutes"):
-        return num * 60.0
-    elif unit in ("h", "hr", "hour", "hours"):
-        return num * 3600.0
-    elif unit in ("d", "day", "days"):
-        return num * 86400.0
-    return num
-
-
-def recovery_redo_start_lsn(log_lines: Sequence[str]) -> int | None:
-    """The LSN crash recovery started replaying from, from the first matching log line."""
-    for line in log_lines:
-        m = _REDO_STARTS_RE.search(line)
-        if m:
-            return (int(m.group(1), 16) << 32) | int(m.group(2), 16)
-    return None
-
-
-def _format_lsn(lsn: int | None) -> str | None:
-    return None if lsn is None else f"{int(lsn) >> 32:X}/{int(lsn) & 0xFFFFFFFF:X}"
+# Database activity, one snapshot per call (Resilience Testing document, section 2.3: "wait events,
+# locks, connections, WAL and checkpoints, dead rows, temporary files ... sampled every second").
+# Read only; counters are cumulative and the analysis takes their differences. {checkpoints} is
+# filled per server version: pg_stat_checkpointer from PostgreSQL 17, pg_stat_bgwriter before.
+ACTIVITY_SQL = """
+SELECT json_build_object(
+  'connections_by_state', (SELECT coalesce(json_object_agg(st, n), '{{}}'::json) FROM
+      (SELECT coalesce(state, 'background') AS st, count(*) AS n FROM pg_stat_activity GROUP BY 1) s),
+  'client_connections', (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'),
+  'max_connections', current_setting('max_connections')::int,
+  'wait_events', (SELECT coalesce(json_object_agg(k, n), '{{}}'::json) FROM
+      (SELECT wait_event_type || ':' || wait_event AS k, count(*) AS n FROM pg_stat_activity
+        WHERE state = 'active' AND wait_event IS NOT NULL AND pid <> pg_backend_pid() GROUP BY 1) w),
+  'lock_waiters', (SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'),
+  'longest_transaction_s', (SELECT coalesce(extract(epoch FROM max(clock_timestamp() - xact_start)), 0)
+      FROM pg_stat_activity WHERE xact_start IS NOT NULL AND pid <> pg_backend_pid()
+        AND backend_type = 'client backend'),
+  'autovacuum_workers', (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'autovacuum worker'),
+  'wal_lsn_bytes', CASE WHEN pg_is_in_recovery() THEN NULL
+                        ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') END,
+  'checkpoints', {checkpoints},
+  'database', (SELECT json_build_object('xact_commit', xact_commit, 'xact_rollback', xact_rollback,
+      'blks_read', blks_read, 'blks_hit', blks_hit, 'temp_files', temp_files, 'temp_bytes', temp_bytes,
+      'deadlocks', deadlocks) FROM pg_stat_database WHERE datname = current_database()),
+  'dead_tuples', (SELECT coalesce(sum(n_dead_tup), 0) FROM pg_stat_user_tables),
+  'live_tuples', (SELECT coalesce(sum(n_live_tup), 0) FROM pg_stat_user_tables)
+)::text
+"""
+ACTIVITY_CHECKPOINTS_17 = ("(SELECT json_build_object('timed', num_timed, 'requested', num_requested, "
+                           "'write_time_ms', write_time, 'sync_time_ms', sync_time, "
+                           "'buffers_written', buffers_written) FROM pg_stat_checkpointer)")
+ACTIVITY_CHECKPOINTS_OLD = ("(SELECT json_build_object('timed', checkpoints_timed, 'requested', checkpoints_req, "
+                            "'write_time_ms', checkpoint_write_time, 'sync_time_ms', checkpoint_sync_time, "
+                            "'buffers_written', buffers_checkpoint) FROM pg_stat_bgwriter)")
+ACTIVITY_TIMEOUT_S = 3.0
 
 
 class PostgreSQLSession(DatabaseSession):
@@ -407,6 +337,28 @@ class PostgreSQLSession(DatabaseSession):
             ("r", append_key, None if after is None else list(after)),
         ]
 
+    async def commit_marker_with_contended_row(self, seq: int, marker_id: str, key: int) -> TransactionOutcome:
+        try:
+            async with self._conn.transaction():
+                for statement in CONTENDED_NO_TIMEOUTS:
+                    await self._conn.execute(statement)
+                await self._conn.execute(INSERT_MARKER, marker_id, seq)
+                await self._conn.fetchval(CONTENDED_READ, key)
+                await self._conn.execute(CONTENDED_UPDATE, key)
+        except _DEFINITE_ABORT:
+            return TransactionOutcome.DEFINITELY_ABORTED
+        except _CONNECTION_ERRORS:
+            await self.close()
+            return TransactionOutcome.UNKNOWN
+        return TransactionOutcome.COMMITTED
+
+    async def tpcc_execute(self, txn_type: str, inputs: Mapping[str, Any],
+                           marker: tuple[int, str] | None) -> tuple[str, dict[str, Any], str | None]:
+        outcome, journal, sqlstate = await call_tpcc(self._conn, txn_type, inputs, marker)
+        if outcome == "unknown":
+            await self.close()          # no longer trustworthy: the workload reconnects
+        return outcome, journal, sqlstate
+
     async def try_write(self) -> bool:
         try:
             await self._conn.execute(PROBE_WRITE)
@@ -435,9 +387,11 @@ class PostgreSQLSession(DatabaseSession):
 
 
 @register_adapter
-class PostgreSQLAdapter(BaseDatabaseAdapter):
+class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMixin, BaseDatabaseAdapter):
     engine = "postgresql"
     capabilities = frozenset({
+        Capability.TPCC_WORKLOAD,          # tables, loader, the five functions, consistency (TPC-C steps 4, 6)
+        Capability.CONTENDED_TABLE,        # NL-N-I03: the harness-owned contended table
         Capability.TRANSACTIONAL_MARKERS,
         Capability.WORKLOAD_CHURN,
         Capability.STRUCTURAL_INTEGRITY_CHECK,
@@ -447,10 +401,14 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
     })
 
     churn_key_space = CHURN_ROWS
+    contended_key_space = CONTENDED_ROWS
 
     def __init__(self, node: Node) -> None:
         super().__init__(node)
         self._checksum_baseline: ChecksumStats | None = None
+        # activity_snapshot(): one connection kept for the sampler, and its query for this server version
+        self._activity_conn: asyncpg.Connection | None = None
+        self._activity_sql: str | None = None
 
     async def _connect(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0,
                        command_timeout: float | None = _SAME_AS_CONNECT,
@@ -467,33 +425,38 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
     def _psql_as_os_user(self, sql: str, *, tuples_only: bool = True) -> str:
         """psql over SSH as the cluster's OS user: a superuser on the local socket, which is
         what reads and acts on other roles' sessions."""
-        flags = "-X -At -v ON_ERROR_STOP=1" if tuples_only else "-X -v ON_ERROR_STOP=1"
-        return as_user(self.node.os_user,
-                       f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} {flags} -p {self.node.db.port} "
-                       f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(sql)}")
+        flags = ["-X", "-At", "-v", "ON_ERROR_STOP=1"] if tuples_only else ["-X", "-v", "ON_ERROR_STOP=1"]
+        return self._as_os_user(["psql", *flags, "-p", str(self.node.db.port), "-d", self.node.db.dbname, "-c", sql])
 
-    async def session(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0) -> DatabaseSession:
+    def _as_os_user(self, argv: list[str]) -> str:
+        """One of the engine's own programs (argv[0] in pg_bin), run on the target as the
+        cluster's OS user from /tmp, in the form the environment allows (remote.privileged)."""
+        return privileged(self.node.ssh, [f"{self.node.pg_bin}/{argv[0]}", *argv[1:]], user=self.node.os_user, cwd="/tmp")
+
+    async def session(self, endpoint: DbEndpoint | None = None, timeout_s: float = 5.0,
+                      settings: Mapping[str, str] | None = None) -> DatabaseSession:
         """A workload/probe session. Statements are NOT bounded by the connect timeout: the
         caller bounds its own operation (the workload gives a marker transaction
         TXN_TIMEOUT_S, a probe gives its attempt PROBE_ATTEMPT_TIMEOUT_S). Tying the two
         together made a commit slower than the 2 s connect timeout indeterminate -- dropping
         genuine losses out of rpo_txn, and counting a latency spike as a dropped connection."""
-        return PostgreSQLSession(await self._connect(endpoint or self.node.client, timeout_s, command_timeout=None))
+        # `settings` travel in the connection's startup message, so they apply to this session
+        # only, from its first statement (no SET round trip, nothing changed for other sessions).
+        return PostgreSQLSession(await self._connect(endpoint or self.node.client, timeout_s, command_timeout=None,
+                                                     server_settings=dict(settings) if settings else None))
 
     async def prepare_harness_state(self) -> None:
         # Pre-grant required roles to harness user if running against a cluster with SSH access.
         # PostgreSQL 15+ restricts CHECKPOINT to superusers and members of 'pg_checkpoint',
         # and pg_stat_activity detailed monitoring to 'pg_read_all_stats'. The grant persists
         # (it is not revoked at cleanup), so it is recorded for the report's disclosures.
-        self.harness_grants: list[str] = []
+        self.harness_grants = []
         try:
             async with RemoteHost(self.node.ssh) as host:
-                grant_cmd = (
-                    f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -p {self.node.db.port} "
-                    f"-d {shlex.quote(self.node.db.dbname)} -c "
-                    f"{shlex.quote(f'GRANT pg_checkpoint, pg_read_all_stats TO {self.node.db.user};')}"
-                )
-                r = await host.run(as_user(self.node.os_user, grant_cmd), timeout_s=10.0, check=False)
+                grant_cmd = self._as_os_user([
+                    "psql", "-X", "-p", str(self.node.db.port), "-d", self.node.db.dbname, "-c",
+                    f"GRANT pg_checkpoint, pg_read_all_stats TO {self.node.db.user};"])
+                r = await host.run(grant_cmd, timeout_s=10.0, check=False)
                 if r.exit_status == 0:
                     self.harness_grants = ["pg_checkpoint", "pg_read_all_stats"]
         except Exception:
@@ -518,65 +481,18 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         finally:
             await conn.close()
 
-    corruption_sqlstates = ("XX001",)  # data_corrupted
-
-    async def prepare_corruption_target(self) -> dict[str, Any]:
-        """Recreate the corruption target and locate a populated page in its data file."""
-        conn = await self._connect(timeout_s=60.0)
-        try:
-            await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
-            await conn.execute(f"CREATE TABLE {CORRUPTION_TARGET} (id int NOT NULL, payload text NOT NULL) "
-                               "WITH (autovacuum_enabled = false)")
-            await conn.execute(f"INSERT INTO {CORRUPTION_TARGET} SELECT g, repeat('c', 100) "
-                               "FROM generate_series(1, $1) g", CORRUPTION_TARGET_ROWS)
-            row = await conn.fetchrow(
-                "SELECT pg_relation_filepath($1::regclass) AS path, "
-                "pg_relation_filenode($1::regclass)::bigint AS filenode, "
-                "current_setting('block_size')::int AS block_size, "
-                "pg_relation_size($1::regclass)::bigint AS bytes", CORRUPTION_TARGET)
-        finally:
-            await conn.close()
-        pages = int(row["bytes"]) // int(row["block_size"])
-        return {
-            "relation": CORRUPTION_TARGET,
-            "relation_path": str(row["path"]),
-            "filenode": int(row["filenode"]),
-            "block": pages // 2,
-            "pages": pages,
-            "block_size": int(row["block_size"]),
-            "byte_in_page": int(row["block_size"]) - CORRUPTION_BYTE_FROM_PAGE_END,
-            "rows": CORRUPTION_TARGET_ROWS,
-        }
-
-    async def read_corruption_target(self, attempts: int = 2) -> dict[str, Any]:
-        """A full sequential read (count(*) over a table with no index reads every page),
-        on a fresh connection each time so no attempt is answered from a session cache."""
-        out = []
-        for _ in range(attempts):
-            conn = await self._connect(timeout_s=10.0, command_timeout=60.0)
-            try:
-                rows = await conn.fetchval(f"SELECT count(*) FROM {CORRUPTION_TARGET}")
-                out.append({"error": None, "rows": int(rows)})
-            except asyncpg.PostgresError as exc:
-                message = str(exc)
-                where = _INVALID_PAGE_RE.search(message)
-                out.append({"error": type(exc).__name__, "sqlstate": getattr(exc, "sqlstate", None),
-                            "message": message[:500],
-                            "block": int(where.group(1)) if where else None,
-                            "relation_path": where.group(2) if where else None})
-            finally:
-                await conn.close()
-        return {"attempts": out}
-
-    async def amcheck_relation(self, relation: str, timeout_s: float) -> dict[str, Any]:
+    async def amcheck_relation(self, relation: str, timeout_s: float, *,
+                               heapallindexed: bool = False) -> dict[str, Any]:
         """pg_amcheck on the one relation (Arch §10.1 names it for NL-I-01). A checksum failure
         surfaces either as a reported finding or as the check's own read failing with the
-        invalid-page error; both mean the checker noticed. A clean exit means it did not."""
+        invalid-page error; both mean the checker noticed. A clean exit means it did not.
+        `corrupt_pages` lists every page the checker could not read, so the caller can tell
+        whether it found THE damaged page rather than merely something."""
         node = self.node
-        command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
-                   f"-d {shlex.quote(node.db.dbname)} --relation={shlex.quote(relation)}")
+        command = self._as_os_user(["pg_amcheck", "-p", str(node.db.port), "-d", node.db.dbname,
+                                    f"--relation={relation}"] + (["--heapallindexed"] if heapallindexed else []))
         async with RemoteHost(node.ssh) as host:
-            result = await host.run(as_user(node.os_user, command), timeout_s=timeout_s, check=False)
+            result = await host.run(command, timeout_s=timeout_s, check=False)
         output = (result.stdout + result.stderr).strip()
         noticed = bool(_AMCHECK_FINDING_RE.search(output) or _INVALID_PAGE_RE.search(output)
                        or "checksum" in output.lower())
@@ -586,342 +502,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             detected = True
         else:
             detected = None   # e.g. could not connect, or exited non-zero for another reason
-        return {"detected": detected, "exit_status": result.exit_status, "output": output[:2000]}
-
-    def corruption_log_locations(self, lines: Sequence[str]) -> list[tuple[int, str]]:
-        found = []
-        for line in lines:
-            m = _INVALID_PAGE_RE.search(line)
-            if m:
-                found.append((int(m.group(1)), m.group(2)))
-        return found
-
-    def idle_session_timeout_s(self, observed: dict[str, str]) -> float:
-        return parse_pg_interval_s(observed.get("idle_in_transaction_session_timeout"))
-
-    # ------------------------------------------------------------------ fault.during
-
-    async def prepare_scenario_objects(self, during: str | None) -> dict[str, Any]:
-        """Objects a `during` operation needs, created in init -- before the baseline, so
-        seeding them never disturbs the steady state being measured."""
-        if during == "autovacuum_worker":
-            return await self._prepare_avac_table()
-        if during == "checkpoint":
-            return await self._prepare_checkpoint_table()
-        if during != "concurrent_index_build":
-            return {}
-        conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
-        try:
-            await conn.execute(CIC_DDL)
-            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
-            rows = await conn.fetchval(f"SELECT count(*) FROM {CIC_TABLE}")
-            if rows != CIC_ROWS:
-                # reseeded only when it is not exactly the expected size, so a run normally
-                # reuses the table rather than rewriting it
-                await conn.execute(f"TRUNCATE {CIC_TABLE}")
-                await conn.execute(CIC_SEED, CIC_ROWS)
-                await conn.execute(f"VACUUM (ANALYZE) {CIC_TABLE}")
-            return {"table": CIC_TABLE, "rows": CIC_ROWS, "reseeded": rows != CIC_ROWS}
-        finally:
-            await conn.close()
-
-    async def _prepare_avac_table(self) -> dict[str, Any]:
-        conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
-        try:
-            await conn.execute(AVAC_DDL)
-            opts = ", ".join(f"{k} = {v}" for k, v in AVAC_OPTIONS.items())
-            await conn.execute(f"ALTER TABLE {AVAC_TABLE} SET ({opts})")
-            rows = await conn.fetchval(f"SELECT count(*) FROM {AVAC_TABLE}")
-            if rows != AVAC_ROWS:
-                await conn.execute(f"TRUNCATE {AVAC_TABLE}")
-                await conn.execute(AVAC_SEED, AVAC_ROWS)
-                await conn.execute(f"VACUUM (ANALYZE) {AVAC_TABLE}")
-            self._avac_round = 0
-            return {"table": AVAC_TABLE, "rows": AVAC_ROWS, "reseeded": rows != AVAC_ROWS,
-                    "table_options": dict(AVAC_OPTIONS)}
-        finally:
-            await conn.close()
-
-    async def _naptime_s(self, conn: asyncpg.Connection) -> float:
-        # pg_settings reports seconds; SHOW would say '1min'
-        return float(await conn.fetchval("SELECT setting::float8 FROM pg_settings WHERE name = 'autovacuum_naptime'"))
-
-    async def _make_dead_tuples(self, conn: asyncpg.Connection) -> int:
-        """Dead tuples on the harness table, created AFTER the latest recovery: crash recovery
-        discards the statistics autovacuum uses to choose tables, so earlier ones are unseen."""
-        self._avac_round = (getattr(self, "_avac_round", 0) + 1) % 4
-        status = await conn.execute(AVAC_MAKE_DEAD, self._avac_round)
-        return int(status.split()[-1]) if status.split()[-1].isdigit() else 0
-
-    async def start_autovacuum_worker(self) -> dict[str, Any]:
-        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
-        try:
-            naptime = await self._naptime_s(conn)
-            wait_s = 2 * naptime + AVAC_WAIT_SLACK_S
-            dead = await self._make_dead_tuples(conn)
-            t = time.monotonic()
-            while time.monotonic() - t < wait_s:
-                for row in await conn.fetch(AVAC_WORKERS_SQL):
-                    if row["relation"] == AVAC_TABLE:
-                        query = row["query"] or ""
-                        return {"in_progress": True, "dead_tuples_made": dead, "naptime_s": naptime,
-                                "kill_target": {
-                                    "pid": int(row["pid"]), "title_marker": AVAC_TITLE_MARKER,
-                                    "relation": row["relation"], "phase": row["phase"],
-                                    "wraparound": "to prevent wraparound" in query,
-                                    "observed_after_s": round(time.monotonic() - t, 3)}}
-                await asyncio.sleep(AVAC_POLL_S)
-            return {"in_progress": False, "dead_tuples_made": dead, "naptime_s": naptime,
-                    "note": f"no autovacuum worker vacuumed {AVAC_TABLE} within {wait_s:.0f} s "
-                            f"(2 x autovacuum_naptime {naptime:.0f} s + {AVAC_WAIT_SLACK_S:.0f} s)"}
-        finally:
-            await conn.close()
-
-    async def verify_autovacuum_resumed(self) -> dict[str, Any]:
-        """After the final recovery (research R6). Crash recovery reset the statistics, so a
-        last-autovacuum time at or after `t_recovered` can only come from a vacuum after the
-        last kill. Fresh dead tuples on the harness table guarantee at least one relation is
-        eligible; a run where none became eligible reports None, never 0."""
-        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
-        try:
-            naptime = await self._naptime_s(conn)
-            bound_s = AVAC_VERIFY_NAPTIMES * naptime
-            t_recovered = await conn.fetchval("SELECT now()")
-            dead = await self._make_dead_tuples(conn)
-            eligible: dict[str, dict[str, Any]] = {}
-            vacuumed: set[str] = set()
-            respawned = False
-            t = time.monotonic()
-            while True:
-                if int(await conn.fetchval(AVAC_ANY_WORKER_SQL)) > 0:
-                    respawned = True
-                for r in await conn.fetch(AVAC_RELATIONS_SQL, t_recovered):
-                    rel = r["relation"]
-                    if r["dead"] > r["threshold"] and rel not in eligible:
-                        eligible[rel] = {"dead": int(r["dead"]), "threshold": float(r["threshold"]),
-                                         "eligible_after_s": round(time.monotonic() - t, 1)}
-                    if r["vacuumed_after"]:
-                        vacuumed.add(rel)
-                elapsed = time.monotonic() - t
-                pending = set(eligible) - vacuumed
-                if AVAC_TABLE in eligible and not pending and respawned:
-                    # everything proven, including the table the harness itself made eligible
-                    # after the last recovery (its statistics can lag the update by a second)
-                    break
-                busy = any(row["relation"] in pending for row in await conn.fetch(AVAC_WORKERS_SQL))
-                if elapsed >= AVAC_VERIFY_CAP_S or (elapsed >= bound_s and not busy):
-                    break                                   # bound reached, nothing still vacuuming
-                await asyncio.sleep(AVAC_VERIFY_SAMPLE_S)
-            unvacuumed = sorted(set(eligible) - vacuumed)
-            return {"autovacuum_worker_respawned": respawned,
-                    "relations_eligible": len(eligible),
-                    "relations_left_unvacuumed": len(unvacuumed) if eligible else None,
-                    "relations_left_unvacuumed_why": None if eligible else (
-                        "no relation became eligible for autovacuum during verification"),
-                    "unvacuumed": unvacuumed, "eligible": eligible,
-                    "bound_s": bound_s, "waited_s": round(time.monotonic() - t, 1),
-                    "t_recovered": str(t_recovered), "dead_tuples_made": dead}
-        finally:
-            await conn.close()
-
-    async def _prepare_checkpoint_table(self) -> dict[str, Any]:
-        """Create the checkpoint table, sized to a fraction of this server's shared_buffers.
-        An existing table of the right size is reused; otherwise it is reseeded."""
-        conn = await self._connect(timeout_s=30.0, command_timeout=600.0)
-        try:
-            shared = int(await conn.fetchval(SHARED_BUFFERS_BYTES_SQL))
-            target_bytes = int(shared * CKPT_FRACTION_OF_SHARED_BUFFERS)
-            rows = max(1, target_bytes // CKPT_BYTES_PER_ROW)
-            await conn.execute(CKPT_DDL)
-            have = int(await conn.fetchval(f"SELECT count(*) FROM {CKPT_TABLE}"))
-            if have != rows:
-                await conn.execute(f"TRUNCATE {CKPT_TABLE}")
-                await conn.execute(CKPT_SEED, rows)
-                await conn.execute(f"VACUUM (ANALYZE) {CKPT_TABLE}")
-            size = int(await conn.fetchval(f"SELECT pg_relation_size('{CKPT_TABLE}')"))
-            return {"table": CKPT_TABLE, "rows": rows, "reseeded": have != rows,
-                    "table_bytes": size, "shared_buffers_bytes": shared}
-        finally:
-            await conn.close()
-
-    async def change_pages_before_checkpoint(self) -> dict[str, Any]:
-        """Update every row of the checkpoint table, so its pages are changed in memory and
-        not yet on disk: the CHECKPOINT that follows has to write all of them."""
-        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
-        try:
-            started = time.monotonic()
-            status = await conn.execute(f"UPDATE {CKPT_TABLE} SET v = v + 1")
-            elapsed = time.monotonic() - started
-            size = int(await conn.fetchval(f"SELECT pg_relation_size('{CKPT_TABLE}')"))
-        finally:
-            await conn.close()
-        updated = int(status.split()[-1]) if status and status.split()[-1].isdigit() else None
-        return {"supported": True, "table": CKPT_TABLE, "rows_updated": updated,
-                "table_bytes": size, "update_s": round(elapsed, 3)}
-
-    async def _start_background(self, statements: list[tuple[str, tuple[Any, ...]]],
-                                in_transaction: bool) -> int:
-        """Run `statements` on a dedicated session in the background; returns its backend pid."""
-        conn = await self._connect(timeout_s=10.0, command_timeout=None)
-        pid = int(await conn.fetchval("SELECT pg_backend_pid()"))
-
-        async def run() -> None:
-            if in_transaction:
-                async with conn.transaction():
-                    for sql, args in statements:
-                        await conn.execute(sql, *args)
-            else:
-                for sql, args in statements:
-                    await conn.execute(sql, *args)
-
-        self._bg_conn, self._bg_pid = conn, pid
-        self._bg_task = asyncio.create_task(run(), name="during-operation")
-        return pid
-
-    def _bg_finished(self) -> str | None:
-        """None while the background operation runs; otherwise how it ended."""
-        task = getattr(self, "_bg_task", None)
-        if task is None or not task.done():
-            return None
-        if task.cancelled():
-            return "cancelled"
-        exc = task.exception()
-        return f"failed: {type(exc).__name__}: {exc}" if exc else "completed"
-
-    async def start_large_transaction(self) -> dict[str, Any]:
-        pid = await self._start_background(
-            [("INSERT INTO resilience.bulk_parent (id) VALUES ($1)", (BULK_PARENT_ID,)),
-             (BULK_INSERT, (BULK_PARENT_ID, BULK_ROWS))],
-            in_transaction=True)
-        t = time.monotonic()
-        deadline = t + BULK_CONFIRM_TIMEOUT_S
-        poll = await self._connect(timeout_s=10.0)
-        try:
-            while time.monotonic() < deadline:
-                ended = self._bg_finished()
-                if ended is not None:
-                    return {"in_progress": False, "pid": pid, "note": f"the INSERT {ended} before the kill"}
-                row = await poll.fetchrow(
-                    "SELECT a.state, a.xact_start IS NOT NULL AS in_xact, "
-                    "pg_relation_size('resilience.bulk_child') AS child_bytes "
-                    "FROM pg_stat_activity a WHERE a.pid = $1", pid)
-                if row and row["state"] == "active" and row["in_xact"] and row["child_bytes"] >= BULK_IN_FLIGHT_BYTES:
-                    return {"in_progress": True, "pid": pid, "rows_target": BULK_ROWS,
-                            "child_bytes_at_confirm": int(row["child_bytes"]),
-                            "confirmed_after_s": round(time.monotonic() - t, 3)}
-                await asyncio.sleep(0.05)
-        finally:
-            await poll.close()
-        return {"in_progress": False, "pid": pid,
-                "note": f"the INSERT had not written {BULK_IN_FLIGHT_BYTES} bytes within {BULK_CONFIRM_TIMEOUT_S} s"}
-
-    async def verify_large_transaction(self) -> dict[str, Any]:
-        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
-        try:
-            return {
-                "rows_visible": int(await conn.fetchval("SELECT count(*) FROM resilience.bulk_child")),
-                "parent_rows_visible": int(await conn.fetchval("SELECT count(*) FROM resilience.bulk_parent")),
-                "fk_violations": int(await conn.fetchval(
-                    "SELECT count(*) FROM resilience.bulk_child c "
-                    "LEFT JOIN resilience.bulk_parent p ON p.id = c.parent_id WHERE p.id IS NULL")),
-            }
-        finally:
-            await conn.close()
-
-    async def start_concurrent_index_build(self) -> dict[str, Any]:
-        pid = await self._start_background([(CIC_BUILD, ())], in_transaction=False)
-        t = time.monotonic()
-        deadline = t + CIC_CONFIRM_TIMEOUT_S
-        poll = await self._connect(timeout_s=10.0)
-        try:
-            while time.monotonic() < deadline:
-                ended = self._bg_finished()
-                if ended is not None:
-                    return {"in_progress": False, "pid": pid, "note": f"the index build {ended} before the kill"}
-                # the engine's own progress view: the build is running, past initialisation
-                row = await poll.fetchrow(
-                    "SELECT phase, blocks_done, blocks_total, tuples_done, tuples_total "
-                    "FROM pg_stat_progress_create_index WHERE pid = $1", pid)
-                if row and row["phase"] != "initializing":
-                    return {"in_progress": True, "pid": pid, "index": CIC_INDEX_QUALIFIED,
-                            "phase": row["phase"], "blocks_done": row["blocks_done"],
-                            "blocks_total": row["blocks_total"], "tuples_done": row["tuples_done"],
-                            "tuples_total": row["tuples_total"],
-                            "confirmed_after_s": round(time.monotonic() - t, 3)}
-                await asyncio.sleep(0.01)
-        finally:
-            await poll.close()
-        return {"in_progress": False, "pid": pid,
-                "note": f"no index build progress was reported within {CIC_CONFIRM_TIMEOUT_S} s"}
-
-    async def verify_concurrent_index(self) -> dict[str, Any]:
-        """Framework §10.2 NL-C-06: index left INVALID, table readable, rebuild succeeds."""
-        conn = await self._connect(timeout_s=10.0, command_timeout=600.0)
-        try:
-            state = await conn.fetchrow(CIC_INDEX_STATE, CIC_INDEX)
-            detail: dict[str, Any] = {
-                "index_present": state is not None,
-                "index_left_invalid": state is not None and not state["indisvalid"],
-            }
-            try:
-                detail["table_rows"] = int(await conn.fetchval(f"SELECT count(*) FROM {CIC_TABLE}"))
-                detail["table_readable"] = True
-            except asyncpg.PostgresError as exc:
-                detail["table_readable"] = False
-                detail["table_read_error"] = str(exc)
-            # PostgreSQL's documented recovery for a failed concurrent build: drop it, build again
-            try:
-                await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
-                await conn.execute(CIC_BUILD)
-                rebuilt = await conn.fetchrow(CIC_INDEX_STATE, CIC_INDEX)
-                detail["rebuild_succeeds"] = rebuilt is not None and bool(rebuilt["indisvalid"])
-            except asyncpg.PostgresError as exc:
-                detail["rebuild_succeeds"] = False
-                detail["rebuild_error"] = str(exc)
-            return detail
-        finally:
-            await conn.close()
-
-    async def abandon_background_operation(self) -> dict[str, Any]:
-        detail: dict[str, Any] = {}
-        task = getattr(self, "_bg_task", None)
-        conn = getattr(self, "_bg_conn", None)
-        pid = getattr(self, "_bg_pid", None)
-        if task is not None:
-            detail["ended"] = self._bg_finished() or "still running"
-            if not task.done():
-                # never leave a 10M-row INSERT or an index build running behind the harness
-                try:
-                    killer = await self._connect(timeout_s=5.0)
-                    try:
-                        detail["terminated"] = await killer.fetchval("SELECT pg_terminate_backend($1)", pid)
-                    finally:
-                        await killer.close()
-                except Exception as exc:  # noqa: BLE001 -- recorded; the task is cancelled anyway
-                    detail["terminate_error"] = f"{type(exc).__name__}: {exc}"
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        if conn is not None:
-            try:
-                conn.terminate()
-            except Exception:  # noqa: BLE001 -- the server already closed it
-                pass
-        self._bg_task = self._bg_conn = self._bg_pid = None
-        return detail
-
-    async def cleanup_scenario_objects(self) -> dict[str, Any]:
-        conn = await self._connect(timeout_s=10.0, command_timeout=300.0)
-        try:
-            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
-            # TRUNCATE gives back the aborted bulk rows' space now, not at the next autovacuum
-            await conn.execute("TRUNCATE resilience.bulk_child, resilience.bulk_parent")
-            # NL-M-03's table is kept (as NL-C-06's is): reseeding 1M rows right before the next
-            # baseline would put a checkpoint's spread writes inside the measurement window
-            return {"dropped_index": CIC_INDEX_QUALIFIED,
-                    "truncated": ["resilience.bulk_child", "resilience.bulk_parent"]}
-        finally:
-            await conn.close()
-
+        pages = [{"block": int(b), "relation_path": p} for b, p in _INVALID_PAGE_RE.findall(output)]
+        return {"detected": detected, "exit_status": result.exit_status, "corrupt_pages": pages,
+                "output": output[:2000], "command": command}
 
     async def redo_distance_bytes(self) -> int | None:
         try:
@@ -978,6 +561,48 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             r"received SIGHUP",
         )
 
+    async def prepare_contended_table(self) -> dict[str, Any]:
+        """NL-N-I03: the contended table, created once and kept; rebuilt when its column slots
+        run low, and cleared of any probe column a crashed run left (sessions.py). Runs before
+        the workload starts, so nothing waits on the drop."""
+        conn = await self._connect(timeout_s=120.0, command_timeout=300.0)
+        try:
+            await conn.execute(CONTENDED_DDL)
+            attributes = int(await conn.fetchval(CONTENDED_ATTRIBUTES_SQL))
+            rebuilt = attributes > CONTENDED_MAX_ATTRIBUTES
+            if rebuilt:
+                await conn.execute(f"DROP TABLE {CONTENDED_TABLE}")
+                await conn.execute(CONTENDED_DDL)
+                attributes = int(await conn.fetchval(CONTENDED_ATTRIBUTES_SQL))
+            rows = int(await conn.fetchval(f"SELECT count(*) FROM {CONTENDED_TABLE}"))
+            seeded = rows < CONTENDED_ROWS
+            if seeded:   # once, or after a rebuild: a kept table is not re-inserted every run
+                await conn.execute(SEED_CONTENDED, CONTENDED_ROWS)
+                await conn.execute(f"VACUUM (ANALYZE) {CONTENDED_TABLE}")
+                rows = int(await conn.fetchval(f"SELECT count(*) FROM {CONTENDED_TABLE}"))
+        finally:
+            await conn.close()
+        dropped, left = await self._drop_probe_columns()
+        if left:
+            raise RuntimeError(f"probe column(s) {left} left on {CONTENDED_TABLE} could not be removed")
+        return {"table": CONTENDED_TABLE, "rows": rows, "attribute_slots": attributes,
+                "rebuilt": rebuilt, "seeded": seeded, "leftover_columns_dropped": dropped}
+
+    def crash_restart_log_patterns(self) -> tuple[str, ...]:
+        # A backend that dies abnormally makes the postmaster end every other session and
+        # reinitialize, while it keeps running itself; its start time does not change.
+        return (
+            r"server process \(PID \d+\) was terminated by signal",
+            r"terminating any other active server processes",
+            r"all server processes terminated; reinitializing",
+            r"\bPANIC:",
+        )
+
+    def lock_wait_log_patterns(self) -> tuple[str, ...]:
+        # log_lock_waits: "process 4711 still waiting for AccessExclusiveLock on relation 16384
+        # of database 5 after 1000.081 ms"
+        return (r"process \d+ still waiting for \w+ on relation",)
+
     def recovery_start_log_patterns(self) -> tuple[str, ...]:
         # Written by the REPLACEMENT postmaster as it begins crash recovery: evidence of
         # restart, not of detection.
@@ -993,6 +618,29 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
             return await conn.fetchval("SELECT version()")
         finally:
             await conn.close()
+
+    async def activity_snapshot(self) -> dict[str, Any]:
+        """One read-only snapshot of database activity (ACTIVITY_SQL) over one connection kept
+        for the purpose; a broken connection is dropped and the error raised, and the next call
+        connects again (the target may be restarting)."""
+        conn = self._activity_conn
+        if conn is None or conn.is_closed() or self._activity_sql is None:
+            conn = await self._connect(timeout_s=ACTIVITY_TIMEOUT_S, server_settings={
+                "application_name": "resilience-activity"})
+            version = int(await conn.fetchval("SHOW server_version_num"))
+            self._activity_conn = conn
+            self._activity_sql = ACTIVITY_SQL.format(
+                checkpoints=ACTIVITY_CHECKPOINTS_17 if version >= 170000 else ACTIVITY_CHECKPOINTS_OLD)
+        try:
+            return json.loads(await conn.fetchval(self._activity_sql, timeout=ACTIVITY_TIMEOUT_S))
+        except Exception:
+            await self.close_activity()
+            raise
+
+    async def close_activity(self) -> None:
+        conn, self._activity_conn = self._activity_conn, None
+        if conn is not None:
+            conn.terminate()
 
     async def storage_footprint(self) -> dict[str, Any]:
         """Measured, never assumed: sizes come from the server, and the WAL ceiling is read
@@ -1027,319 +675,6 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
     def integrity_databases(self) -> list[str]:
         return list(self.node.integrity_databases or [self.node.db.dbname])
 
-    # Both idle states of the checkpointer process. The poll loop must wait until the
-    # checkpointer leaves ALL of these before declaring it "active". CheckpointerMain is the
-    # main-loop sleep when no checkpoint is pending; CheckpointDelay is the inter-checkpoint
-    # sleep. Either one means the checkpointer is NOT flushing dirty buffers.
-    _CHECKPOINTER_IDLE_EVENTS = frozenset({"CheckpointerMain", "CheckpointDelay"})
-
-    # Wait events that positively confirm the checkpointer is doing checkpoint I/O.
-    # We require one of these rather than merely "not idle", so a transient NULL or an
-    # unrecognised future event does not produce a false positive.
-    _CHECKPOINTER_ACTIVE_EVENTS = frozenset({
-        "CheckpointWriteDelay",   # Timeout: throttling between buffer writes
-        "CheckpointSync",         # IO: syncing relation files to storage (older PG)
-        "DataFileSync",           # IO: syncing relation files to storage (PG 10+)
-        "DataFileWrite",          # IO: writing data pages
-        "WalSync",                # IO: flushing WAL during checkpoint
-        "WALSync",                # IO: capitalization variation
-        "SlruWrite",              # IO: writing SLRU pages
-        "SlruSync",               # IO: syncing SLRU pages
-        "SLRUSync",               # IO: capitalization variation
-        "ControlFileWrite",       # IO: writing control file
-        "ControlFileSync",        # IO: syncing control file
-        "ControlFileSyncUpdate",  # IO: updating control file
-        "BufFileWrite",           # IO: writing temp buffers (rare during checkpoint)
-    })
-    _CHECKPOINTER_ACTIVE_TYPES = frozenset({"IO", "Timeout"})
-
-    async def trigger_checkpoint_and_await_active(self, timeout_s: float = 10.0) -> dict[str, Any]:
-        """Trigger a checkpoint under the current write workload and deterministically synchronize
-        until the checkpointer process is actively writing/syncing buffers (Arch §5, Framework §10.2).
-
-        In industry-standard resilience engineering, guessing sleep intervals is replaced by
-        observing internal state transitions. The checkpointer sits in one of two idle states
-        (CheckpointerMain or CheckpointDelay). Under write load, issuing CHECKPOINT wakes it,
-        transitioning it to active buffer flushing and syncing (wait_event_type IO or Timeout with
-        events like CheckpointWriteDelay, CheckpointSync, DataFileWrite). We capture pre-checkpoint
-        LSN, start an asynchronous CHECKPOINT, and poll pg_stat_activity until the checkpointer is
-        confirmed active. If the timeout expires without seeing active I/O, we report
-        checkpointer_active=False so the orchestrator can abort (fail closed).
-        """
-        baseline_cp: dict[str, Any] = {}
-        checkpointer_pid: int | None = None
-        stat_table: str | None = "pg_stat_checkpointer"
-        buf_col: str = "buffers_written"
-        baseline_buffers: int | None = None
-        baseline_io_writes: int | None = None  # pg_stat_io: immediate per-IO tracking
-
-        conn = await self._connect()
-        try:
-            row = await conn.fetchrow(
-                "SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE backend_type = 'checkpointer'"
-            )
-            if row and row["pid"]:
-                checkpointer_pid = int(row["pid"])
-            try:
-                cp_row = await conn.fetchrow("SELECT checkpoint_lsn, redo_lsn, checkpoint_time::text FROM pg_control_checkpoint()")
-                if cp_row:
-                    baseline_cp = dict(cp_row)
-            except Exception:
-                pass
-
-            # Sample baseline buffers written to enable quantitative progress verification
-            try:
-                val = await conn.fetchval("SELECT buffers_written FROM pg_stat_checkpointer")
-                if val is not None:
-                    baseline_buffers = int(val)
-            except Exception:
-                stat_table = "pg_stat_bgwriter"
-                buf_col = "buffers_checkpoint"
-                try:
-                    val = await conn.fetchval("SELECT buffers_checkpoint FROM pg_stat_bgwriter")
-                    if val is not None:
-                        baseline_buffers = int(val)
-                except Exception:
-                    stat_table = None
-
-            # pg_stat_io tracks individual write operations immediately (not batched post-
-            # checkpoint like pg_stat_checkpointer.buffers_written), so it provides a reliable
-            # secondary instrument even for small working sets where the cumulative counter
-            # hasn't been flushed to shared memory yet.
-            try:
-                val = await conn.fetchval(
-                    "SELECT writes FROM pg_stat_io "
-                    "WHERE backend_type = 'checkpointer' AND context = 'normal' AND object = 'relation'"
-                )
-                if val is not None:
-                    baseline_io_writes = int(val)
-            except Exception:
-                pass  # pg_stat_io may not exist on older PG or custom builds
-
-            self._checkpoint_baseline = baseline_cp
-            self._checkpointer_pid = checkpointer_pid
-        finally:
-            await conn.close()
-
-        # Dedicated connection executing CHECKPOINT asynchronously
-        cp_conn = await self._connect()
-        self._checkpoint_conn = cp_conn
-
-        # Poll connection established in advance to avoid connection latency delaying detection
-        poll_conn = await self._connect()
-
-        checkpoint_error: str | None = None
-
-        async def _run_checkpoint() -> str:
-            nonlocal checkpoint_error
-            try:
-                await cp_conn.execute("CHECKPOINT")
-            except Exception as e:
-                err_str = str(e)
-                checkpoint_error = err_str
-                # If SQL connection lacks privileges (e.g. pg_checkpoint role not granted to harness user),
-                # attempt to grant role and trigger CHECKPOINT over SSH as cluster OS user (postgres).
-                if "permission denied" in err_str.lower() or "insufficientprivilege" in err_str.lower():
-                    try:
-                        async with RemoteHost(self.node.ssh) as host:
-                            grant_cmd = (
-                                f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -p {self.node.db.port} "
-                                f"-d {shlex.quote(self.node.db.dbname)} -c "
-                                f"{shlex.quote(f'GRANT pg_checkpoint, pg_read_all_stats TO {self.node.db.user};')}"
-                            )
-                            await host.run(as_user(self.node.os_user, grant_cmd), timeout_s=10.0, check=False)
-                            cp_cmd = (
-                                f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -p {self.node.db.port} "
-                                f"-d {shlex.quote(self.node.db.dbname)} -c 'CHECKPOINT;'"
-                            )
-                            r = await host.run(as_user(self.node.os_user, cp_cmd), timeout_s=30.0, check=False)
-                            if r.exit_status == 0:
-                                checkpoint_error = None
-                                return "completed"
-                            checkpoint_error = f"{err_str} (SSH fallback psql exit {r.exit_status}: {r.stderr.strip()})"
-                    except Exception as ssh_exc:
-                        checkpoint_error = f"{err_str} (SSH fallback failed: {ssh_exc})"
-                return checkpoint_error or "completed"
-            return "completed"
-
-        self._checkpoint_task = asyncio.create_task(_run_checkpoint())
-
-        # Poll until checkpointer is confirmed active (doing checkpoint I/O), or timeout.
-        active_event: str | None = None
-        active_type: str | None = None
-        buffers_flushed: int | None = None
-        io_writes_delta: int | None = None
-        confirmed_active = False
-        deadline = asyncio.get_running_loop().time() + timeout_s
-        try:
-            while asyncio.get_running_loop().time() < deadline:
-                # Early abort if CHECKPOINT command errored out
-                if self._checkpoint_task.done():
-                    res = self._checkpoint_task.result()
-                    if res != "completed" and checkpoint_error:
-                        return {
-                            "checkpointer_active": False,
-                            "error": f"CHECKPOINT failed: {checkpoint_error}",
-                            "checkpointer_pid": checkpointer_pid,
-                            "wait_event_type": active_type,
-                            "wait_event": active_event,
-                            "buffers_written_during_cp": None,
-                            "prior_checkpoint": baseline_cp,
-                            "t_active_mono_ns": time.monotonic_ns(),
-                        }
-
-                row = None
-                current_buffers: int | None = None
-                current_io_writes: int | None = None
-                if stat_table and checkpointer_pid:
-                    try:
-                        row = await poll_conn.fetchrow(
-                            f"SELECT a.wait_event_type, a.wait_event, c.{buf_col} AS buffers "
-                            f"FROM pg_stat_activity a, {stat_table} c "
-                            f"WHERE a.pid = $1",
-                            checkpointer_pid,
-                        )
-                        if row and "buffers" in row and row["buffers"] is not None:
-                            current_buffers = int(row["buffers"])
-                    except Exception:
-                        row = None
-                # pg_stat_io: immediate per-IO write tracking (not batched post-checkpoint)
-                if baseline_io_writes is not None:
-                    try:
-                        io_val = await poll_conn.fetchval(
-                            "SELECT writes FROM pg_stat_io "
-                            "WHERE backend_type = 'checkpointer' AND context = 'normal' AND object = 'relation'"
-                        )
-                        if io_val is not None:
-                            current_io_writes = int(io_val)
-                    except Exception:
-                        pass
-
-                if not row:
-                    if checkpointer_pid:
-                        row = await poll_conn.fetchrow(
-                            "SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
-                            checkpointer_pid,
-                        )
-                    else:
-                        row = await poll_conn.fetchrow(
-                            "SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE backend_type = 'checkpointer'"
-                        )
-                        if row and row["pid"]:
-                            checkpointer_pid = int(row["pid"])
-                            self._checkpointer_pid = checkpointer_pid
-                    if row and "buffers" in row and row["buffers"] is not None:
-                        current_buffers = int(row["buffers"])
-
-                if row:
-                    w_type = row["wait_event_type"]
-                    w_event = row["wait_event"]
-                    buffers_delta = (
-                        (current_buffers - baseline_buffers)
-                        if (current_buffers is not None and baseline_buffers is not None)
-                        else None
-                    )
-                    io_delta = (
-                        (current_io_writes - baseline_io_writes)
-                        if (current_io_writes is not None and baseline_io_writes is not None)
-                        else None
-                    )
-
-                    # 1. Positive proof: checkpointer is in a known active I/O wait event
-                    if w_event in self._CHECKPOINTER_ACTIVE_EVENTS:
-                        active_type = w_type
-                        active_event = w_event
-                        buffers_flushed = buffers_delta
-                        io_writes_delta = io_delta
-                        confirmed_active = True
-                        break
-
-                    # 2. Positive proof: wait_event_type is IO or Timeout and not idle
-                    if (w_type in self._CHECKPOINTER_ACTIVE_TYPES
-                            and w_event not in self._CHECKPOINTER_IDLE_EVENTS):
-                        active_type = w_type
-                        active_event = w_event
-                        buffers_flushed = buffers_delta
-                        io_writes_delta = io_delta
-                        confirmed_active = True
-                        break
-
-                    # 3. Positive quantitative proof: checkpointer has genuinely written
-                    #    buffers (stat counter) or IO operations (pg_stat_io)
-                    if (buffers_delta is not None and buffers_delta > 0) or \
-                       (io_delta is not None and io_delta > 0):
-                        active_type = w_type
-                        active_event = w_event
-                        buffers_flushed = buffers_delta
-                        io_writes_delta = io_delta
-                        confirmed_active = True
-                        break
-
-                    # NOTE: A NULL/NULL wait event (running on CPU) is intentionally NOT treated
-                    # as active unless confirmed by buffers_delta > 0, because the checkpointer may be
-                    # running its main loop initialization before flushing any buffers.
-                await asyncio.sleep(0.005)  # 5ms poll — fast enough to catch the transition
-        finally:
-            await poll_conn.close()
-
-        err_msg: str | None = None
-        if not confirmed_active:
-            if checkpoint_error:
-                err_msg = f"CHECKPOINT failed: {checkpoint_error}"
-            elif self._checkpoint_task.done() and self._checkpoint_task.result() == "completed":
-                err_msg = "CHECKPOINT finished before an active write/sync wait event or buffer flush was sampled"
-            else:
-                err_msg = f"checkpointer timed out waiting for active state (last wait event: {active_event or 'CheckpointerMain'})"
-
-        return {
-            "checkpointer_active": confirmed_active,
-            "checkpointer_pid": checkpointer_pid,
-            "error": err_msg,
-            "wait_event_type": active_type,
-            "wait_event": active_event,
-            "buffers_written_during_cp": buffers_flushed,
-            "io_writes_during_cp": io_writes_delta,
-            "prior_checkpoint": baseline_cp,
-            "t_active_mono_ns": time.monotonic_ns(),
-        }
-
-    async def checkpoint_in_flight_at_kill(self, log_lines: Sequence[str]) -> dict[str, Any]:
-        """Whether the CHECKPOINT issued by trigger_checkpoint_and_await_active had finished
-        when the kill landed (NL-C-02), proven from where crash recovery started.
-
-        Crash recovery replays from the redo point of the last checkpoint that COMPLETED, and
-        the replacement postmaster logs it: "redo starts at X/Y". Before issuing the CHECKPOINT
-        the harness read the then-current redo point from pg_control. If recovery started
-        there, the new checkpoint never completed -- the kill landed mid-checkpoint. If it
-        started anywhere later, a newer checkpoint (ours, or a timed one) completed first and
-        the run tested an ordinary crash.
-
-        pg_control after recovery cannot answer this: recovery writes its own end-of-recovery
-        checkpoint, which is always newer than the pre-kill one whether or not ours finished."""
-        if hasattr(self, "_checkpoint_task"):
-            self._checkpoint_task.cancel()
-        if hasattr(self, "_checkpoint_conn"):
-            try:
-                await self._checkpoint_conn.close()
-            except Exception:  # noqa: BLE001 -- the server it talked to was killed
-                pass
-
-        prior = (getattr(self, "_checkpoint_baseline", None) or {}).get("redo_lsn")
-        redo_start = recovery_redo_start_lsn(log_lines)
-        detail: dict[str, Any] = {"prior_redo_lsn": _format_lsn(prior), "recovery_redo_start_lsn": _format_lsn(redo_start)}
-        if prior is None:
-            detail.update(in_flight=None, note="the redo point before the CHECKPOINT was not captured")
-        elif redo_start is None:
-            detail.update(in_flight=None, note="no 'redo starts at' line from the replacement postmaster reached "
-                                               "the harness (check the node's log_file in the profile)")
-        elif redo_start == int(prior):
-            detail.update(in_flight=True, note="recovery started from the redo point that preceded the CHECKPOINT: "
-                                               "the checkpoint had not completed when the kill landed")
-        else:
-            detail.update(in_flight=False, note="recovery started from a newer redo point: a checkpoint completed "
-                                                "before the kill landed, so this was an ordinary crash")
-        return detail
-
     async def integrity_check(self, timeout_s: float) -> IntegrityResult:
         """pg_amcheck --heapallindexed over the configured databases (Arch §10.1, Framework
         NL-I-07). Runs as the cluster's OS user over SSH, so the harness role needs no
@@ -1354,9 +689,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         async with RemoteHost(node.ssh) as host:
             missing = []
             for db in databases:
-                probe = (f"cd /tmp && {shlex.quote(node.pg_bin + '/psql')} -X -At -p {node.db.port} "
-                         f"-d {shlex.quote(db)} -c {shlex.quote(AMCHECK_INSTALLED_SQL)}")
-                r = await host.run(as_user(node.os_user, probe), timeout_s=AMCHECK_PROBE_TIMEOUT_S, check=False)
+                probe = self._as_os_user(["psql", "-X", "-At", "-p", str(node.db.port), "-d", db,
+                                          "-c", AMCHECK_INSTALLED_SQL])
+                r = await host.run(probe, timeout_s=AMCHECK_PROBE_TIMEOUT_S, check=False)
                 if r.exit_status != 0 or r.stdout.strip() != "1":
                     missing.append(db)
             if missing:
@@ -1364,11 +699,10 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                     f"amcheck is not installed in {missing}; the operator installs it by hand "
                     "(CREATE EXTENSION amcheck) -- the harness does not modify target databases"
                 )
-            db_args = " ".join(f"-d {shlex.quote(db)}" for db in databases)
-            exclude = "".join(f" --exclude-relation={shlex.quote(r)}" for r in self.integrity_exclusions)
-            command = (f"cd /tmp && {shlex.quote(node.pg_bin + '/pg_amcheck')} -p {node.db.port} "
-                       f"{db_args} --heapallindexed{exclude}")
-            result = await host.run(as_user(node.os_user, command), timeout_s=timeout_s, check=False)
+            db_args = [a for db in databases for a in ("-d", db)]
+            exclude = [f"--exclude-relation={r}" for r in self.integrity_exclusions]
+            command = self._as_os_user(["pg_amcheck", "-p", str(node.db.port), *db_args, "--heapallindexed", *exclude])
+            result = await host.run(command, timeout_s=timeout_s, check=False)
         output = result.stdout + result.stderr
         if result.exit_status not in (0, 2):
             # 1 = could not run: we do not know whether the data is sound. Fail closed.
@@ -1387,272 +721,6 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                     "excluded_relations": list(self.integrity_exclusions),
                     "checksum_baseline_taken": baseline is not None},
         )
-
-    async def inject_idle_transaction(self) -> dict[str, Any]:
-        """Inject an open idle-in-transaction holding back the vacuum horizon (NL-M-05).
-
-        A dedicated session, tagged with IDLE_SESSION_APPLICATION_NAME so every later step --
-        including the kill switch after a harness crash -- can find exactly this session and no
-        other, BEGINs and takes a transaction id, then goes idle. The fault is confirmed from a
-        SEPARATE connection: the session must be seen as `idle in transaction` holding that
-        transaction id. Querying pg_stat_activity from the idle session itself would show it
-        `active` (it is running that query) and would move its snapshot.
-
-        No fallback: if the session cannot be established and confirmed, the injection did not
-        happen and the run aborts. A second, unconfirmed mechanism would only produce a fault
-        the harness cannot see or clean up."""
-        conn: Any = None
-        try:
-            conn = await self._connect(timeout_s=10.0, command_timeout=None,
-                                       server_settings={"application_name": IDLE_SESSION_APPLICATION_NAME})
-            pid = await conn.fetchval("SELECT pg_backend_pid()")
-            await conn.execute("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            await conn.execute("SELECT txid_current()")
-            self._idle_conn, self._idle_pid = conn, pid
-        except Exception as exc:  # noqa: BLE001 -- reported; the orchestrator aborts the run
-            if conn is not None:
-                try:
-                    if not conn.is_closed():
-                        await conn.execute("ROLLBACK")
-                    await conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            self._idle_conn = self._idle_pid = None
-            return {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
-
-        row = None
-        stat_conn = await self._connect(timeout_s=5.0)
-        try:
-            deadline = time.monotonic() + IDLE_CONFIRM_TIMEOUT_S
-            while time.monotonic() < deadline:
-                row = await stat_conn.fetchrow(
-                    "SELECT state, backend_xid, backend_xmin, "
-                    "EXTRACT(EPOCH FROM (now() - xact_start)) AS xact_age_s "
-                    "FROM pg_stat_activity WHERE pid = $1", pid)
-                if row is not None and row["state"] == "idle in transaction":
-                    break
-                await asyncio.sleep(0.05)
-        finally:
-            await stat_conn.close()
-        state = row["state"] if row is not None else None
-        xid = row["backend_xid"] if row is not None else None
-        detail = {
-            "pid": pid,
-            "application_name": IDLE_SESSION_APPLICATION_NAME,
-            "state": state,
-            "backend_xid": None if xid is None else int(xid),
-            "backend_xmin": None if row is None or row["backend_xmin"] is None else str(row["backend_xmin"]),
-            "xact_age_s": None if row is None or row["xact_age_s"] is None else float(row["xact_age_s"]),
-        }
-        # confirmed only when the server itself shows the session idle AND holding an xid
-        detail["supported"] = state == "idle in transaction" and xid is not None
-        if not detail["supported"]:
-            detail["error"] = (f"session {pid} was not seen as 'idle in transaction' holding a transaction id "
-                               f"within {IDLE_CONFIRM_TIMEOUT_S} s (state {state!r}, backend_xid {xid!r})")
-        return detail
-
-    async def check_idle_transaction(self, pid: int | None = None) -> dict[str, Any]:
-        """Check status of the idle-in-transaction backend (NL-M-05): still open, or gone with
-        the harness's session closed. Says only WHETHER it ended; why it ended is judged by the
-        orchestrator from `termination_sqlstate` here and the server's own log line."""
-        target_pid = pid or getattr(self, "_idle_pid", None)
-        if target_pid is None:
-            # No session was ever established. "The backend is absent" must never be read as
-            # "the engine enforced idle_in_transaction_session_timeout" -- that is the
-            # fail-open a crashed or failed injection would otherwise report as path A.
-            return {
-                "pid": None,
-                "terminated_by_timeout": False,
-                "still_idle": False,
-                "conn_closed": False,
-                "note": "no idle transaction session was established (injection did not produce a backend pid)",
-            }
-
-        # Query pg_stat_activity first without touching the held session!
-        # Running SELECT 1 inside an open READ COMMITTED transaction takes a new snapshot
-        # and advances backend_xmin, mutating the very state we are measuring.
-        # Only probe the connection if the backend row is absent from pg_stat_activity.
-        try:
-            stat_conn = await self._connect(timeout_s=5.0)
-            try:
-                row = await stat_conn.fetchrow(
-                    "SELECT pid, state, backend_xmin, "
-                    "EXTRACT(EPOCH FROM (now() - xact_start)) AS xact_age_s, "
-                    "wait_event_type, wait_event "
-                    "FROM pg_stat_activity WHERE pid = $1",
-                    target_pid,
-                )
-                if row is not None:
-                    return {
-                        "pid": target_pid,
-                        "terminated_by_timeout": False,
-                        "still_idle": "idle" in str(row["state"]).lower(),
-                        "state": str(row["state"]),
-                        "backend_xmin": str(row["backend_xmin"]) if row.get("backend_xmin") else None,
-                        "age_s": float(row["xact_age_s"] or 0.0),
-                        "wait_event": row.get("wait_event"),
-                    }
-            finally:
-                await stat_conn.close()
-        except Exception:
-            pass
-
-        # Backend is not present in pg_stat_activity. Now probe the held session to confirm
-        # whether the server terminated it (Path A), keeping the error code it was closed with.
-        conn = getattr(self, "_idle_conn", None)
-        conn_closed = False
-        sqlstate = None
-        if conn is not None:
-            if conn.is_closed():
-                conn_closed = True
-            else:
-                try:
-                    await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=0.5)
-                except Exception as exc:
-                    conn_closed = True
-                    sqlstate = getattr(exc, "sqlstate", None)
-                    self._idle_conn_error = str(exc)
-
-        if conn_closed:
-            return {
-                "pid": target_pid,
-                "terminated_by_timeout": True,
-                "still_idle": False,
-                "conn_closed": True,
-                "termination_sqlstate": sqlstate,
-                "note": "harness session was closed and the backend is no longer present",
-            }
-        return {
-            "pid": target_pid,
-            "terminated_by_timeout": False,
-            "still_idle": False,
-            "conn_closed": False,
-            "note": "backend not present but the harness session did not close; "
-                    "timeout enforcement NOT confirmed",
-        }
-
-    def idle_timeout_log_patterns(self) -> tuple[str, ...]:
-        return (r"terminating connection due to idle-in-transaction timeout",)
-
-    idle_timeout_sqlstates = ("25P03",)  # idle_in_transaction_session_timeout
-
-    async def close_idle_transaction(self) -> dict[str, Any]:
-        """Roll back and close the injected idle session (NL-M-05). Idempotent.
-
-        Only the harness's own session is ever touched: the server-side fallback terminates
-        backends carrying IDLE_SESSION_APPLICATION_NAME and nothing else -- never every idle
-        session on the cluster, and never a signal to an operating-system PID that may since
-        have been reused."""
-        pid = getattr(self, "_idle_pid", None)
-        conn = getattr(self, "_idle_conn", None)
-        detail: dict[str, Any] = {"pid": pid}
-        if conn is not None:
-            try:
-                if not conn.is_closed():
-                    await conn.execute("ROLLBACK")
-                    await conn.close()
-                detail["conn_closed"] = True
-            except Exception as exc:
-                detail["conn_close_error"] = str(exc)
-            finally:
-                self._idle_conn = None
-        try:
-            stat_conn = await self._connect(timeout_s=5.0)
-            try:
-                detail["terminated"] = await stat_conn.fetchval(TERMINATE_IDLE_SESSIONS_SQL, IDLE_SESSION_APPLICATION_NAME)
-            finally:
-                await stat_conn.close()
-        except Exception as exc:  # noqa: BLE001 -- the ledger revert repeats this over SSH
-            detail["terminate_error"] = f"{type(exc).__name__}: {exc}"
-        self._idle_pid = None
-        return detail
-
-    async def evaluate_vacuum_bloat(self) -> dict[str, Any]:
-        """Dead-tuple counters on the harness tables (NL-M-05). These are planner statistics:
-        context for the report, never the evidence a path is accepted on."""
-        conn = await self._connect(timeout_s=5.0)
-        try:
-            row = await conn.fetchrow(
-                "SELECT "
-                "COALESCE(SUM(CASE WHEN relname = 'churn' THEN n_live_tup END), SUM(n_live_tup), 0) AS live_tup, "
-                "COALESCE(SUM(CASE WHEN relname = 'churn' THEN n_dead_tup END), SUM(n_dead_tup), 0) AS dead_tup, "
-                "MAX(last_vacuum)::text AS last_vacuum, "
-                "MAX(last_autovacuum)::text AS last_autovacuum, "
-                "MAX(last_analyze)::text AS last_analyze, "
-                "MAX(last_autoanalyze)::text AS last_autoanalyze "
-                "FROM pg_stat_user_tables "
-                "WHERE schemaname = 'resilience' AND relname IN ('churn', 'markers')"
-            )
-            row_dict = dict(row) if row else {}
-            live = int(row_dict.get("live_tup", 0))
-            dead = int(row_dict.get("dead_tup", 0))
-            total = live + dead
-            max_age_row = await conn.fetchval(
-                "SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (now() - xact_start))), 0) "
-                "FROM pg_stat_activity "
-                "WHERE state LIKE 'idle in transaction%'"
-            )
-            return {
-                "dead_tuple_ratio": round(dead / total, 4) if total > 0 else 0.0,
-                "unvacuumed_dead_tuples": dead,
-                "live_tuples": live,
-                "tuple_bloat_ratio": round(total / max(live, 1), 4),
-                "oldest_transaction_age_s": round(float(max_age_row or 0.0), 2),
-                "last_vacuum": row_dict.get("last_vacuum"),
-                "last_autovacuum": row_dict.get("last_autovacuum"),
-                "last_analyze": row_dict.get("last_analyze"),
-                "last_autoanalyze": row_dict.get("last_autoanalyze"),
-            }
-        finally:
-            await conn.close()
-
-    async def probe_vacuum_horizon(self) -> dict[str, Any]:
-        """VACUUM (VERBOSE) the churn table while the idle session is still open (NL-M-05 path
-        B evidence). PostgreSQL reports, per table, how many dead tuples it could not remove
-        because an open transaction might still see them, and the cutoff it was held to:
-
-            tuples: 120 removed, 2000 remain, 5310 are dead but not yet removable
-            removable cutoff: 74121, which was 6022 XIDs old when operation ended
-
-        The table is the harness's own, so vacuuming it touches nothing the operator owns."""
-        messages: list[str] = []
-        conn = await self._connect(timeout_s=10.0, command_timeout=VACUUM_PROBE_TIMEOUT_S)
-        try:
-            # PostgreSQL 15+ puts the counts in the message itself; older servers in DETAIL
-            conn.add_log_listener(lambda _c, msg: messages.append(
-                f"{getattr(msg, 'message', '') or ''}\n{getattr(msg, 'detail', '') or ''}"))
-            await conn.execute("VACUUM (VERBOSE) resilience.churn")
-        finally:
-            await conn.close()
-        text = "\n".join(messages)
-        dead = _DEAD_NOT_REMOVABLE_RE.search(text)
-        cutoff = _REMOVABLE_CUTOFF_RE.search(text)
-        return {
-            "supported": True,
-            "dead_not_removable": int(dead.group(1)) if dead else None,
-            "removable_cutoff": int(cutoff.group(1)) if cutoff else None,
-            "output": text[-2000:],
-        }
-
-    async def observe_fault_settings(self, fault_type: str, during: str | None = None) -> dict[str, str]:
-        """Read only -- nothing is written. For the idle-in-transaction fault the deciding
-        setting is the server's own timeout; for a kill that must land on an autovacuum
-        worker, the autovacuum settings (NL-M-03)."""
-        if during == "autovacuum_worker":
-            conn = await self._connect(timeout_s=10.0)
-            try:
-                rows = await conn.fetch("SELECT name, setting || coalesce(unit, '') AS v FROM pg_settings "
-                                        "WHERE name = ANY($1::text[])", list(AVAC_SETTINGS))
-                return {r["name"]: r["v"] for r in rows}
-            finally:
-                await conn.close()
-        if fault_type != "idle_in_transaction":
-            return {}
-        conn = await self._connect(timeout_s=10.0)
-        try:
-            return {"idle_in_transaction_session_timeout": str(await conn.fetchval("SHOW idle_in_transaction_session_timeout"))}
-        finally:
-            await conn.close()
 
     async def config_deviations(self) -> dict[str, str]:
         """Detect any parameters set in postgresql.auto.conf (ALTER SYSTEM deviations)."""
@@ -1679,11 +747,9 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
                         "SELECT name, setting FROM pg_file_settings "
                         "WHERE sourcefile LIKE '%postgresql.auto.conf' AND error IS NULL;"
                     )
-                    cmd = (
-                        f"cd /tmp && {shlex.quote(self.node.pg_bin + '/psql')} -X -At -F '=' -p {self.node.db.port} "
-                        f"-d {shlex.quote(self.node.db.dbname)} -c {shlex.quote(sql_cmd)}"
-                    )
-                    r = await host.run(as_user(self.node.os_user, cmd), timeout_s=15.0, check=False)
+                    cmd = self._as_os_user(["psql", "-X", "-At", "-F", "=", "-p", str(self.node.db.port),
+                                            "-d", self.node.db.dbname, "-c", sql_cmd])
+                    r = await host.run(cmd, timeout_s=15.0, check=False)
                     if r.exit_status == 0 and r.stdout:
                         for line in r.stdout.strip().splitlines():
                             if "=" in line:
@@ -1703,122 +769,4 @@ class PostgreSQLAdapter(BaseDatabaseAdapter):
         except Exception as exc:
             return {"checksum_failures": 0, "ok": False, "error": str(exc)}
 
-    async def exhaust_connections(self, hold_s: float) -> dict[str, Any]:
-        """NL-R-04 (Framework §10.5): open max_connections + 50% sessions under load, hold them
-        for `hold_s`, release them, and confirm the server accepts a new session again.
 
-        Every flood session carries FLOOD_APPLICATION_NAME, so revert_exhaust_connections can
-        terminate exactly these from any process. The flood is released here, inside the fault,
-        so validate's own connections never compete with it."""
-        t0_mono_ns = time.monotonic_ns()
-        conn = await self._connect(timeout_s=5.0)
-        try:
-            max_conn = int(await conn.fetchval("SHOW max_connections"))
-            su_reserved = int(await conn.fetchval("SHOW superuser_reserved_connections"))
-        finally:
-            await conn.close()
-
-        attempted = max(10, int(max_conn * 1.5))
-        explicit: list[str] = []      # SQLSTATE 53300: the server said why it refused
-        other: list[str] = []         # timeouts, resets: a refusal nobody explained
-        self._holding_conns: list[asyncpg.Connection] = []
-
-        async def one() -> None:
-            try:
-                self._holding_conns.append(await self._connect(
-                    self.node.client, timeout_s=FLOOD_CONNECT_TIMEOUT_S, command_timeout=None,
-                    server_settings={"application_name": FLOOD_APPLICATION_NAME}))
-            except asyncpg.TooManyConnectionsError as exc:
-                explicit.append(str(exc))
-            except Exception as exc:  # noqa: BLE001 -- classified as an unexplained refusal
-                other.append(f"{type(exc).__name__}: {exc}")
-
-        await asyncio.gather(*(one() for _ in range(attempted)))
-        held = len(self._holding_conns)
-
-        # Reserved slots, probed while the flood is held, as a role that is entitled to them.
-        # Only a superuser proves anything here: a non-superuser who gets in found an ordinary
-        # free slot, which says nothing about the reserved ones.
-        superuser_slot_honoured: bool | None
-        superuser_probe: dict[str, Any]
-        try:
-            async with RemoteHost(self.node.ssh) as host:
-                r = await host.run(self._psql_as_os_user("SELECT rolsuper FROM pg_roles WHERE rolname = current_user"),
-                                   timeout_s=10.0, check=False)
-            out = (r.stdout + r.stderr).strip()
-            superuser_probe = {"exit_status": r.exit_status, "output": out[:300]}
-            if r.exit_status == 0 and r.stdout.strip() == "t":
-                superuser_slot_honoured = True
-            elif r.exit_status == 0:
-                superuser_slot_honoured = None
-                superuser_probe["note"] = "the probing role is not a superuser, so reserved slots were not tested"
-            else:
-                superuser_slot_honoured = False
-        except Exception as exc:  # noqa: BLE001 -- no probe means not measured, never a pass
-            superuser_slot_honoured = None
-            superuser_probe = {"error": f"{type(exc).__name__}: {exc}"}
-
-        await asyncio.sleep(hold_s)
-        released = await self._release_flood()
-
-        # After release a new ordinary session must be accepted again, within a bound
-        recovered, recovery_s = False, None
-        t_rel = time.monotonic()
-        while time.monotonic() - t_rel < FLOOD_RECOVERY_TIMEOUT_S:
-            try:
-                probe = await self._connect(self.node.client, timeout_s=2.0)
-                await probe.close()
-                recovered, recovery_s = True, round(time.monotonic() - t_rel, 3)
-                break
-            except Exception:  # noqa: BLE001 -- retried until the bound
-                await asyncio.sleep(0.2)
-
-        return {
-            "action": "connection_exhaustion",
-            "t0_mono_ns": t0_mono_ns,
-            "max_connections": max_conn,
-            "superuser_reserved": su_reserved,
-            "attempted_connections": attempted,
-            "held_connections": held,
-            "rejected_explicit": len(explicit),
-            "rejected_other": len(other),
-            "rejection_samples": (explicit[:2] + other[:3]),
-            # explicit only if the limit was actually reached AND every refusal said why
-            "rejections_explicit": bool(explicit) and not other,
-            "superuser_slot_honoured": superuser_slot_honoured,
-            "superuser_probe": superuser_probe,
-            "hold_s": hold_s,
-            "released_connections": released,
-            "connections_recover_after_release": recovered,
-            "recovery_after_release_s": recovery_s,
-        }
-
-    async def _release_flood(self) -> int:
-        released = 0
-        for c in getattr(self, "_holding_conns", []):
-            try:
-                await c.close(timeout=5.0)
-                released += 1
-            except Exception:  # noqa: BLE001 -- the server side is terminated by revert if needed
-                c.terminate()
-        self._holding_conns = []
-        return released
-
-    async def revert_exhaust_connections(self) -> dict[str, Any]:
-        released = await self._release_flood()
-        terminate = ("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
-                     f"WHERE application_name = '{FLOOD_APPLICATION_NAME}'")
-        remaining_sql = f"SELECT count(*) FROM pg_stat_activity WHERE application_name = '{FLOOD_APPLICATION_NAME}'"
-        async with RemoteHost(self.node.ssh) as host:
-            t = await host.run(self._psql_as_os_user(terminate), timeout_s=15.0)
-            remaining = 0
-            for _ in range(25):   # terminated backends take a moment to leave pg_stat_activity
-                r = await host.run(self._psql_as_os_user(remaining_sql), timeout_s=15.0)
-                remaining = int(r.stdout.strip() or 0)
-                if remaining == 0:
-                    break
-                await asyncio.sleep(0.2)
-        if remaining:
-            raise RuntimeError(f"{remaining} flood session(s) ({FLOOD_APPLICATION_NAME}) still open after terminate")
-        return {"action": "flood sessions terminated", "released_in_process": released,
-                "terminated_on_server": int(t.stdout.strip() or 0), "remaining": 0}

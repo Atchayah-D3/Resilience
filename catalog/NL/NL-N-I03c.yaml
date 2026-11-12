@@ -1,0 +1,97 @@
+# NL-N-I03c -- Lock pile-up behind a schema change, run 3c: a schema change that rewrites the table (finding) (internal NL-N scenario; not a row of
+# Framework §10.6, which lists 8 NL-N rows and no lock pile-up).
+#
+# A schema change needs the strongest lock on its table. While it waits for that lock -- or holds
+# it while it rewrites the table -- every new query on the table queues behind it. Half the
+# marker workload reads and updates a row of the harness's contended table (the table users);
+# the other half never touches it (the others). The contended table stands in for an
+# application table until the TPC-C workload exists.
+#
+# Run 3c: nothing blocks the schema change, but it rewrites every row (ADD COLUMN with a volatile
+# default), holding the exclusive lock throughout. Its 5 s lock timeout cannot help: it is
+# granted the lock at once, so the timeout never fires. A finding: the freeze lasts as long as
+# the rewrite of the harness table. Gated only on the fault having landed and the standing
+# safety gates (Framework §16.3) -- NEEDS SIGN-OFF.
+#
+# Every setting is a SESSION setting on the pile-up's own two sessions (tagged by
+# application_name); the server's configuration is never written. Cleanup and the kill switch
+# end the tagged sessions and drop the probe column the schema change added.
+id: NL-N-I03c
+name: Lock pile-up behind a schema change -- rewriting schema change
+tier: node_local
+category: NL-N
+applies_to: [standalone]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false
+
+steady_state:
+  tps_min: 150
+  p99_latency_ms_max: 300
+  duration_s: 120
+
+workload:
+  profile: oltp_write_heavy
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 200
+  contended_share: 0.5           # half the transactions also read and update a contended-table row
+
+fault:
+  type: lock_pileup
+  driver: os_ssh
+  target: primary
+  duration: 60.0                 # upper bound; the hold ends when the rewrite does
+  lock_pileup:
+    blocker: none
+    ddl: add_column_rewrite
+    ddl_lock_timeout_s: 5.0
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+abort_if:
+  - replication_lag_s > 300
+  - secondary_node_unhealthy
+
+requires:
+  - transactional_markers
+  - structural_integrity_check
+  - contended_table
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - rto_to_slo_s
+  - corruption_count
+  - structural_integrity_errors
+  - starts_unattended
+  - fault_confirmed
+  - oltp_tps_ratio
+  - oltp_p99_ratio
+  - ddl_lock_timeout_fired
+  - ddl_completed
+  - queue_freeze_s
+  - queue_max_sessions
+  - blocker_visible
+  - longest_table_wait_s
+  - other_tables_tps_lost_pct
+  - writer_max_stall_s
+  - server_crash_restarts
+
+accept:
+  - fault_confirmed == true
+  - rpo_txn == 0
+  - corruption_count == 0
+  - structural_integrity_errors == 0
+
+priority: P2
+
+description: >
+  A schema change that rewrites the contended table holds its exclusive lock for the whole rewrite,
+  so its lock timeout never fires and the table users wait for the rewrite to finish. Reported as a
+  finding: the freeze and its spread to the other work. Internal scenario of category NL-N
+  (Framework §10.6).

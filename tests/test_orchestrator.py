@@ -19,6 +19,7 @@ from resilience_tests.analysis.elle_checker import ElleResult
 from resilience_tests.adapters.base import Capability, DatabaseSession, IntegrityResult, TransactionOutcome, register_adapter
 from resilience_tests.control import killswitch
 from resilience_tests.control import orchestrator as orch
+from resilience_tests.control.faults import idle_transaction as idle_behaviour
 from resilience_tests.control.killswitch import ledger_for
 from resilience_tests.control.matrix import RunPlanItem
 from resilience_tests.control.orchestrator import RunOptions, TestOrchestrator
@@ -220,6 +221,13 @@ class FakeFault(FaultInjector):
     lands = True
     reverts: list[dict[str, Any]] = []
 
+    def __init__(self, profile, fault_type):
+        super().__init__(profile, fault_type)
+        self.kill_target = None
+
+    def aim_at(self, target):
+        self.kill_target = target   # as the process driver: a targeted kill hits only this process
+
     async def preflight(self, node):
         return {"auto_conf_prior": "1s"} if self.fault_type == "config_reload" else {"ok": True}
 
@@ -273,7 +281,7 @@ def env(tmp_path, monkeypatch):
     # flaky test rather than as the timing mistake it is.
     timeouts = dict(BASE_PROFILE.phase_timeouts_s, recovery=12.0)   # loop runs ~7 s
     monkeypatch.setattr(rto_decomposer, "SLO_SUSTAIN_S", 2.0)       # reachable: exercises the early exit
-    monkeypatch.setattr(orch, "IDLE_TRANSACTION_MIN_SOAK_S", 2.0)
+    monkeypatch.setattr(idle_behaviour, "IDLE_TRANSACTION_MIN_SOAK_S", 2.0)
     profile = BASE_PROFILE.model_copy(update={
         "database": BASE_PROFILE.database.model_copy(update={"engine": "orch-fake"}),
         "driver_host": BASE_PROFILE.driver_host.model_copy(update={"host": "127.0.0.1", "run_dir": str(tmp_path)}),
@@ -300,6 +308,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "measure_clock_offset", no_offset)
     monkeypatch.setattr(orch, "LogTailer", NoTail)
     monkeypatch.setattr(orch, "DiskUsageProber", NoTail)
+    monkeypatch.setattr(orch, "HostStatsSampler", NoTail)    # no SSH to a real target from a unit test
     monkeypatch.setattr(orch, "WORKLOAD_RAMP_S", 0.3)
     monkeypatch.setattr(orch, "resolve", lambda fault, prof: FakeFault(prof, fault.type))
     monkeypatch.setattr(killswitch, "resolve_by_name", lambda section, driver, prof, fault_type="": FakeFault(prof, fault_type))
@@ -628,7 +637,7 @@ def test_summary_shows_the_cleanup_problem(env, monkeypatch):
     from resilience_tests.analysis.report import render_summary
 
     failing_revert(monkeypatch)
-    summary = render_summary(run(env, "NL-C-01"))
+    summary = render_summary(run(env, "NL-C-01"), sections=[])
     assert "STATUS: ERROR" in summary and "killswitch" in summary
 
 

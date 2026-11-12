@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from resilience_tests.analysis import predicates
+from resilience_tests.execution.workload import contract as workload_contract
 
 CATALOG_ROOT = Path(__file__).resolve().parent
 
@@ -41,6 +42,11 @@ Capability = Literal[
     "durability_settings",          # flush/commit settings are inspectable
     "list_append_history",          # list-append reads and appends in the marker transaction,
                                     # so Elle can check the recorded history (Arch §10.3)
+    "tpcc_workload",                # the TPC-C-like workload: tables, loader, functions, checks
+                                    # (docs/tpcc-workload-proposal.md)
+    "contended_table",              # a share of marker transactions also reads and updates one
+                                    # row of a shared harness table, so a lock held on that table
+                                    # has users to block (workload.contended_share)
 ]
 
 # Infrastructure a scenario cannot be run to specification without (docs/infra-requirements.md).
@@ -50,9 +56,9 @@ InfraFeature = Literal[
     "dedicated_wal_volume",         # pg_wal on its own volume, large enough for 16 GB of WAL
 ]
 
-# Framework §9 -- the 20 categories.
+# Framework §9 -- the 21 categories.
 Category = Literal[
-    "NL-D", "NL-C", "NL-W", "NL-I", "NL-R", "NL-N", "NL-M",
+    "NL-D", "NL-E", "NL-C", "NL-W", "NL-I", "NL-R", "NL-N", "NL-M",
     "CL-F", "CL-S", "CL-R", "CL-N", "CL-C", "CL-B", "CL-X",
     "DX-T", "DX-M", "DX-S", "DX-Q", "DX-P", "DX-D",
 ]
@@ -62,7 +68,9 @@ COMPOUND_CATEGORY = "CL-X"
 Role = Literal["standalone", "distdb.pc", "distdb.qc", "distdb.worker"]
 EnvClass = Literal["E1", "E2", "E3", "E4"]
 Priority = Literal["P0", "P1", "P2"]
-WorkloadProfile = Literal["idle", "oltp_read", "oltp_write_heavy", "bulk_load", "long_analytic", "mixed"]
+# `tpcc`: the TPC-C-like workload (docs/tpcc-workload-proposal.md). Accepted by the catalog so scenarios can
+# be written against it; refused as "not built yet" by the run plan and init until the profile exists.
+WorkloadProfile = Literal["idle", "oltp_read", "oltp_write_heavy", "bulk_load", "long_analytic", "mixed", "tpcc"]
 Environment = Literal["lab", "staging"]  # Framework §7.1: never production
 
 # Arch §5 -- fault types (one FaultInjector interface; the env profile picks the driver).
@@ -70,6 +78,7 @@ FaultType = Literal[
     "process_kill", "service_restart", "config_reload", "connection_exhaustion", "idle_in_transaction", "resource_limit", "resource_stress", "network_delay", "network_loss",
     "network_rate", "network_partition", "proxy_fault", "storage_write_loss", "storage_latency",
     "filesystem_full", "host_power_loss", "clock_skew", "data_corruption", "counter_preseed",
+    "lock_pileup",
 ]
 # Env-profile section that resolves each fault type to a driver (Arch §3.1: power_control,
 # noisy_neighbour, storage_fault; the OS/SSH driver serves the rest, Arch §5).
@@ -82,12 +91,17 @@ DEFAULT_DRIVER_SECTION = "os_ssh"
 
 FaultTarget = Literal["primary", "sync_standby"]
 
-SCENARIO_ID_RE = re.compile(r"^(?P<category>(?P<tier>NL|CL|DX)-[A-Z])-(?P<num>\d{2})$")
-SCENARIO_REF_RE = re.compile(r"\b(?:NL|CL|DX)-[A-Z]-\d{2}\b")
+# A Framework row is `NL-C-01`. An internal scenario -- ours, not a row of the Framework --
+# carries an `I` before its number (`NL-N-I03`): it belongs to a category but is not one of
+# the scenarios the Framework declares, so the reconciliation checks leave it out. An internal
+# scenario run in several variants names each with a letter (`NL-N-I03a`, `NL-N-I03b`).
+SCENARIO_ID_RE = re.compile(
+    r"^(?P<category>(?P<tier>NL|CL|DX)-[A-Z])-(?P<internal>I)?(?P<num>\d{2})(?P<variant>[a-z])?$")
+SCENARIO_REF_RE = re.compile(r"\b(?:NL|CL|DX)-[A-Z]-(?:\d{2}|I\d{2}[a-z]?)\b")
 # "Framework §7.3" / "Arch §4.2" / a bare "§13.1". The document matters: the two documents
 # have different section trees, so a citation without one cannot be checked (Arch §4.1: a
 # documentation defect must be a build failure, not a finding at the next review).
-SECTION_REF_RE = re.compile(r"(?:(Arch|Architecture|Framework)\s*)?§\s?(\d+(?:\.\d+)*)")
+SECTION_REF_RE = re.compile(r"(?:(Arch|Architecture|Framework)\s*)?§\s?(\d+(?:\.\d+)*[a-z]?)")  # §10.1a
 IDENT_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # User hard rule + Arch §3.1: a scenario never names a host or a driver.
@@ -121,6 +135,28 @@ class SteadyState(_Model):
     p99_latency_ms_max: float = Field(gt=0)
     replication_lag_s_max: float | None = Field(default=None, ge=0)
     duration_s: int = Field(gt=0)
+    # Load runs this long, unmeasured, before the baseline window opens (caches fill, the
+    # workload settles). 0: the window opens once every worker is connected, as before.
+    warmup_s: float = Field(default=0.0, ge=0)
+
+
+# A PostgreSQL duration or plain number, as a session setting takes it: 5s, 500ms, 2min, 30000.
+SESSION_VALUE_RE = re.compile(r"^\d+(us|ms|s|min|h|d)?$")
+
+
+class WorkloadGroup(_Model):
+    """A named group of clerks (docs/tpcc-contract.md §1). Every sample reports it separately."""
+
+    name: str = Field(pattern=workload_contract.GROUP_NAME_PATTERN)
+    clerks: int = Field(gt=0)
+
+
+class TpccOptions(_Model):
+    """Options of the `tpcc` profile (docs/tpcc-contract.md §1)."""
+
+    warehouses: int = Field(gt=0)
+    # group name -> the warehouse every clerk of that group works on
+    home_warehouse: dict[str, int] = Field(default_factory=dict)
 
 
 class Workload(_Model):
@@ -131,6 +167,61 @@ class Workload(_Model):
     # `list_append`: every marker transaction also appends to and reads back Elle's lists, and
     # the operation history records what was actually read (Arch §10.3). `none`: no history.
     history: Literal["none", "list_append"] = "none"
+    # Optional (docs/tpcc-contract.md §1). `session`: settings each clerk sets on its own
+    # connection -- never ALTER ROLE, never a server setting. `groups`: named groups of clerks.
+    # `tpcc`: options of the tpcc profile. Absent, a scenario behaves exactly as before.
+    session: dict[str, str] = Field(default_factory=dict)
+    groups: tuple[WorkloadGroup, ...] = ()
+    tpcc: TpccOptions | None = None
+    # The share of marker transactions that also read and update one row of the shared
+    # contended table (the "table users"); the rest touch nothing else (the "others"). Absent:
+    # every transaction is the plain marker transaction. Results are also kept per group.
+    # (NL-N-I03: the custom marker workload only; under the tpcc profile the table is TPC-C's own.)
+    contended_share: Annotated[float, Field(gt=0, lt=1)] | None = None
+    # Where a transaction's latency is timed from. `send`: when it is sent (as before).
+    # `intended_start`: when the fixed-rate schedule said it should start -- a stall that keeps
+    # transactions from starting is then counted in their latency instead of hidden, and the
+    # schedule is kept, so transactions missed during a stall start as soon as clerks are free.
+    latency_from: Literal["send", "intended_start"] = "send"
+
+    @model_validator(mode="after")
+    def _declared_rate(self) -> Workload:
+        # Framework §7.5: the workload is a declared parameter of every scenario, never chosen at
+        # execution time. Without a rate the load would be "as fast as this machine can go".
+        if self.rate_tps is None and self.profile != "idle":
+            raise ValueError(f"workload.rate_tps must be declared for profile {self.profile!r} (Framework §7.5)")
+        return self
+
+    @model_validator(mode="after")
+    def _contract_fields(self) -> Workload:
+        unknown = sorted(set(self.session) - workload_contract.SESSION_SETTINGS)
+        if unknown:
+            raise ValueError(f"workload.session: {', '.join(unknown)} not allowed; only "
+                             f"{', '.join(sorted(workload_contract.SESSION_SETTINGS))}")
+        bad = sorted(k for k, v in self.session.items() if not SESSION_VALUE_RE.match(str(v)))
+        if bad:
+            raise ValueError(f"workload.session: {', '.join(bad)} must be a number with an optional unit "
+                             "(us, ms, s, min, h, d), e.g. 5s")
+        problems = workload_contract.group_problems(
+            self.concurrency, [{"name": g.name, "clerks": g.clerks} for g in self.groups])
+        if problems:
+            raise ValueError("workload.groups: " + "; ".join(problems))
+        if self.profile == "tpcc" and self.tpcc is None:
+            raise ValueError("workload.tpcc (warehouses, ...) must be given for profile 'tpcc'")
+        if self.profile != "tpcc" and self.tpcc is not None:
+            raise ValueError("workload.tpcc is only allowed with profile 'tpcc'")
+        if self.tpcc is not None:
+            names = {g.name for g in self.groups}
+            for group, warehouse in self.tpcc.home_warehouse.items():
+                if group not in names:
+                    raise ValueError(f"workload.tpcc.home_warehouse: group {group!r} is not declared in workload.groups")
+                if not 1 <= warehouse <= self.tpcc.warehouses:
+                    raise ValueError(f"workload.tpcc.home_warehouse: warehouse {warehouse} of group {group!r} "
+                                     f"is not between 1 and {self.tpcc.warehouses}")
+        if self.contended_share is not None and (self.profile != "oltp_write_heavy" or self.history != "none"):
+            raise ValueError("workload.contended_share is only defined for the plain oltp_write_heavy marker workload")
+        return self
+        return self
 
 
 # A database state the fault must land inside (Framework §10.2 NL-C-02 "while the checkpointer
@@ -139,21 +230,69 @@ class Workload(_Model):
 # progress, then injects; which scenario asked is never consulted -- only this field.
 FaultDuring = Literal["checkpoint", "large_transaction", "concurrent_index_build", "autovacuum_worker"]
 
+# What a data_corruption fault damages (Framework §10.4): NL-I-01 a heap page, NL-I-02 a btree
+# file. Absent means heap. The adapter owns the relation; the catalog only says which kind.
+CorruptionRelationKind = Literal["heap", "btree_index"]
+
+
+class LockPileup(_Model):
+    """A lock pile-up behind a schema change (fault type lock_pileup): what holds the table,
+    which schema change queues behind it, and the schema-change session's own lock timeout.
+
+    `blocker: long_read` -- a session opens a read on the contended table and holds its
+    transaction open; `ddl_after_s` later the schema change is issued and must wait for it, so
+    every new query on the table queues behind the schema change. `blocker: none` -- nothing
+    holds the table; a rewriting schema change gets its lock at once and holds it while it
+    rewrites the table. `ddl_lock_timeout_s` is set on the schema-change session only (0: wait
+    for ever). fault.duration bounds the whole pile-up."""
+
+    blocker: Literal["long_read", "none"]
+    ddl: Literal["add_column", "add_column_rewrite"]
+    ddl_lock_timeout_s: float = Field(ge=0)
+    ddl_after_s: float = Field(default=0.0, ge=0)
+    # The table the pile-up forms on: the harness's own contended table (marker workload with
+    # contended_share), or the TPC-C stock table (workload profile tpcc; its users are
+    # New-Order and Stock-Level). The adapter maps the name to the engine's table.
+    table: Literal["contended_table", "tpcc_stock"] = "contended_table"
+
+    @model_validator(mode="after")
+    def _consistent(self) -> LockPileup:
+        if self.blocker == "none" and self.ddl_after_s:
+            raise ValueError("lock_pileup.ddl_after_s needs a blocker to wait behind (blocker: long_read)")
+        if self.blocker == "long_read" and not self.ddl_after_s:
+            raise ValueError("lock_pileup.ddl_after_s must be set with blocker: long_read, so the read "
+                             "is seen blocking nobody on its own before the schema change arrives")
+        return self
+
 
 class Fault(_Model):
     type: FaultType
-    driver: str  # env-profile section name, resolved at run time -- never a driver name
+    # The env-profile section that serves this fault type (os_ssh, power_control, ...); the
+    # profile's <section>.driver then names the driver. Written `section:`; the former key
+    # `driver:` is still accepted, so existing scenario files read unchanged.
+    section: str = Field(validation_alias=AliasChoices("section", "driver"))
     target: FaultTarget
     duration: Literal["permanent"] | Annotated[float, Field(gt=0)] = "permanent"
     during: FaultDuring | None = None
+    relation_kind: CorruptionRelationKind | None = None
+    lock_pileup: LockPileup | None = None
 
     @model_validator(mode="after")
     def _driver_section(self) -> Fault:
         expected = FAULT_DRIVER_SECTION.get(self.type, DEFAULT_DRIVER_SECTION)
-        if self.driver != expected:
+        if self.section != expected:
             raise ValueError(
-                f"fault.driver for {self.type} must be the env-profile section {expected!r}, got {self.driver!r}"
+                f"fault.section for {self.type} must be the env-profile section {expected!r}, got {self.section!r}"
             )
+        if self.relation_kind is not None and self.type != "data_corruption":
+            raise ValueError("fault.relation_kind is only defined for data_corruption")
+        if (self.lock_pileup is not None) != (self.type == "lock_pileup"):
+            raise ValueError("fault.lock_pileup is required for, and only defined for, lock_pileup")
+        if self.lock_pileup is not None:
+            if self.duration == "permanent":
+                raise ValueError("lock_pileup is held and released by the harness: fault.duration must be seconds")
+            if self.lock_pileup.ddl_after_s >= self.duration:
+                raise ValueError("lock_pileup.ddl_after_s must fall inside fault.duration")
         return self
 
 
@@ -236,6 +375,8 @@ class Scenario(_Model):
             raise ValueError(f"id {self.id} does not belong to category {self.category}")
         if TIER_OF_PREFIX[m["tier"]] != self.tier:
             raise ValueError(f"id {self.id} is tier {TIER_OF_PREFIX[m['tier']]}, not {self.tier}")
+        if m["variant"] and not m["internal"]:
+            raise ValueError(f"id {self.id}: only an internal scenario (`-I`) is run in lettered variants")
 
         # Arch §4.3 / §15: the node ceiling is 1 everywhere; CL-X alone carries an override of 2,
         # and it is category-scoped -- no other scenario may set it.
@@ -261,6 +402,16 @@ class Scenario(_Model):
             raise ValueError("elle_anomalies_count is measured, so workload.history must be list_append")
         if self.fault.during is not None and self.fault.type != "process_kill":
             raise ValueError("fault.during is only defined for process_kill")
+        if self.workload.contended_share is not None and "contended_table" not in self.requires:
+            raise ValueError("workload.contended_share needs requires: [contended_table]")
+        pileup = self.fault.lock_pileup
+        if pileup is not None and pileup.table == "contended_table" and self.workload.contended_share is None:
+            # a pile-up on a table nobody uses blocks nobody: the fault would test nothing
+            raise ValueError("lock_pileup needs workload.contended_share, so the table it locks has users")
+        if pileup is not None and pileup.table == "tpcc_stock" and self.workload.profile != "tpcc":
+            raise ValueError("lock_pileup.table tpcc_stock needs workload.profile tpcc, so the table it locks has users")
+        if self.internal and self.environment.env_sensitive:
+            raise ValueError("an internal scenario is not a Framework §7.3 environment-sensitive row")
 
         # Every accept predicate must be computed from declared measures.
         declared = set(self.measure)
@@ -282,7 +433,15 @@ class Scenario(_Model):
 
     @property
     def number(self) -> int:
-        return int(self.id[-2:])
+        m = SCENARIO_ID_RE.match(self.id)
+        assert m is not None
+        return int(m["num"])
+
+    @property
+    def internal(self) -> bool:
+        """Ours, not a row of the Framework (`NL-N-I03`): kept out of check 2 and check 6."""
+        m = SCENARIO_ID_RE.match(self.id)
+        return bool(m and m["internal"])
 
 
 def _strings(value: Any) -> list[str]:
@@ -380,15 +539,19 @@ def run_checks(catalog: Catalog, reference: Reference, *, complete: bool = True)
     of the Framework catalog is authored: checks 1, 3, 4 and 5 are unchanged; check 2 reports
     gaps without failing; check 6 still fails on anything authored that CONTRADICTS the
     Framework (more scenarios or P0s than declared, a wrong env_sensitive flag, too many runs)
-    but not on what is merely not written yet. The release gate always uses complete=True."""
+    but not on what is merely not written yet. The release gate always uses complete=True.
+
+    Internal scenarios (`NL-N-I03`) are checked like any other by checks 1, 3, 4 and 5; checks
+    2 and 6 compare the catalog with the Framework's own rows, so they see Framework rows only."""
     s = catalog.scenarios
+    framework_rows = {sid: sc for sid, sc in s.items() if not sc.internal}
     return [
         _check1_wellformed(catalog),
-        _check2_contiguity(s, complete=complete),
+        _check2_contiguity(framework_rows, complete=complete),
         _check3_falsifiability(s),
         _check4_scenario_refs(s),
         _check5_section_refs(s, reference),
-        _check6_reconciliation(s, reference, complete=complete),
+        _check6_reconciliation(framework_rows, reference, complete=complete),
     ]
 
 

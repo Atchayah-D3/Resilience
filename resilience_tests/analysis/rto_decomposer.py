@@ -127,12 +127,16 @@ def write_recovery(events: Sequence[Event], t0_ns: int) -> WriteRecovery:
     return WriteRecovery(True, None)
 
 
-def sample_meets_slo(e: Event, baseline: Baseline, max_sample_interval_s: float = MAX_SAMPLE_INTERVAL_S) -> bool:
+def sample_meets_slo(e: Event, baseline: Baseline, max_sample_interval_s: float = MAX_SAMPLE_INTERVAL_S,
+                     tps_fraction: float | None = None) -> bool:
     """One 1 s workload sample against the Framework §6.2 SLO: committed TPS >= 80% of
-    baseline and p99 <= 1.5x baseline, over an interval short enough to show a dip."""
+    baseline and p99 <= 1.5x baseline, over an interval short enough to show a dip.
+    `tps_fraction` replaces the 80% for a fault whose scenario defines "normal" more strictly
+    (FaultBehaviour.slo_tps_fraction); None is the Framework's."""
+    fraction = SLO_TPS_FRACTION if tps_fraction is None else tps_fraction
     return (
         e.data["interval_s"] <= max_sample_interval_s
-        and e.data["tps"] >= SLO_TPS_FRACTION * baseline.tps
+        and e.data["tps"] >= fraction * baseline.tps
         and e.data.get("p99_ms") is not None
         and e.data["p99_ms"] <= SLO_P99_MULTIPLIER * baseline.p99_ms
     )
@@ -157,16 +161,18 @@ class BaselineSloCheck:
 
 
 def baseline_slo_check(events: Sequence[Event], window_t0_ns: int, window_end_ns: int,
-                       baseline: Baseline) -> BaselineSloCheck:
+                       baseline: Baseline, tps_fraction: float | None = None) -> BaselineSloCheck:
     samples = [e for e in sorted(events, key=lambda e: e.t_mono_ns)
                if e.kind == "sample" and e.source == "workload"
                and e.t_mono_ns - int(e.data["interval_s"] * 1e9) >= window_t0_ns and e.t_mono_ns <= window_end_ns]
-    start, _ = slo_recovery(samples, window_t0_ns, baseline)
-    return BaselineSloCheck(len(samples), sum(1 for e in samples if sample_meets_slo(e, baseline)), start is not None)
+    start, _ = slo_recovery(samples, window_t0_ns, baseline, tps_fraction=tps_fraction)
+    return BaselineSloCheck(len(samples), sum(1 for e in samples if sample_meets_slo(e, baseline, tps_fraction=tps_fraction)),
+                            start is not None)
 
 
 def slo_recovery(events: Sequence[Event], t0_ns: int, baseline: Baseline,
-                 max_sample_interval_s: float = MAX_SAMPLE_INTERVAL_S) -> tuple[float | None, float | None]:
+                 max_sample_interval_s: float = MAX_SAMPLE_INTERVAL_S,
+                 tps_fraction: float | None = None) -> tuple[float | None, float | None]:
     """Earliest run of consecutive 1 s workload samples after T0, spanning SLO_SUSTAIN_S, in
     which every sample meets the SLO. Returns (start, end) relative to T0 in seconds.
 
@@ -184,7 +190,7 @@ def slo_recovery(events: Sequence[Event], t0_ns: int, baseline: Baseline,
         start_ns = e.t_mono_ns - interval_ns
         if start_ns < t0_ns:
             continue
-        ok = sample_meets_slo(e, baseline, max_sample_interval_s)
+        ok = sample_meets_slo(e, baseline, max_sample_interval_s, tps_fraction)
         contiguous = prev_end_ns is not None and start_ns - prev_end_ns <= interval_ns // 2
         if not ok:
             run_start_ns = None
@@ -277,13 +283,13 @@ def mttd_from_log(events: Sequence[Event], t0_ns: int, patterns: Sequence[str]) 
 
 def decompose(events: Sequence[Event], t0_ns: int, baseline: Baseline, *, clustered: bool,
               detection_patterns: Sequence[str] = (), recovery_patterns: Sequence[str] = (),
-              expect_outage: bool = False) -> RtoDecomposition:
+              expect_outage: bool = False, slo_tps_fraction: float | None = None) -> RtoDecomposition:
     """`expect_outage`: the fault must interrupt writes (kill, restart, power loss). If the
     probes never saw it do so, rto_first_write_s is NOT_MEASURED -- the outage was shorter
     than the probe interval or the fault did not take effect, and either way the harness
     has no gap to report."""
     ordered = sorted(events, key=lambda e: e.t_mono_ns)
-    slo_start, slo_end = slo_recovery(ordered, t0_ns, baseline)
+    slo_start, slo_end = slo_recovery(ordered, t0_ns, baseline, tps_fraction=slo_tps_fraction)
     components: dict[str, Any]
     if clustered:
         # Patroni / etcd signals arrive with the Tier-2 probes (Phase 4). Until then a

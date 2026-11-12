@@ -11,8 +11,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
-from catalog.schema import DEFAULT_DRIVER_SECTION, FAULT_DRIVER_SECTION, Fault
-from resilience_tests.adapters.base import BaseDatabaseAdapter
+from catalog.schema import DEFAULT_DRIVER_SECTION, FAULT_DRIVER_SECTION, Fault, Repeat
+from resilience_tests.adapters.base import BaseDatabaseAdapter, adapter_for
 from resilience_tests.control.profile import EnvProfile, Node
 
 
@@ -45,19 +45,31 @@ class FaultInjector(ABC):
         self.fault_type = fault_type
         # The run's database adapter. Faults that live inside the database (a held session,
         # a connection flood) are applied and reverted through it, so the session the fault
-        # opened is the same one the run observes and cleanup ends. Set by the orchestrator
-        # and by the kill switch; None when no adapter was handed over.
+        # opened is the same one the run observes and cleanup ends. Handed over with
+        # `use_adapter` (by `configure`, or by the kill switch); None when none was.
         self.adapter: BaseDatabaseAdapter | None = None
-        # (cycles, interval_s) when the scenario repeats its fault, so preflight can check the
-        # target can actually take that cadence (Framework NL-C-05)
-        self.repeat_plan: tuple[int, float] | None = None
-        # the scenario's fault.duration in seconds, for faults that are held and then released
-        # (None for a permanent fault)
-        self.duration_s: float | None = None
-        # A single process the fault must hit instead of the whole service, found by the
-        # adapter: {"pid", "parent_pid", "title_marker"}. Generic -- the driver re-checks
-        # parent and title before acting. Set per attempt by the orchestrator, cleared after.
-        self.kill_target: Mapping[str, Any] | None = None
+
+    def configure(self, fault: Fault, repeat: Repeat | None, adapter: BaseDatabaseAdapter | None) -> None:
+        """Take what the driver needs from the scenario's fault section, in one place. The
+        orchestrator calls this once, right after resolving the driver; the kill switch, which
+        has no scenario, calls only `use_adapter`. A driver that needs more of the scenario
+        (a hold duration, a repeat plan, a relation kind) overrides this, calls it, and keeps
+        those values itself."""
+        self.use_adapter(adapter)
+
+    def use_adapter(self, adapter: BaseDatabaseAdapter | None) -> None:
+        """The run's database adapter: faults inside the database act on its own sessions."""
+        self.adapter = adapter
+
+    def aim_at(self, target: Mapping[str, Any] | None) -> None:
+        """A single process the next injection must hit instead of the whole service
+        ({"pid", "parent_pid", "title_marker"}, found by the adapter); None for the whole
+        service again. Set per attempt by the orchestrator and cleared after it.
+
+        A driver that cannot aim refuses: injecting into the whole service when one process was
+        asked for would test something else."""
+        if target is not None:
+            raise DriverNotAvailable(f"{self.driver_name} cannot aim {self.fault_type!r} at a single process")
 
     async def confirm(self, node: Node, detail: Mapping[str, Any]) -> dict[str, Any]:
         """After recovery: independent evidence that the fault took effect, beyond the
@@ -65,6 +77,13 @@ class FaultInjector(ABC):
         this driver cannot tell, which is reported as not measured -- never as confirmed.
         `detail` is the injection's ledger detail (`preflight` and `inject`)."""
         return {"fault_confirmed": None, "note": f"{self.driver_name} has no confirmation for {self.fault_type}"}
+
+    def _database_adapter(self, node: Node) -> BaseDatabaseAdapter:
+        """The run's adapter when it was handed over; otherwise one built from the profile
+        (the kill switch after a crash, where the run's adapter no longer exists)."""
+        if self.adapter is None:
+            self.adapter = adapter_for(self.profile.database.engine, node)
+        return self.adapter
 
     @abstractmethod
     async def preflight(self, node: Node) -> dict[str, Any]:
@@ -99,7 +118,19 @@ _REGISTRY: dict[tuple[str, str], list[type[FaultInjector]]] = {}
 
 
 def register(section: str, cls: type[FaultInjector]) -> type[FaultInjector]:
-    _REGISTRY.setdefault((section, cls.driver_name), []).append(cls)
+    """Refuse a nameless driver, and a second driver for a fault type the same profile section
+    and driver name already serve: which one ran would depend on import order."""
+    if not getattr(cls, "driver_name", "") or not getattr(cls, "fault_types", None):
+        raise ValueError(f"{cls.__qualname__} does not set its driver_name and fault_types")
+    classes = _REGISTRY.setdefault((section, cls.driver_name), [])
+    if cls in classes:
+        return cls
+    for other in classes:
+        shared = other.fault_types & cls.fault_types
+        if shared:
+            raise ValueError(f"fault type(s) {', '.join(sorted(shared))} of {section}/{cls.driver_name} registered "
+                             f"twice: {other.__module__}.{other.__qualname__} and {cls.__module__}.{cls.__qualname__}")
+    classes.append(cls)
     return cls
 
 

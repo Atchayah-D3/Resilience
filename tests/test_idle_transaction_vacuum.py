@@ -28,6 +28,9 @@ from resilience_tests.adapters.base import (
 )
 from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
 from resilience_tests.analysis.report import render_summary
+from resilience_tests.control.faults import summary_sections
+from resilience_tests.control.faults import FaultBehaviour
+from resilience_tests.control.faults.service import ProcessKill
 from resilience_tests.control.matrix import RunPlanItem
 from resilience_tests.control.orchestrator import RunOptions, TestOrchestrator
 from resilience_tests.control.profile import Node
@@ -48,7 +51,7 @@ def test_nl_m_05_catalog_specification():
     assert sc.category == "NL-M"
     assert sc.priority == "P1"
     assert sc.fault.type == "idle_in_transaction"
-    assert sc.fault.driver == "os_ssh"
+    assert sc.fault.section == "os_ssh"
     assert sc.workload.profile == "mixed"
     assert sc.workload.transaction_markers is True
 
@@ -93,6 +96,12 @@ def test_nl_m_05_path_a_timeout_enforced(env):
     assert "idle_transaction_check" in facts
     assert facts["idle_transaction_check"].get("terminated_by_timeout") is True
 
+    # Was: path B was not taken (the session had ended), so the declared dead_tuples_not_removable
+    # was silently left out. Every declared measure is produced, with the reason when unmeasured.
+    assert facts["declared_not_produced"] == []
+    assert str(m["dead_tuples_not_removable"]) == "NOT_MEASURED"
+    assert "already ended" in facts["not_measured"]["dead_tuples_not_removable"]
+
 
 def _run_nlm05(env):
     item = RunPlanItem(scenario=scenario("NL-M-05"), env_class=env.env_class,
@@ -116,6 +125,19 @@ def test_nl_m_05_path_a_needs_evidence_of_why_the_session_ended(env, monkeypatch
     assert results["status"] == "failed", why(results)
     assert str(results["measured"]["idle_in_transaction_session_timeout_enforced"]) == "NOT_MEASURED"
     assert "cause is unknown" in results["facts"]["not_measured"]["idle_in_transaction_session_timeout_enforced"]
+
+
+def test_nl_m_05_an_unreadable_session_state_is_not_measured_not_false(env, monkeypatch):
+    """Was: an error reading the idle session became "the timeout was not enforced" -- a
+    definite answer to a question the harness could not answer."""
+    async def unreadable(self, pid=None):
+        raise ConnectionError("server closed the connection unexpectedly")
+
+    monkeypatch.setattr(OutageAdapter, "check_idle_transaction", unreadable)
+    results = _run_nlm05(env)
+    assert results["status"] == "failed", why(results)
+    assert str(results["measured"]["idle_in_transaction_session_timeout_enforced"]) == "NOT_MEASURED"
+    assert "could not be read" in results["facts"]["not_measured"]["idle_in_transaction_session_timeout_enforced"]
 
 
 def test_nl_m_05_path_b_cannot_pass_without_an_alert_source(env, monkeypatch):
@@ -252,7 +274,7 @@ def test_nl_m_05_summary_report_rendering(env):
         node=env.nodes[0],
     )
     results = asyncio.run(TestOrchestrator(item, env, RunOptions()).run())
-    summary = render_summary(results)
+    summary = render_summary(results, sections=summary_sections())
 
     assert "idle-in-transaction vacuum blocking (NL-M-05):" in summary
     assert "idle backend pid: 8888" in summary
@@ -322,6 +344,25 @@ def test_check_idle_transaction_fails_closed_when_no_session_was_established():
     asyncio.run(_test())
 
 
+def test_check_idle_transaction_reports_an_unreadable_activity_view_instead_of_guessing():
+    """Was: a failed pg_stat_activity query was ignored and the held session probed instead, so a
+    crashed server read as "terminated" (and a SELECT on a still-open session moved its xmin)."""
+
+    async def _test():
+        adapter = PostgreSQLAdapter(_node())
+        held = MagicMock()
+        held.is_closed = MagicMock(return_value=True)
+        adapter._idle_conn = held
+        adapter._connect = AsyncMock(side_effect=OSError("connection refused"))
+
+        result = await adapter.check_idle_transaction(pid=7777)
+        assert result["terminated_by_timeout"] is False
+        assert "pg_stat_activity could not be read" in result["error"]
+        held.is_closed.assert_not_called()   # the held session was not used to guess
+
+    asyncio.run(_test())
+
+
 def test_check_idle_transaction_absent_backend_without_closed_session_is_not_timeout_enforcement(monkeypatch):
     """An absent backend is only evidence of timeout enforcement when the harness-held session
     existed and is now closed. The SSH-fallback shell pid (never a backend pid) must fail closed."""
@@ -372,9 +413,10 @@ def test_settings_are_observed_never_written():
         conn.fetchval = AsyncMock(return_value="30s")
         conn.close = AsyncMock()
         adapter._connect = AsyncMock(return_value=conn)
-        assert await adapter.observe_fault_settings("idle_in_transaction") == {
+        assert await adapter.observe_idle_transaction_settings() == {
             "idle_in_transaction_session_timeout": "30s"}
-        assert await adapter.observe_fault_settings("process_kill") == {}
+        # a kill observes nothing: only the fault classes that depend on a setting read one
+        assert ProcessKill.observe_settings is FaultBehaviour.observe_settings
         assert conn.execute.call_count == 0
         assert not hasattr(adapter, "cleanup_leftover_configuration")
         assert not hasattr(adapter, "configure_for_scenario")
@@ -460,7 +502,7 @@ def test_inject_idle_transaction_rolls_back_and_does_not_fall_back(monkeypatch):
         mock_conn.is_closed = MagicMock(return_value=False)
         mock_conn.close = AsyncMock()
         adapter._connect = AsyncMock(return_value=mock_conn)
-        monkeypatch.setattr("resilience_tests.adapters.postgresql.adapter.RemoteHost",
+        monkeypatch.setattr("resilience_tests.adapters.postgresql.sessions.RemoteHost",
                             MagicMock(side_effect=AssertionError("no SSH fallback")))
 
         result = await adapter.inject_idle_transaction()

@@ -10,7 +10,7 @@ from typing import Any
 from resilience_tests.reporting.evidence import load_run
 from resilience_tests.reporting.view import case_status, non_pass_rules, stopped_phase
 
-SCENARIO_ID_RE = re.compile(r"\b(?:NL|CL|DX)-[A-Z]-\d{2}\b")
+SCENARIO_ID_RE = re.compile(r"\b(?:NL|CL|DX)-[A-Z]-(?:\d{2}|I\d{2}[a-z]?)\b")
 
 
 @dataclass

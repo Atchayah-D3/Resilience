@@ -22,7 +22,7 @@ catalog checks exists to catch it.
 
 ## 1. Overview
 
-“Is the database resilient?” cannot be tested. The specification turns that question into 155
+“Is the database resilient?” cannot be tested. The specification turns that question into 162
 specific questions, each with a number as the answer. For example:
 
 > Kill the database process while the database is taking 200 writes a second. How many
@@ -86,6 +86,7 @@ stops a half-finished run from looking perfect.
 | File | Job |
 |---|---|
 | `control/orchestrator.py` | The manager. Runs the nine phases in order, sets a time limit on each, collects every measurement, decides whether the result may be trusted. |
+| `control/faults/` | What each fault type (and each `fault.during` operation) adds to the phases: its recovery action, its own measures, the operation the fault must land inside. The manager calls these and never compares a fault type itself. |
 | `control/safety.py` | The refusals: not production, the right machine, the operator’s approval, one machine only. |
 | `control/ledger.py` | The record book of faults caused. Written and forced to disk *before* each fault. |
 | `control/killswitch.py` | The repair tool. Undoes every fault still recorded as outstanding, including after a crash. |
@@ -99,7 +100,9 @@ stops a half-finished run from looking perfect.
 |---|---|
 | `execution/remote.py` | The SSH layer. Every command sent to the target passes through here. |
 | `execution/injectors/base.py` | The shape every fault tool must have, and the list of tools available. |
-| `execution/injectors/process.py` | Kill the process, restart the service, reload the configuration. Confirms the kill really landed. |
+| `execution/injectors/process.py` | Kill the process, restart the service, reload the configuration, hold an idle transaction, flood connections -- one small class per fault. Confirms the kill really landed. |
+| `execution/injectors/corruption.py` | Flip one byte in one page of the harness's own relation, and prove it landed. |
+| `execution/injectors/os_ssh.py` | What the OS/SSH tools share: the service manager's state and stop mode, and psql on the target. |
 | `execution/injectors/power.py` | Cut and restore power, through libvirt. |
 | `execution/workload/driver.py` | The load generator: 64 connections, paced transactions, one summary per second. |
 | `execution/workload/markers.py` | The data-loss evidence: two journals on the harness machine, and the arithmetic over them. |
@@ -109,11 +112,14 @@ stops a half-finished run from looking perfect.
 
 | File | Job |
 |---|---|
-| `adapters/base.py` | The interface an engine must implement, and the capabilities an engine can declare. |
-| `adapters/postgresql/adapter.py` | The only file that knows PostgreSQL: connections, SQL, error meanings, `pg_amcheck`, checksum counters. |
+| `adapters/base.py` | The interface an engine must implement, grouped by topic (the core, and one support interface per kind of fault), and the capabilities an engine can declare. |
+| `adapters/postgresql/` | The only package that knows PostgreSQL. `adapter.py` holds the core (connections, SQL, error meanings, `pg_amcheck`, checksum counters); `corruption.py`, `operations.py` and `sessions.py` each implement one fault-support interface; `host.py` declares what they use from the core. |
 | `adapters/target_resolver.py` | Turns a test’s allowed roles into the actual machines in the file. |
 | `observability/event_stream.py` | The append-only record: one JSON line per event into `events.jsonl`. |
+| `observability/alerts.py` | Asks the environment's monitoring whether an alert fired (`alerting.source` in the profile). Only `none` exists: "alerted" measures are then NOT_MEASURED with the reason. |
+| `analysis/degradation.py` | For a fault held under load: TPS and p99 during the hold over the baseline (`oltp_tps_ratio`, `oltp_p99_ratio`). |
 | `analysis/rto_decomposer.py` | Everything time-related: when service stopped, when writes returned, when throughput truly recovered, and the breakdown. |
+| `analysis/cycles.py` | For a repeated fault: each cycle's recovery against the replay work it faced, the trend across cycles, errors per cycle, and on-disk growth. |
 | `analysis/predicates.py` | Evaluates one rule, such as `rpo_txn == 0`, against the measured values. |
 | `analysis/threshold_eval.py` | Applies every rule and produces the verdict, with a reason recorded for each rule. |
 | `analysis/report.py` | Writes `results.json` and `summary.txt`. |
@@ -231,6 +237,11 @@ Recovery must be unattended: on the target, the service manager notices the deat
 database again, and the database replays its log and reopens. **T1 equals T0**, because no
 harness action was needed.
 
+**A fault the harness holds and then removes** (contention and pressure, Framework §10.6) —
+held for `fault.duration` and released while still in the fault_inject phase; the release is
+**T1**. Recovery only watches what follows it, so the recovery phase's duration does not
+include the hold.
+
 **Power loss** — the harness switches the power back on, and that instant is **T1**, later than
 T0 by however long the scenario keeps the machine dark. The harness restores power and nothing
 else: the machine must boot, and the database must start by itself. All of that time counts
@@ -293,6 +304,45 @@ record-book entries. `summary.txt` is the readable version — start there.
 said. The status becomes `error` and carries the repair command.
 
 ## 7. Measurements
+
+### Workload profiles (§7.1, §7.5)
+
+The same fault has different effects on an idle database and on a busy one, so every scenario
+declares its load in the `workload:` section of its file, and the harness never chooses it at
+run time (§7.5). The catalog checks refuse a scenario that does not state
+`rate_tps`, except for the `idle` profile.
+
+| Field | Meaning | Example (NL-C-01) |
+|---|---|---|
+| `profile` | Which kind of load (table below). | `oltp_write_heavy` |
+| `rate_tps` | Transactions started per second, across all connections together. | `200` |
+| `concurrency` | Number of connections, each sending one transaction at a time. | `64` |
+| `transaction_markers` | Every transaction carries a marker id, so lost commits can be counted (RPO). | `true` |
+| `history` | `list_append` also records every read and write for the Elle checker (NL-C-03). | `none` |
+
+How long the load runs is not part of `workload:`. The load runs for the whole test: the
+baseline lasts `steady_state.duration_s` (120 s), and the load continues through the fault and
+the recovery.
+
+The Framework names six profiles (§7.1). Two are built:
+
+| Profile | What each transaction does | Used by | Built |
+|---|---|---|---|
+| `oltp_write_heavy` | `BEGIN; INSERT marker; COMMIT` | NL-C-01..04, NL-C-06, NL-I-01, NL-I-02, NL-M-06, NL-M-07, NL-R-04 | yes |
+| `mixed` | the marker insert, plus an UPDATE or DELETE of an existing row, so dead rows build up for the vacuum and bloat checks | NL-C-05, NL-M-03, NL-M-05 | yes |
+| `idle` | no load | — | no |
+| `oltp_read` | read-only queries | — | no |
+| `bulk_load` | large COPY or INSERT batches | — | no |
+| `long_analytic` | long-running analytic queries | — (NL-N-07 will need it) | no |
+
+A scenario that asks for a profile that is not built is refused at the init phase ("workload
+profile ... is not built yet"), never run with a different load.
+
+**The load values are set for the lab VM, not taken from the Framework.** The Framework fixes
+only one rate: NL-M-07 "at 1000 TPS" (§10.7). The other values (200 TPS offered,
+`tps_min` 150, p99 at most 300 ms) were chosen so the current lab VM runs them comfortably, and
+they need review when the lab hardware changes. Example from the 23 Oct runs: offered 200 TPS,
+measured baseline 194–200 TPS, p99 3–103 ms.
 
 ### RPO — the marker protocol (§6.4, arch §6.2)
 
@@ -381,7 +431,7 @@ python3.11 -m venv .venv
 # the harness's own tests, and the catalog checks
 .venv/bin/pytest -q -n 4
 .venv/bin/python -m catalog.schema --partial   # while the catalog is being authored
-.venv/bin/python -m catalog.schema             # release gate: the complete 155-test catalog
+.venv/bin/python -m catalog.schema             # release gate: the complete 162-test catalog
 
 # dry run: reset .. pre_fault only. No fault, no verdict.
 .venv/bin/pytest resilience_tests/test_scenarios.py --env e2-dedicated-vm \
@@ -489,12 +539,59 @@ Plus `injection-ledger.jsonl` in the harness machine’s run directory, shared a
 **A new fault type** — add it to `FaultType` and, if it needs a new profile section, to
 `FAULT_DRIVER_SECTION` in `catalog/schema.py`; write a `FaultInjector` subclass with
 `preflight` / `inject` / `revert`, call `register()` at the bottom of the file, add the file to
-the import line in `injectors/__init__.py`, and add the section to the profile.
+the import line in `injectors/__init__.py`, and add the section to the profile. If the run must
+do anything different for it -- a recovery action, measures of its own -- add a `FaultBehaviour`
+in `control/faults/` with `@register_fault`; the orchestrator itself is not edited. A behaviour
+sees the run only through `self.ctx` (`control/faults/context.py`): the scenario, the adapter,
+the run's facts / not-measured reasons / disclosures, T0, and named actions on the fault. When
+a behaviour needs something new from the run, add it there rather than reaching into the
+orchestrator.
+
+Hooks a behaviour may override, in the order the phases call them (each defaults to nothing):
+`observe_settings()` (engine settings that decide how the fault plays out, read in init through
+a named adapter method, never written), `samplers()` (extra background measurements, started
+and stopped with the run's probes),
+`baseline_started()` / `baseline_ended()`, `before_inject()` / `after_inject(detail)`,
+`hold_and_release()` (fault_inject: a fault the harness holds and removes itself),
+`begin_recovery()`, `recovery_soak_s()` (a fixed time to observe instead of waiting for the SLO,
+for a recovery that is the engine's own doing, e.g. NL-M-05's timeout), `measure_client_impact()`,
+`before_integrity_check()`, `measure()`; `phase_extension_s(phase)` adds a hold to that phase's
+profile bound, `slo_clock_from_t1()` measures time back to SLO from T1, and `cycle_evidence_keys`
+names the injection-detail keys kept in each cycle's row of a repeated scenario. Its section of
+`summary.txt` comes from the classmethod `summary_lines(results)`; the orchestrator hands every
+registered section to `analysis/report.py` (`summary_sections()`), which names no fault.
+
+A `fault.during` behaviour has the same `observe_settings()` and `summary_lines()`, plus
+`create_objects()` for what the operation needs, `establish()` (bring the target into the state
+the fault must land inside, just before each attempt; it returns evidence recorded with the
+injection) and `after_inject(detail)`.
+
+A fault the harness holds and then releases (contention, pressure: Framework §10.6) subclasses
+`HeldFault`: its driver applies the fault in `inject`; still in the fault_inject phase,
+`hold_and_release()` holds it for `fault.duration` with the workload measured in its own window
+(`on_hold_start` / `on_hold_end` for snapshots) and releases it through the driver's `revert`
+(T1). The recovery phase then only watches the return to SLO from T1, so each phase's duration
+means what its name says; `oltp_tps_ratio` / `oltp_p99_ratio` are measured for it.
+
+A fault type with no registered behaviour is not built: the run plan skips it and init refuses
+it, with the reason, before anything is applied (`control/matrix.py: not_built_reason`).
+
+**A driver** keeps its own settings: it overrides `configure()` to take what it needs from the
+scenario (a hold duration, a repeat plan, a relation kind). The base class only aims a fault at
+a single process if the driver overrides `aim_at()`; otherwise it refuses.
 
 **A second database engine** — implement `BaseDatabaseAdapter`, declare its capabilities, and
-`register_adapter()` it against the engine name in the profile. A capability the engine lacks
-makes the affected measurement NOT_APPLICABLE rather than zero. `tests/test_adapter_seam.py`
-shows the whole interface exercised by a fake engine.
+`register_adapter()` it against the engine name in the profile. The interface is grouped by
+topic in `adapters/base.py`: `CoreAdapter` (what every engine provides: sessions, markers,
+settings, integrity, logs) and one support interface per kind of fault (`SessionFaultSupport`,
+`OperationSupport`, `CorruptionSupport`). An engine overrides what it supports; every default it
+leaves either refuses (`NotImplementedError`) or says it cannot tell (None, `supported: False`),
+so an unbuilt feature can never pass on an invented answer. A capability the engine lacks makes
+the affected measurement NOT_APPLICABLE rather than zero. The PostgreSQL adapter implements each
+group in its own file (`sessions.py`, `operations.py`, `corruption.py`), mixed into the core
+class in `adapter.py`; what those files use from the core is declared in `host.py`.
+`tests/test_adapter_seam.py` shows the whole interface exercised by a fake engine, and
+`tests/test_adapter_structure.py` keeps the grouping honest.
 
 **A new environment** — one YAML in `envs/`. The model rejects a profile whose harness machine is
 also a target, or that leaves any phase unbounded.
@@ -554,3 +651,99 @@ deliberately not used: on a customer cluster it would scan every database they o
 not finish inside the validate time limit.
 
 → `adapters/postgresql/adapter.py`, `control/profile.py`
+
+## 13. Design note: tests on several machines (Tier 2 and 3)
+
+**Status: not built.** This note records the plan for the cluster (CL, Tier 2) and distributed
+(DX, Tier 3) scenarios, so the work can start from an agreed design. Until it is built:
+- cluster scenarios cannot run: there is no cluster `Role` to declare yet, and on a node whose
+  role is not `standalone` the orchestrator stops at the Tier-2 checks (`NotImplementedError`);
+- a compound scenario (CL-X) is refused with a reason, in the run plan and again in init
+  (`control/matrix.py` `not_built_reason`). Nothing injects its second fault yet, and a run that
+  applied only the first could pass without testing the scenario.
+
+### What is in place today
+
+| Already supports several machines | Still assumes one machine per run |
+|---|---|
+| The environment file lists any number of `nodes`, each with `role` and `topology_role` (primary, sync_standby, async_standby) and a `client` endpoint (the pooler, if there is one) | `RunPlanItem.node`: a run gets one node |
+| The scenario names the fault's target (`fault.target`: primary or sync_standby) | `TestOrchestrator.node`: used in 24 places (probes, injection, integrity check, safety) |
+| `TargetResolver` chooses nodes through a replaceable `ResolverStrategy` | `RunContext.node`: fault classes see one node |
+| The safety controller counts nodes affected (compound scenarios: at most 2) | RTO decomposition is called with `clustered=False`; Tier-2 probes raise `NotImplementedError` (`orchestrator.py`) |
+| The injection ledger records the node of every injection | Only `standalone` and `distdb.*` exist as `Role` values (`catalog/schema.py`) |
+
+Fault classes, drivers, the driver and fault registries, the database adapter interface, the
+verdict and the report do not change. New cluster faults are added as new classes, as today.
+
+### Proposed design
+
+**1. Environment file: describe the cluster.** The node list stays. Add a `cluster` section
+for what belongs to the whole group, and a role for members of a PostgreSQL HA group:
+
+```yaml
+cluster:
+  manager: patroni                       # who elects the primary; read, never configured
+  manager_api: {port: 8008}              # where the current primary and state are read
+  consensus: [10.0.0.21:2379, 10.0.0.22:2379, 10.0.0.23:2379]   # etcd
+nodes:
+  - {name: pg-a, role: ha_member, topology_role: primary, ...}
+  - {name: pg-b, role: ha_member, topology_role: sync_standby, ...}
+  - {name: pg-c, role: ha_member, topology_role: async_standby, ...}
+```
+
+`topology_role` in the file is only the starting layout. After a failover the primary is a
+different machine, so the current roles are read from the cluster manager when needed (a new
+`ResolverStrategy`, e.g. `PatroniStrategy`).
+
+**2. Run plan: one run gets the whole group.** `RunPlanItem` carries a `Topology`: every node of
+the group, plus the node the fault targets. A standalone profile gives a topology of one node,
+so today's scenarios run exactly as now.
+
+**3. Orchestrator: work on the topology, not one node.**
+
+| Today | Planned |
+|---|---|
+| `self.node` everywhere | `self.topology`; the fault node is `topology.target(fault.target)`, resolved at injection time |
+| write probes on the node | write probes on the `client` endpoint (pooler or virtual IP), as an application would see it |
+| integrity check on the node | integrity check on the current primary, plus a primary-to-replica data comparison |
+| `clustered=False` | `clustered=topology.is_cluster`: detect / elect / promote times become measurable |
+| Tier-2 probes raise `NotImplementedError` | replication lag, standby health and leader changes as samplers on each node |
+| safety checks the one node | safety checks every node, and the blast radius against the topology |
+
+**4. RunContext: give fault classes the group.** Add `ctx.topology` (all nodes, the current
+primary) and `ctx.node_for(role)`. `ctx.node` stays, meaning the fault's target, so existing
+fault classes need no change.
+
+**5. Compound faults (CL-X).** A second driver is resolved for `compound.fault_b` and its target
+node. A watcher waits for the trigger (`on_state`, `on_metric` or `after_phase`, within
+`timeout_s`) and injects fault B, with its own ledger entry. If the trigger never comes, the run
+is aborted. A compound run never reports a pass when only fault A was applied. The guard is
+removed when this is built.
+
+**6. Distributed tests (Tier 3).** A DistDB adapter in `adapters/distdb/`. Topology roles for the
+primary coordinator, query coordinators and workers (`distdb.pc`, `distdb.qc`,
+`distdb.worker`, already in the schema).
+
+### Order of work
+
+| Step | Proves | Existing scenarios |
+|---|---|---|
+| 1. `Topology` model + environment `cluster` section; standalone = topology of one | the model | must give identical results (before/after comparison of the orchestrator tests) |
+| 2. Orchestrator and `RunContext` use the topology | the refactor | identical results again; then a live run of every scenario |
+| 3. Cluster probes and clustered RTO decomposition | cluster measurements | unchanged (standalone skips them) |
+| 4. First cluster scenario, CL-F-02 (kill the primary), on a lab cluster | the whole chain on real machines | — |
+| 5. Remaining CL scenarios, a few at a time, with their drivers (network, pooler, backup) | each scenario | — |
+| 6. Compound injection; remove the guard | CL-X | — |
+| 7. DistDB adapter and roles | Tier 3 | — |
+
+### Decisions needed before step 1
+
+- The lab cluster: machines, cluster manager (Patroni assumed), pooler, consensus store.
+- Checks that apply only to a cluster (e.g. `leader_changed == false`) on a standalone target:
+  proposal is to mark them cluster-only and report them as not applicable there, with the
+  reason.
+- Whether a cluster test may change the cluster manager's state (e.g. pause automatic failover
+  for a test). The current rule is that configuration is observed, never written.
+
+→ `control/matrix.py`, `control/orchestrator.py`, `control/faults/context.py`,
+`control/profile.py`, `adapters/target_resolver.py`

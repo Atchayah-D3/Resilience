@@ -23,6 +23,7 @@ include = ["catalog*", "resilience_tests*"]
 
 [tool.setuptools.package-data]
 "resilience_tests.reporting" = ["templates/*.j2"]
+"resilience_tests.adapters.postgresql" = ["sql/*.sql"]   # TPC-C SQL (docs/tpcc-build-plan.md, step 4)
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

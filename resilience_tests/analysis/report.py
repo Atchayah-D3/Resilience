@@ -1,6 +1,6 @@
-"""Run outputs (Arch §10.4). Phase 1 requires only the results file (Arch §16); the JUnit XML
-CI gate comes from pytest --junitxml; the HTML report, MinIO evidence bundle and trend store
-arrive with Phases 2 and 6.
+"""Run outputs (Arch §10.4): results.json and its plain-text summary.txt. The JUnit XML CI gate
+and the HTML pages are built from these by resilience_tests/reporting; the MinIO evidence
+bundle and the trend store arrive with Phases 2 and 6 (Arch §16).
 
 The evidence directory (Arch §10.4 "Audit: probe stream, logs, metric snapshot, amcheck
 output, marker journals") is the run directory on the driver host.
@@ -10,14 +10,23 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+
+from resilience_tests.analysis.activity import summary_lines as activity_summary_lines
 
 RESULTS_FILE = "results.json"
 SUMMARY_FILE = "summary.txt"
 
+# A section that belongs to one fault or `during` operation (e.g. the checkpoint evidence of
+# NL-C-02): lines built from the results alone, none for a run it does not concern. The caller
+# passes them in (control/faults: summary_sections), so this module never names a fault and a new
+# fault adds its section without editing it.
+Section = Callable[[dict[str, Any]], list[str]]
 
-def write_results(run_dir: Path, results: dict[str, Any]) -> Path:
+
+def write_results(run_dir: Path, results: dict[str, Any], *, sections: Sequence[Section]) -> Path:
     path = run_dir / RESULTS_FILE
     tmp = path.with_suffix(".tmp")
     with tmp.open("w") as fh:
@@ -25,11 +34,11 @@ def write_results(run_dir: Path, results: dict[str, Any]) -> Path:
         fh.flush()
         os.fsync(fh.fileno())
     tmp.replace(path)
-    (run_dir / SUMMARY_FILE).write_text(render_summary(results))
+    (run_dir / SUMMARY_FILE).write_text(render_summary(results, sections=sections))
     return path
 
 
-def render_summary(r: dict[str, Any]) -> str:
+def render_summary(r: dict[str, Any], *, sections: Sequence[Section]) -> str:
     lines = [
         f"{r['scenario']['id']}  {r['scenario']['name']}",
         f"run {r['run_id']}  env {r['environment']['profile']} ({r['environment']['class']})  node {r['target']['node']}",
@@ -72,6 +81,7 @@ def render_summary(r: dict[str, Any]) -> str:
                          f"{bloat['bytes_per_live_row_first']:.1f} -> "
                          f"{bloat['bytes_per_live_row_last']:.1f} bytes per live row "
                          f"(+{bloat['rows_added']} rows, {bloat['bytes_unexplained_by_rows']:+.0f} B unexplained)")
+    lines += activity_summary_lines((r.get("facts") or {}).get("activity"))
     elle = (r.get("facts") or {}).get("elle")
     if elle:
         lines += [
@@ -82,82 +92,8 @@ def render_summary(r: dict[str, Any]) -> str:
              f"  valid: {elle.get('valid')}  anomaly types: {elle.get('anomalies_count')} "
              f"{elle.get('anomaly_types') or ''}"),
         ]
-    cp = (r.get("facts") or {}).get("checkpoint_injection")
-    if cp:
-        w_event = cp.get("wait_event")
-        w_type = cp.get("wait_event_type")
-        if w_event and w_type:
-            event_desc = f"{w_event} ({w_type})"
-        elif w_event or w_type:
-            event_desc = str(w_event or w_type)
-        else:
-            event_desc = "none (checkpointer running, not waiting)"
-
-        verification = (r.get("facts") or {}).get("checkpoint_verification") or {}
-        changed = (r.get("facts") or {}).get("checkpoint_pages_changed") or {}
-        if changed.get("supported"):
-            lines += ["", f"data changed just before the checkpoint: {changed.get('rows_updated')} rows of "
-                          f"{changed.get('table')} ({(changed.get('table_bytes') or 0) / 1024**2:.1f} MB) "
-                          f"in {changed.get('update_s')} s"]
-        lines += [
-            "",
-            "checkpoint fault injection (NL-C-02):",
-            f"  checkpointer seen active before kill: {cp.get('checkpointer_active')}",
-            f"  checkpointer pid: {cp.get('checkpointer_pid')}",
-            f"  wait event: {event_desc}",
-        ]
-        if verification:
-            lines += [
-                f"  checkpoint still in flight at kill: {verification.get('in_flight')}",
-                f"    redo point before CHECKPOINT: {verification.get('prior_redo_lsn')}  "
-                f"recovery redo started at: {verification.get('recovery_redo_start_lsn')}",
-                f"    {verification.get('note', '')}",
-            ]
-        if cp.get("buffers_written_during_cp") is not None:
-            lines.append(f"  stat counter delta (pg_stat_checkpointer.buffers_written): {cp['buffers_written_during_cp']}")
-        if cp.get("io_writes_during_cp") is not None:
-            lines.append(f"  io writes delta (pg_stat_io): {cp['io_writes_during_cp']}")
-    idle = (r.get("facts") or {}).get("idle_transaction")
-    if idle:
-        facts = r.get("facts") or {}
-        idle_chk = facts.get("idle_transaction_check") or {}
-        evidence = facts.get("idle_timeout_evidence") or {}
-        probe = facts.get("vacuum_horizon_probe") or {}
-        measured = r.get("measured") or {}
-        lines += [
-            "",
-            "idle-in-transaction vacuum blocking (NL-M-05):",
-            f"  idle backend pid: {idle.get('pid')}  state at injection: {idle.get('state')}  "
-            f"backend_xid: {idle.get('backend_xid')}",
-            f"  backend_xmin: {idle.get('backend_xmin')}",
-            f"  path A  session ended: {idle_chk.get('terminated_by_timeout')}  "
-            f"timeout log line: {'seen' if evidence.get('log_line') else 'not seen'}  "
-            f"sqlstate: {evidence.get('sqlstate')}  -> timeout enforced: "
-            f"{measured.get('idle_in_transaction_session_timeout_enforced')}",
-            f"  path B  vacuum blocked: {measured.get('vacuum_blocked')}  "
-            f"dead but not removable: {probe.get('dead_not_removable')}  "
-            f"removable cutoff: {probe.get('removable_cutoff')}  "
-            f"bloat alert fired: {measured.get('bloat_alert_fired')}",
-        ]
-    corrupted = (r.get("facts") or {}).get("data_corruption")
-    if corrupted:
-        facts = r.get("facts") or {}
-        attempts = (facts.get("corruption_read") or {}).get("attempts") or []
-        first = attempts[0] if attempts else {}
-        checks = corrupted.get("pg_checksums") or {}
-        lines += [
-            "",
-            "data-file corruption (NL-I):",
-            f"  injected: {corrupted.get('relation')} block {corrupted.get('block')} "
-            f"({corrupted.get('relation_path')}), byte {corrupted.get('original_byte')} -> "
-            f"{corrupted.get('written_byte')}, after a {corrupted.get('cluster_state')!r} stop",
-            f"  pg_checksums before restart: {checks.get('failures')}",
-            f"  first read: {first.get('sqlstate') or 'no error'}  {first.get('message') or ''}"
-            + (f"  ({first.get('rows')} rows returned)" if first.get("rows") is not None else ""),
-            f"  pg_amcheck on the damaged relation: detected={(facts.get('amcheck_on_corrupted_relation') or {}).get('detected')}",
-            f"  failures in the server log: {facts.get('corruption_log_locations')}",
-            f"  whole-database check left out: {(facts.get('integrity_check') or {}).get('excluded_relations')}",
-        ]
+    for section in sections:
+        lines += section(r)
     if r.get("measured"):
         rendered = []
         for k, v in sorted(r["measured"].items()):

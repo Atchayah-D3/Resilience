@@ -1,7 +1,7 @@
 """What one run leaves behind for the next (review finding NL-C-06 cleanup).
 
 S2 (silent ALTER SYSTEM RESET of operator settings) is closed by design: the harness never
-writes configuration at all -- it only observes it (observe_fault_settings; see
+writes configuration at all -- it only observes it (the adapters' observe_*_settings; see
 test_idle_transaction_vacuum.py, which asserts the tuning methods no longer exist).
 """
 

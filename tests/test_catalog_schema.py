@@ -34,6 +34,14 @@ def test_scenario_must_not_name_hosts_or_drivers(leak):
         Scenario.model_validate(variant(description=f"power off via {leak}"))
 
 
+def test_workload_rate_must_be_declared():
+    # Framework §7.5: an undeclared rate would mean "as fast as this machine can go"
+    no_rate = variant()
+    del no_rate["workload"]["rate_tps"]
+    with pytest.raises(ValidationError, match="rate_tps must be declared"):
+        Scenario.model_validate(no_rate)
+
+
 def test_fault_driver_must_be_profile_section():
     # the scenario names an env-profile SECTION, never a driver
     with pytest.raises(ValidationError, match="os_ssh"):
