@@ -59,3 +59,54 @@ def test_torn_final_line_is_reported_not_guessed(tmp_path):
     p.write_text(json.dumps({"seq": 1, "uuid": "a", "t_pre": 1}) + "\n" + '{"seq": 2, "uu')
     r = read_journal(p)
     assert len(r.records) == 1 and r.torn_lines == 1
+
+
+def test_a_sure_rollback_is_not_indeterminate():
+    """Was: the general marker count showed TPC-C's business rollbacks as unknown (223 shown,
+    60 truly unknown, in the first lab NL-C-01 run with TPC-C). A transaction the database
+    answered "rolled back" had an answer: it is counted as rolled back, not as unknown."""
+    d = diff_markers(written={"a", "b", "c", "d", "e"}, acked={"a"}, db={"a", "c"}, aborted={"b", "c"})
+    assert d.indeterminate == {"d", "e"}                 # no answer at all
+    assert d.rolled_back == {"b", "c"}
+    assert d.rolled_back_kept == {"c"}                   # answered "rolled back", yet in the database
+    assert d.indeterminate_committed == frozenset()
+    assert d.rpo_txn == 0
+
+
+def test_an_acknowledgement_wins_over_a_rollback_line_so_its_loss_is_still_seen():
+    d = diff_markers(written={"a"}, acked={"a"}, db=set(), aborted={"a"})
+    assert d.rolled_back == frozenset() and d.lost == {"a"} and d.rpo_txn == 1
+
+
+def test_without_a_rollback_journal_nothing_changes(tmp_path):
+    """The custom workload writes no aborted journal: its counts are exactly as before."""
+    async def go():
+        j = MarkerJournals(tmp_path)
+        for _ in range(4):
+            seq, uid = j.next_marker()
+            await j.written(seq, uid, 1.0)
+            if seq % 2:
+                await j.acknowledged(uid, 2.0)
+        j.close()
+    asyncio.run(go())
+    acked = {r["uuid"] for r in read_journal(tmp_path / ACKED_JOURNAL).records}
+    d, torn = diff_from_journals(tmp_path, acked)
+    assert torn == 0 and len(d.indeterminate) == 2 and d.rolled_back == frozenset()
+
+
+def test_the_rollback_journals_of_every_worker_process_are_read(tmp_path):
+    async def go():
+        for idx in (0, 1):
+            j = MarkerJournals(tmp_path, index=idx)
+            for n in range(3):                       # one confirmed, one rolled back, one unknown
+                seq, uid = j.next_marker()
+                await j.written(seq, uid, 1.0)
+                if n == 0:
+                    await j.acknowledged(uid, 2.0)
+                elif n == 1:
+                    await j.aborted(uid, 2.0)
+            j.close()
+    asyncio.run(go())
+    acked = {r["uuid"] for p in tmp_path.glob("acked.*.jrnl") for r in read_journal(p).records}
+    d, _ = diff_from_journals(tmp_path, acked)
+    assert len(d.rolled_back) == 2 and len(d.indeterminate) == 2 and d.rpo_txn == 0

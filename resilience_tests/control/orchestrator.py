@@ -811,6 +811,7 @@ class TestOrchestrator:
             self.facts["markers"] = {
                 "written": diff.written, "acked": diff.acked, "in_db": diff.in_db, "lost": sorted(diff.lost),
                 "indeterminate": len(diff.indeterminate), "indeterminate_committed": len(diff.indeterminate_committed),
+                "rolled_back": len(diff.rolled_back), "rolled_back_kept": sorted(diff.rolled_back_kept),
                 "phantom": sorted(diff.phantom), "unjournalled_ack": sorted(diff.unjournalled_ack), "torn_journal_lines": torn,
             }
             if diff.unjournalled_ack or torn:

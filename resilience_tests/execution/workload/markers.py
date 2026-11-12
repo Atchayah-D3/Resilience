@@ -175,19 +175,29 @@ class MarkerDiff:
     acked: int
     in_db: int
     lost: frozenset[str]  # acked but absent from the database -> RPO
-    indeterminate: frozenset[str]  # written, never acknowledged -> reported, not counted
+    indeterminate: frozenset[str]  # written, never acknowledged nor surely rolled back -> reported, not counted
     indeterminate_committed: frozenset[str]  # the subset of indeterminate that did commit
     phantom: frozenset[str]  # in the database but never written by the driver -> integrity violation
     unjournalled_ack: frozenset[str]  # acked without a marker record -> harness defect
+    # Written, then answered "rolled back" by the database (the aborted journal; the TPC-C engine
+    # writes it, the custom workload does not, so for it these stay empty). They had an answer,
+    # so they are not indeterminate. One that is nevertheless in the database is a rollback
+    # that was kept -- an atomicity failure, shown here and judged by the profile's checks.
+    rolled_back: frozenset[str] = frozenset()
+    rolled_back_kept: frozenset[str] = frozenset()
 
     @property
     def rpo_txn(self) -> int:
         return len(self.lost)
 
 
-def diff_markers(written: Iterable[str], acked: Iterable[str], db: Iterable[str]) -> MarkerDiff:
+def diff_markers(written: Iterable[str], acked: Iterable[str], db: Iterable[str],
+                 aborted: Iterable[str] = ()) -> MarkerDiff:
     w, a, d = frozenset(written), frozenset(acked), frozenset(db)
-    indeterminate = w - a
+    # an acknowledgement wins over a rollback line (both would be a harness defect; the
+    # acknowledged one is then still checked for loss)
+    rolled_back = (frozenset(aborted) & w) - a
+    indeterminate = w - a - rolled_back
     return MarkerDiff(
         written=len(w),
         acked=len(a),
@@ -197,6 +207,8 @@ def diff_markers(written: Iterable[str], acked: Iterable[str], db: Iterable[str]
         indeterminate_committed=indeterminate & d,
         phantom=d - w,
         unjournalled_ack=a - w,
+        rolled_back=rolled_back,
+        rolled_back_kept=rolled_back & d,
     )
 
 
@@ -226,9 +238,11 @@ def diff_from_journals(run_dir: Path, db_uuids: Iterable[str]) -> tuple[MarkerDi
             raise FileNotFoundError(expected)
     markers = [read_journal(p) for p in marker_paths]
     acks = [read_journal(p) for p in acked_paths]
+    aborts = [read_journal(p) for p in journal_paths(run_dir, ABORTED_JOURNAL)]
     result = diff_markers(
         (r["uuid"] for j in markers for r in j.records),
         (r["uuid"] for j in acks for r in j.records),
         db_uuids,
+        (r["uuid"] for j in aborts for r in j.records),
     )
-    return result, sum(j.torn_lines for j in markers + acks)
+    return result, sum(j.torn_lines for j in markers + acks + aborts)
