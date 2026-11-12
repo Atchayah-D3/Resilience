@@ -64,7 +64,7 @@ from resilience_tests.execution.workload.hooks import (
     required_capabilities,
     split_checks,
 )
-from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals
+from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals, write_db_markers
 from resilience_tests.observability.event_stream import EventStream
 
 EVENTS_FILE = "events.jsonl"
@@ -420,6 +420,7 @@ class TestOrchestrator:
             self.facts["workload_reset"] = reset
         prepared = await self.workload_hooks.prepare(self.adapter)
         if prepared:
+            self.disclosures.extend(prepared.pop("_disclosures", []))
             self.facts["workload_prepare"] = prepared
         if self.scenario.workload.session:
             self.disclosures.append(
@@ -807,6 +808,7 @@ class TestOrchestrator:
         journal_problem: str | None = None
         try:
             db_uuids = await self.adapter.marker_ids()
+            self.facts["markers_db_file"] = write_db_markers(self.run_dir, db_uuids)
             diff, torn = diff_from_journals(self.run_dir, db_uuids)
             self.facts["markers"] = {
                 "written": diff.written, "acked": diff.acked, "in_db": diff.in_db, "lost": sorted(diff.lost),

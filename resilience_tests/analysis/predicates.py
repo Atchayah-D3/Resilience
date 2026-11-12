@@ -11,6 +11,7 @@ ever passed to eval().
 from __future__ import annotations
 
 import ast
+import math
 import operator
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -202,6 +203,10 @@ def _eval(node: ast.AST, measured: Mapping[str, Any], source: str) -> Any:
             if value is NOT_APPLICABLE:
                 raise NotApplicableMeasurement(name)
             if value is NOT_MEASURED:
+                raise NotMeasuredMeasurement(name)
+            # NaN is what a failed calculation yields (0/0): not a value. Every comparison with it
+            # is False except !=, which would be True -- a pass from no measurement at all.
+            if isinstance(value, float) and math.isnan(value):
                 raise NotMeasuredMeasurement(name)
             return value
         case ast.Constant(value=value):

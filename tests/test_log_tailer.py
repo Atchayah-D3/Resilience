@@ -118,3 +118,14 @@ def test_a_run_whose_log_could_not_be_read_discloses_it(env, monkeypatch):  # no
     results = run(env, "NL-C-01")
     assert any("The database log could not be read during this run (sudo: a password is required)" in d
                for d in results["disclosures"]), results["disclosures"]
+
+
+def test_a_run_keeps_the_database_markers_next_to_the_journals(env):  # noqa: F811
+    """Audit issue 9: the run folder holds the database's markers, and their count is the one the
+    RPO comparison used."""
+    from resilience_tests.execution.workload.markers import DB_MARKERS_FILE, read_db_markers
+    results = run(env, "NL-C-01")
+    run_dir = Path(results["evidence_dir"])
+    info = results["facts"]["markers_db_file"]
+    assert (run_dir / DB_MARKERS_FILE).exists() and info["file"] == DB_MARKERS_FILE
+    assert info["count"] == results["facts"]["markers"]["in_db"] == len(read_db_markers(run_dir))

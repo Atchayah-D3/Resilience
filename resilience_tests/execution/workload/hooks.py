@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from catalog.schema import Workload
-from resilience_tests.execution.workload.contract import ProfileHooks
+from resilience_tests.execution.workload.contract import TPCC_GATED_MEASURES, TPCC_GATES, ProfileHooks
 from resilience_tests.execution.workload.profiles import WorkloadProfile, profile_class
 
 
@@ -46,22 +46,40 @@ def split_checks(result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
     return measures, facts, reasons
 
 
+
+
 def with_tpcc_workload(scenario: Any, warehouses: int) -> Any:
     """The scenario with the TPC-C workload in place of its own (same clerks, rate, groups and
     session settings; `warehouses` must match the loaded data). For trying a scenario on TPC-C
     before it is switched for good (TPC-C build steps 7 and 10). The run discloses it. A
     list-append history is not kept with TPC-C, so a scenario that needs Elle then fails its
-    Elle criterion rather than passing without it."""
+    Elle criterion rather than passing without it. The TPC-C gates are added to the scenario's
+    own acceptance (never replacing any of it), and their measures to its measures."""
     w = scenario.workload
-    data = {**w.model_dump(), "profile": "tpcc", "history": "none",
+    data = {**w.model_dump(), "profile": "tpcc", "history": "none", "transaction_markers": True,
             "tpcc": {"warehouses": warehouses, "home_warehouse": {}}}
-    return scenario.model_copy(update={"workload": Workload(**data)})
+    accept = [*scenario.accept, *(g for g in TPCC_GATES if g not in scenario.accept)]
+    measure = list(dict.fromkeys([*scenario.measure, *TPCC_GATED_MEASURES]))
+    return scenario.model_copy(update={"workload": Workload(**data), "accept": accept, "measure": measure})
 
 
 def tpcc_override_note(warehouses: int) -> str:
-    return (f"Workload replaced for this run: the TPC-C workload (profile tpcc, {warehouses} warehouses) ran in "
-            "place of the scenario's own workload, with the same clerks, rate and session settings "
-            "(--tpcc-warehouses). The scenario file was not changed.")
+    return (f"Workload replaced for this run: the TPC-C-like workload (profile tpcc, {warehouses} warehouses) ran "
+            "in place of the scenario's own workload, with the same clerks, rate and session settings "
+            "(--tpcc-warehouses). The scenario file was not changed; the TPC-C gates "
+            f"({', '.join(TPCC_GATES)}) were added to its acceptance.")
+
+
+def tpcc_label(concurrency: int, warehouses: int, rate_tps: float | None) -> str:
+    """The honest name of the workload and its differences from TPC-C 5.11 (docs/tpcc-workload-guide.md
+    section 11), in every report of a run with it."""
+    return ("TPC-C-like workload, not an audited TPC-C benchmark; results are not tpmC. Differences from "
+            "TPC-C 5.11: no keying or thinking time (the load is set by the scenario's rate, "
+            f"{rate_tps:g} TPS); {concurrency / warehouses:g} clerks per warehouse ({concurrency} clerks, "
+            f"{warehouses} warehouses; TPC-C has 10); Delivery runs at once, not deferred; transactions run at "
+            "the database's standard isolation level (READ COMMITTED) with row locks, and TPC-C's isolation "
+            "tests (Clause 3.4) are not run; random texts are hexadecimal; items are distinct within an order; "
+            "each write transaction also saves an RPO marker row.")
 
 
 def not_built_reason(workload: Workload) -> str | None:

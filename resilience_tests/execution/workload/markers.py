@@ -21,6 +21,8 @@ is sent" holds for every transaction individually.
 from __future__ import annotations
 
 import asyncio
+import gzip
+import hashlib
 import json
 import os
 import queue
@@ -210,6 +212,25 @@ def diff_markers(written: Iterable[str], acked: Iterable[str], db: Iterable[str]
         rolled_back=rolled_back,
         rolled_back_kept=rolled_back & d,
     )
+
+
+DB_MARKERS_FILE = "markers_db.txt.gz"
+
+
+def write_db_markers(run_dir: Path, db_uuids: Iterable[str]) -> dict[str, Any]:
+    """Keep the markers the database held after recovery in the run folder (sorted, one per
+    line, gzip), so the RPO comparison -- journals against database -- can be redone later from
+    the evidence alone. Returns its count and SHA-256 (of the uncompressed text) for the results."""
+    lines = sorted(str(u) for u in db_uuids)
+    text = ("\n".join(lines) + ("\n" if lines else "")).encode()
+    with gzip.open(run_dir / DB_MARKERS_FILE, "wb") as fh:
+        fh.write(text)
+    return {"file": DB_MARKERS_FILE, "count": len(lines), "sha256": hashlib.sha256(text).hexdigest()}
+
+
+def read_db_markers(run_dir: Path) -> set[str]:
+    with gzip.open(run_dir / DB_MARKERS_FILE, "rt") as fh:
+        return {line.strip() for line in fh if line.strip()}
 
 
 def journal_paths(run_dir: Path, name: str) -> list[Path]:

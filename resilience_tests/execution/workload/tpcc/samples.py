@@ -30,6 +30,28 @@ DRIVER_LIMIT_SECONDS = 5
 
 TOTAL_FIELDS = ("commits", "errors", "indeterminate", "drops", "reconnects", "connect_failures")
 
+# Coordinated omission. Response times are measured from the moment a transaction is SENT. When
+# the database stalls, a clerk waits inside one call and does not send the transactions it was
+# due to send meanwhile; their waiting is in no measurement, so percentiles look better than what
+# users would feel. The standard correction (HdrHistogram's recordValueWithExpectedInterval, as
+# YCSB and wrk2 use): a response of L ms from a clerk due every E ms also stands for the
+# transactions it missed, recorded as L - E, L - 2E, ... (while above 0). E = clerks / rate.
+# Reported NEXT TO the measured values (p99_corrected_ms), never instead of them. Meaningful
+# when the declared rate is reachable; at an unreachable rate every response above E counts as late.
+MAX_CORRECTION_SAMPLES = 10_000      # per response: bounds memory after a very long stall
+
+
+def corrected_latencies(latency_ms: float, expected_ms: float | None) -> list[float]:
+    """The response itself plus the responses it hid (L - E, L - 2E, ... > 0)."""
+    out = [latency_ms]
+    if not expected_ms or expected_ms <= 0:
+        return out
+    hidden = latency_ms - expected_ms
+    while hidden > 0 and len(out) <= MAX_CORRECTION_SAMPLES:
+        out.append(hidden)
+        hidden -= expected_ms
+    return out
+
 
 def choose_processes(rate_tps: float | None, concurrency: int, cores: int) -> int:
     """How many worker processes: one per PLANNED_TPS_PER_PROCESS of rate, at least 1, at most
@@ -65,6 +87,7 @@ def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None) -> 
     lat = [v for r in raws for v in r["latencies"]]
     journal = [v for r in raws for v in r["journal_ms"]]
     tps = _rate(raws, lambda r: r["totals"]["commits"])
+    corrected = [v for r in raws for v in r.get("corrected", r["latencies"])]
 
     by_type: dict[str, Any] = {}
     for t in contract.TPCC_TYPES:
@@ -90,6 +113,7 @@ def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None) -> 
     return {"interval_s": interval, **totals, "tps": tps,
             "p99_ms": p99(lat), "journal_p99_ms": p99(journal),
             "p50_ms": percentile(lat, 0.50), "p95_ms": percentile(lat, 0.95),
+            "p99_corrected_ms": p99(corrected),
             contract.BY_TYPE: by_type, contract.BY_GROUP: by_group}
 
 
@@ -102,9 +126,11 @@ def merge_window(raws: Iterable[dict[str, Any]], duration_s: float) -> dict[str,
     journal = [v for r in raws for v in r["journal_ms"]]
     totals = {f: sum(r["totals"][f] for r in raws) for f in TOTAL_FIELDS}
     tps = _rate(raws, lambda r: r["totals"]["commits"])
+    corrected = [v for r in raws for v in r.get("corrected", r["latencies"])]
     return {"duration_s": duration_s, **totals, "tps": tps,
             "p99_ms": p99(lat), "journal_p99_ms": p99(journal),
-            "p50_ms": percentile(lat, 0.50), "p95_ms": percentile(lat, 0.95)}
+            "p50_ms": percentile(lat, 0.50), "p95_ms": percentile(lat, 0.95),
+            "p99_corrected_ms": p99(corrected)}
 
 
 class DriverLoadWatch:

@@ -338,6 +338,14 @@ class Scenario(_Model):
         if self.fault.during is not None and self.fault.type != "process_kill":
             raise ValueError("fault.during is only defined for process_kill")
 
+        # The TPC-C workload is judged on what it exists to prove (docs/tpcc-workload-guide.md 10.3):
+        # a scenario file that selects it must gate those measures, so a partial commit can never
+        # be reported while the run passes. (--tpcc-warehouses adds them: hooks.with_tpcc_workload.)
+        if self.workload.profile == "tpcc":
+            missing_gates = [g for g in workload_contract.TPCC_GATES if g not in self.accept]
+            if missing_gates:
+                raise ValueError(f"profile tpcc needs these accept predicates: {missing_gates}")
+
         # Every accept predicate must be computed from declared measures.
         declared = set(self.measure)
         for text in self.accept:

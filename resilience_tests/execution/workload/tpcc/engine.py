@@ -44,7 +44,7 @@ from resilience_tests.execution.workload.driver import (
     percentile,
     p99,
 )
-from resilience_tests.execution.workload.tpcc.samples import DriverLoadWatch, merge_raws
+from resilience_tests.execution.workload.tpcc.samples import DriverLoadWatch, corrected_latencies, merge_raws
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.execution.workload.profiles.base import Request, Terminal, WorkloadProfile
 from resilience_tests.observability.event_stream import EventStream
@@ -71,10 +71,15 @@ class TpccWorkloadDriver:
         self.stream = stream
         self.raw_sink = raw_sink
         self.profile = profile
-        self.limiter = RateLimiter(workload.rate_tps if rate_tps is None else rate_tps)
+        rate = workload.rate_tps if rate_tps is None else rate_tps
+        self.limiter = RateLimiter(rate)
         self.session_settings = dict(workload.session)
         ids = list(range(workload.concurrency)) if worker_ids is None else list(worker_ids)
         self.terminals: dict[int, Terminal] = {i: profile.terminal(i) for i in ids}
+        # how often each clerk is due to start a transaction, for the stall correction
+        self.expected_interval_ms = 1000.0 * len(ids) / rate if rate and ids else None
+        self._corrected: list[float] = []
+        self._measure_corrected: list[float] | None = None
         self.load_watch = DriverLoadWatch()
         self._seq = 0
         self._last_t: float | None = None
@@ -106,6 +111,7 @@ class TpccWorkloadDriver:
 
     def begin_window(self) -> None:
         self._measure = _Window()
+        self._measure_corrected = []
         self._measure_t0 = time.monotonic()
         self.window_t0_ns = time.monotonic_ns()
 
@@ -113,13 +119,15 @@ class TpccWorkloadDriver:
         if self._measure is None:
             raise RuntimeError("end_window() without begin_window()")
         w, self._measure = self._measure, None
+        corrected, self._measure_corrected = self._measure_corrected or [], None
         duration = time.monotonic() - self._measure_t0
         lat = w.latencies_ms or []
         return MeasuredWindow(
             duration_s=duration, commits=w.commits, tps=w.commits / duration if duration > 0 else 0.0,
             p99_ms=p99(lat), journal_p99_ms=p99(w.journal_ms or []), errors=w.errors,
             indeterminate=w.indeterminate, drops=w.drops, reconnects=w.reconnects,
-            connect_failures=w.connect_failures, p50_ms=percentile(lat, 0.50), p95_ms=percentile(lat, 0.95))
+            connect_failures=w.connect_failures, p50_ms=percentile(lat, 0.50), p95_ms=percentile(lat, 0.95),
+            p99_corrected_ms=p99(corrected))
 
     async def stop(self) -> None:
         """Graceful: no new transaction starts; each clerk finishes the one it is running, for at
@@ -264,6 +272,11 @@ class TpccWorkloadDriver:
                 w.latencies_ms.append(latency_ms)
             if journal_ms is not None:
                 w.journal_ms.append(journal_ms)
+        if latency_ms is not None:
+            hidden = corrected_latencies(latency_ms, self.expected_interval_ms)
+            self._corrected.extend(hidden)
+            if self._measure_corrected is not None:
+                self._measure_corrected.extend(hidden)
 
     async def _sampler(self) -> None:
         """One interval at a time, over the interval actually measured (as the custom driver):
@@ -317,6 +330,7 @@ class TpccWorkloadDriver:
         types, self._types = self._types, {t: _Window() for t in contract.TPCC_TYPES}
         business, self._business = self._business, Counter()
         groups, self._groups = self._groups, {g: _Window() for g in self._groups}
+        corrected, self._corrected = self._corrected, []
         self._seq += 1
         return {
             "seq": self._seq, "t_end_ns": time.monotonic_ns(),
@@ -325,6 +339,7 @@ class TpccWorkloadDriver:
             "totals": {"commits": w.commits, "errors": w.errors, "indeterminate": w.indeterminate, "drops": w.drops,
                        "reconnects": w.reconnects, "connect_failures": w.connect_failures},
             "latencies": list(w.latencies_ms or []), "journal_ms": list(w.journal_ms or []),
+            "corrected": corrected,
             "types": {t: {"commits": tw.commits, "errors": tw.errors, "business_rollbacks": business[t],
                           "latencies": list(tw.latencies_ms or [])} for t, tw in types.items()},
             "groups": {g: {"commits": gw.commits, "errors": gw.errors, "indeterminate": gw.indeterminate,

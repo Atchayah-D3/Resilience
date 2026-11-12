@@ -163,7 +163,7 @@ def test_samples_report_five_types_and_the_totals(ran):
     samples = ran["samples"]
     assert samples
     for s in samples:
-        assert set(s) == set(c.SAMPLE_FIELDS) | {c.BY_TYPE, c.BY_GROUP}
+        assert set(s) == set(c.SAMPLE_FIELDS) | set(c.TPCC_EXTRA_SAMPLE_FIELDS) | {c.BY_TYPE, c.BY_GROUP}
         assert set(s[c.BY_TYPE]) == set(c.TPCC_TYPES) and set(s[c.BY_GROUP]) == {"all"}
         assert sum(t["commits"] for t in s[c.BY_TYPE].values()) == s["commits"] == s[c.BY_GROUP]["all"]["commits"]
         assert sum(t["errors"] for t in s[c.BY_TYPE].values()) == s["errors"]

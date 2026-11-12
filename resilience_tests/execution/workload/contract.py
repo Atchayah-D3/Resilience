@@ -75,6 +75,10 @@ SAMPLE_FIELDS: tuple[str, ...] = (
     "connect_failures",
 )
 
+# Extra top-level field of the TPC-C engine's samples (not of the custom workload's):
+#   p99_corrected_ms   p99 corrected for stalls (coordinated omission), next to p99_ms
+TPCC_EXTRA_SAMPLE_FIELDS: tuple[str, ...] = ("p99_corrected_ms",)
+
 # New, extra fields: one entry per transaction type and per clerk group.
 BY_TYPE = "by_type"
 BY_GROUP = "by_group"
@@ -180,6 +184,20 @@ OUTCOME_COMMITTED = "committed"
 OUTCOME_DEFINITELY_ABORTED = "definitely_aborted"
 OUTCOME_UNKNOWN = "unknown"
 OUTCOME_BUSINESS_ROLLBACK = "business_rollback"
+
+# What the TPC-C workload exists to prove after a fault: nothing confirmed was lost, nothing was
+# half saved, no rolled-back transaction was kept, the TPC-C consistency rules hold. A run with
+# the TPC-C workload is JUDGED on these, not only shown them: without the gate a partial commit
+# would be reported and the run would still pass. Added by --tpcc-warehouses
+# (hooks.with_tpcc_workload); required in a scenario file with profile tpcc (catalog/schema.py).
+TPCC_GATES: tuple[str, ...] = (
+    "rpo_txn == 0",
+    "partial_commits == 0",
+    "aborted_markers_present == 0",
+    "tpcc_consistency_violations == 0",
+)
+TPCC_GATED_MEASURES: tuple[str, ...] = ("rpo_txn", "partial_commits", "aborted_markers_present",
+                                        "tpcc_consistency_violations")
 
 # Measures a scenario may name in `measure:` and `accept:`. Existing names keep their meaning;
 # the new ones are produced once the tpcc profile is built (until then: refused as not built).

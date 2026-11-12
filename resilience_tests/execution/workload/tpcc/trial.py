@@ -155,7 +155,8 @@ async def _main(a: argparse.Namespace) -> int:
 
     samples = [e.data for e in stream.events() if e.kind == "sample"]
     summary = summarize(samples, window.duration_s, a.rate)
-    summary.update({"p50_ms": window.p50_ms, "p99_ms": window.p99_ms, "prepare": prepared,
+    summary.update({"p50_ms": window.p50_ms, "p99_ms": window.p99_ms, "p99_corrected_ms": window.p99_corrected_ms,
+                    "prepare": prepared,
                     "processes": getattr(drv, "processes", 1)})
     db = await adapter.marker_ids()
     diff, torn = diff_from_journals(out, db)
@@ -171,7 +172,8 @@ async def _main(a: argparse.Namespace) -> int:
     (out / "summary.json").write_text(json.dumps({"summary": summary, "checks": checks}, indent=2, default=str) + "\n")
     load = [e.data for e in stream.events() if e.kind == "driver_load"]
     summary["max_cpu_share"] = max((c for d in load for c in d["cpu_share"]), default=None)
-    print(f"\n{window.tps:.0f} TPS, p50 {summary['p50_ms']:.1f} ms, p99 {summary['p99_ms']:.1f} ms, "
+    print(f"\n{window.tps:.0f} TPS, p50 {summary['p50_ms']:.1f} ms, p99 {summary['p99_ms']:.1f} ms "
+          f"(corrected for stalls: {summary['p99_corrected_ms'] or 0:.1f} ms), "
           f"{summary['processes']} worker process(es), busiest at {summary['max_cpu_share'] or 0:.0%} of a core")
     for name, ok, detail in checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")

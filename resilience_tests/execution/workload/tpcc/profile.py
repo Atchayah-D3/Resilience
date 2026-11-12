@@ -146,7 +146,12 @@ class TpccProfile(WorkloadProfile):
             "size_bytes": status.get("size_bytes"),
             "consistency": {str(r): results[r] for r in data.PREPARE_RULES},
             "district_sample": data.PREPARE_DISTRICT_SAMPLE,
-        }}
+        }, "_disclosures": [self.label()]}
+
+    def label(self) -> str:
+        from resilience_tests.execution.workload.hooks import tpcc_label
+        assert self.workload.tpcc is not None
+        return tpcc_label(self.workload.concurrency, self.workload.tpcc.warehouses, self.workload.rate_tps)
 
     def terminal(self, worker_id: int) -> Terminal:
         """Clerk `worker_id`: its group, home warehouse and fixed district (terminals.py)."""

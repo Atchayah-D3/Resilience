@@ -110,3 +110,19 @@ def test_the_rollback_journals_of_every_worker_process_are_read(tmp_path):
     acked = {r["uuid"] for p in tmp_path.glob("acked.*.jrnl") for r in read_journal(p).records}
     d, _ = diff_from_journals(tmp_path, acked)
     assert len(d.rolled_back) == 2 and len(d.indeterminate) == 2 and d.rpo_txn == 0
+
+
+def test_the_database_markers_are_kept_so_the_rpo_comparison_can_be_redone(tmp_path):
+    """Audit, 12 November: the database's list of markers was used but not kept, so the journals-
+    against-database comparison could not be checked again from the evidence."""
+    import gzip
+    import hashlib
+
+    from resilience_tests.execution.workload.markers import DB_MARKERS_FILE, read_db_markers, write_db_markers
+    ids = {"c", "a", "b"}
+    info = write_db_markers(tmp_path, ids)
+    assert info["file"] == DB_MARKERS_FILE and info["count"] == 3
+    text = gzip.open(tmp_path / DB_MARKERS_FILE, "rb").read()
+    assert text == b"a\nb\nc\n" and info["sha256"] == hashlib.sha256(text).hexdigest()   # sorted, checkable
+    assert read_db_markers(tmp_path) == ids
+    assert write_db_markers(tmp_path, set())["count"] == 0 and read_db_markers(tmp_path) == set()
