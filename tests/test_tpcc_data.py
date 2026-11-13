@@ -93,6 +93,9 @@ class FakeTpccAdapter:
     async def tpcc_data_status(self):
         return self.status
 
+    async def tpcc_clock(self):
+        return "2026-11-12 10:00:00"
+
     async def tpcc_install_functions(self):
         self.calls.append(("install_functions",))
 

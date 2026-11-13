@@ -12,7 +12,9 @@ from typing import Any
 
 # The loader in adapters/postgresql/sql/tpcc_load.sql. A data set loaded by another version is
 # refused, so a run never measures data built by different rules than it assumes.
-LOADER_VERSION = 1
+# Version 2: random texts made of fresh pieces (version 1 repeated one piece), the data
+# reproducible from the loader's seed, and the seed kept in the meta row.
+LOADER_VERSION = 2
 
 # Cardinalities per warehouse (Clause 1.2, 4.2.2, 4.3.3.1)
 ITEMS = 100_000
@@ -86,6 +88,13 @@ def row_count_problems(counts: Mapping[str, int], warehouses: int, items: int = 
             want = f"{lo}" if lo == hi else f"{lo}..{hi}"
             problems.append(f"{table}: {n} rows, expected {want} for {warehouses} warehouses")
     return problems
+
+
+def load_seed_value(seed: int, part: int) -> float:
+    """The value for the database's setseed() (between -1 and 1) for one part of a load: part 0 =
+    the items, part w = warehouse w. Each part has its own, so the parallel loaders' varying
+    order does not change the data."""
+    return ((seed * 1_000_003 + part * 7_919) % 2_000_000) / 1_000_000 - 1.0
 
 
 def loaded_orders(warehouses: int) -> int:

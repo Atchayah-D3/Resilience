@@ -97,7 +97,7 @@ def test_without_a_rollback_journal_nothing_changes(tmp_path):
 def test_the_rollback_journals_of_every_worker_process_are_read(tmp_path):
     async def go():
         for idx in (0, 1):
-            j = MarkerJournals(tmp_path, index=idx)
+            j = MarkerJournals(tmp_path, index=idx, processes=2)
             for n in range(3):                       # one confirmed, one rolled back, one unknown
                 seq, uid = j.next_marker()
                 await j.written(seq, uid, 1.0)
@@ -126,3 +126,18 @@ def test_the_database_markers_are_kept_so_the_rpo_comparison_can_be_redone(tmp_p
     assert text == b"a\nb\nc\n" and info["sha256"] == hashlib.sha256(text).hexdigest()   # sorted, checkable
     assert read_db_markers(tmp_path) == ids
     assert write_db_markers(tmp_path, set())["count"] == 0 and read_db_markers(tmp_path) == set()
+
+
+def test_marker_numbers_are_unique_across_worker_processes(tmp_path):
+    """Fix 3: each of N worker processes numbers its markers i+1, i+1+N, ...; one process 1, 2, 3."""
+    import pytest
+    single = MarkerJournals(tmp_path / "one" if (tmp_path / "one").mkdir() is None else tmp_path)
+    assert [single.next_marker()[0] for _ in range(3)] == [1, 2, 3]
+    single.close()
+    procs = [MarkerJournals(tmp_path, index=i, processes=4) for i in range(4)]
+    numbers = [n for j in procs for n in (j.next_marker()[0] for _ in range(50))]
+    for j in procs:
+        j.close()
+    assert len(numbers) == len(set(numbers)) == 200
+    with pytest.raises(ValueError):
+        MarkerJournals(tmp_path, index=4, processes=4)

@@ -13,6 +13,7 @@ has none, and init refuses the data.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import random
 import time
 import uuid as uuidlib
@@ -110,6 +111,11 @@ async def call_tpcc(conn: asyncpg.Connection, txn_type: str, inputs: Mapping[str
         # the per-order check after a fault looks for exactly this order with exactly these lines
         return OUTCOME_COMMITTED, {"w": inputs["w_id"], "d": inputs["d_id"], "o_id": value,
                                    "ol_cnt": len(inputs["items"])}, None
+    if txn_type == PAYMENT:
+        # the per-payment check after a fault looks for exactly this history row: the customer
+        # that paid (the function returns it, also when found by last name) and the amount
+        return OUTCOME_COMMITTED, {"w": inputs["w_id"], "d": inputs["d_id"], "c_w": inputs["c_w_id"],
+                                   "c_d": inputs["c_d_id"], "c": value, "amt": inputs["amount_cents"]}, None
     return OUTCOME_COMMITTED, {}, None
 
 
@@ -133,7 +139,12 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
             raise ValueError("warehouses and jobs must be at least 1")
         say = progress or (lambda _msg: None)
         started = time.perf_counter()
-        c_last = data.choose_c_last_load(random.Random(seed))
+        # Every random value of the data comes from the database's own generator. Seeding it before
+        # the items and before each warehouse (not per connection: the parallel loaders take the
+        # warehouses in a varying order) makes the data the same for the same seed -- every value
+        # except the load's own timestamps (C_SINCE, O_ENTRY_D, H_DATE, OL_DELIVERY_D).
+        load_seed = seed if seed is not None else random.SystemRandom().randrange(1, 2**31)
+        c_last = data.choose_c_last_load(random.Random(load_seed))
 
         conn = await self._connect(timeout_s=10.0, command_timeout=None)
         try:
@@ -149,6 +160,7 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                 await conn.execute("RESET lock_timeout")
             for name in SETUP_FILES:
                 await conn.execute(_sql(name))
+            await conn.execute("SELECT setseed($1)", data.load_seed_value(load_seed, 0))
             await conn.execute(f"SELECT {TPCC_SCHEMA}.load_items($1)", data.ITEMS)
             say(f"items loaded ({data.ITEMS})")
         finally:
@@ -168,6 +180,7 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                         w = pending.get_nowait()
                     except asyncio.QueueEmpty:
                         return
+                    await c.execute("SELECT setseed($1)", data.load_seed_value(load_seed, w))
                     await c.execute(f"SELECT {TPCC_SCHEMA}.load_warehouse($1, $2, $3)", w, data.ITEMS, c_last)
                     done += 1
                     say(f"warehouse {w} loaded ({done}/{warehouses})")
@@ -191,15 +204,16 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                 raise TpccLoadError(problems)
             seconds = time.perf_counter() - started
             await conn.execute(
-                f"INSERT INTO {TPCC_META} (warehouses, items, loader_version, c_last_load, loaded_orders, load_seconds) "
-                "VALUES ($1, $2, $3, $4, $5, $6)",
-                warehouses, data.ITEMS, data.LOADER_VERSION, c_last, data.loaded_orders(warehouses), seconds)
+                f"INSERT INTO {TPCC_META} (warehouses, items, loader_version, c_last_load, loaded_orders, load_seconds, "
+                "load_seed) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                warehouses, data.ITEMS, data.LOADER_VERSION, c_last, data.loaded_orders(warehouses), seconds, load_seed)
             size = await self._tpcc_size(conn)
         finally:
             await conn.close()
         say(f"done in {seconds:.0f} s")
         return {"warehouses": warehouses, "seconds": seconds, "rows": counts, "rules": rules,
-                "c_last_load": c_last, "size_bytes": size}
+                "c_last_load": c_last, "size_bytes": size, "load_seed": load_seed}
 
     async def tpcc_drop(self) -> bool:
         conn = await self._connect(timeout_s=10.0, command_timeout=None)
@@ -231,6 +245,41 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                       LEFT JOIN LATERAL (SELECT count(*) AS lines FROM {S}.order_line l
                                           WHERE (l.ol_w_id, l.ol_d_id, l.ol_o_id) = (a.w, a.d, a.o_id)) l ON true""")
                 return {"checked": len(rows), "missing": int(row["missing"]), "incomplete": int(row["incomplete"])}
+        finally:
+            await conn.close()
+
+    async def tpcc_clock(self) -> datetime.datetime:
+        """The database's local time, as the history rows record it (H_DATE is clock_timestamp()
+        stored without a time zone): the start of a run's own history rows."""
+        conn = await self._connect(timeout_s=10.0)
+        try:
+            return await conn.fetchval("SELECT localtimestamp")
+        finally:
+            await conn.close()
+
+    async def tpcc_payment_check(self, payments: Sequence[Mapping[str, Any]],
+                                 since: datetime.datetime) -> dict[str, int]:
+        """For confirmed Payments ({w, d, c_w, c_d, c, amt} in cents): how many have no history row
+        written since `since` by that customer, in that district, for that amount. Identical
+        payments are counted as many times as they were confirmed. One scan of the run's history."""
+        if not payments:
+            return {"checked": 0, "missing": 0}
+        rows = [(int(p["w"]), int(p["d"]), int(p["c_w"]), int(p["c_d"]), int(p["c"]), int(p["amt"])) for p in payments]
+        conn = await self._connect(timeout_s=10.0, command_timeout=None)
+        try:
+            async with conn.transaction():
+                await conn.execute("CREATE TEMP TABLE tpcc_paid (w int, d int, c_w int, c_d int, c int, amt int) "
+                                   "ON COMMIT DROP")
+                await conn.copy_records_to_table("tpcc_paid", records=rows)
+                missing = await conn.fetchval(f"""
+                    SELECT coalesce(sum(greatest(e.n - coalesce(h.n, 0), 0)), 0)
+                      FROM (SELECT w, d, c_w, c_d, c, amt, count(*) AS n FROM tpcc_paid GROUP BY 1, 2, 3, 4, 5, 6) e
+                      LEFT JOIN (SELECT h_w_id, h_d_id, h_c_w_id, h_c_d_id, h_c_id, (h_amount * 100)::int AS amt,
+                                        count(*) AS n
+                                   FROM {S}.history WHERE h_date >= $1 GROUP BY 1, 2, 3, 4, 5, 6) h
+                        ON (h.h_w_id, h.h_d_id, h.h_c_w_id, h.h_c_d_id, h.h_c_id, h.amt)
+                         = (e.w, e.d, e.c_w, e.c_d, e.c, e.amt)""", since)
+                return {"checked": len(rows), "missing": int(missing)}
         finally:
             await conn.close()
 
@@ -292,6 +341,7 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                 "loader_version": meta["loader_version"], "c_last_load": meta["c_last_load"],
                 "loaded_orders": meta["loaded_orders"], "current_orders": int(current) if current is not None else None,
                 "loaded_at": meta["loaded_at"].isoformat(), "load_seconds": float(meta["load_seconds"]),
+                "load_seed": meta.get("load_seed"),
                 "capacity_tps": float(meta["capacity_tps"]) if meta["capacity_tps"] is not None else None,
                 "size_bytes": await self._tpcc_size(conn),
             }

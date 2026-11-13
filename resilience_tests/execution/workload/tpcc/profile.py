@@ -68,6 +68,7 @@ class TpccProfile(WorkloadProfile):
         self.seed = seed
         self.constants: inputs.RunConstants | None = None      # set by prepare() from the loaded data
         self.orders_at_prepare: int | None = None                # sum(D_NEXT_O_ID - 1) at prepare, for step 7
+        self.history_since: Any = None                           # database time at prepare: this run's payments
         self._terminals: list[Terminal] | None = None
         self._clerks: dict[int, tuple[random.Random, inputs.Deck]] = {}
 
@@ -138,6 +139,8 @@ class TpccProfile(WorkloadProfile):
             raise TpccDataError("the TPC-C data cannot be used: " + "; ".join(problems))
         consts = self.set_run_constants(status["c_last_load"])
         self.orders_at_prepare = status.get("current_orders")
+        # history rows written from now on are this run's payments (the per-payment check after a fault)
+        self.history_since = await adapter.tpcc_clock()
         return {"tpcc_data": {
             "run_constants": {"c_last": consts.c_last, "c_id": consts.c_id, "ol_i_id": consts.ol_i_id,
                               "c_last_load": status["c_last_load"]},
@@ -146,6 +149,7 @@ class TpccProfile(WorkloadProfile):
             "size_bytes": status.get("size_bytes"),
             "consistency": {str(r): results[r] for r in data.PREPARE_RULES},
             "district_sample": data.PREPARE_DISTRICT_SAMPLE,
+            "history_since": str(self.history_since), "load_seed": status.get("load_seed"),
         }, "_disclosures": [self.label()]}
 
     def label(self) -> str:
@@ -223,17 +227,31 @@ class TpccProfile(WorkloadProfile):
                 return None
 
         db = await attempt("markers", adapter.marker_ids())
-        acked_check = lost_check = None
+        acked_check = lost_check = acked_pay = lost_pay = None
         if db is not None:
             acked_check = await attempt("per-order check", adapter.tpcc_order_check(
                 checks.new_order_lines(acked, set(acked) & db)))
             lost_check = await attempt("per-order check of lost New-Orders", adapter.tpcc_order_check(
                 checks.new_order_lines(acked, set(acked) - db)))
+            if self.history_since is None:
+                problems.append("per-payment check: the run's start time was not recorded at prepare")
+            else:
+                acked_pay = await attempt("per-payment check", adapter.tpcc_payment_check(
+                    checks.payment_lines(acked, set(acked) & db), self.history_since))
+                lost_pay = await attempt("per-payment check of lost Payments", adapter.tpcc_payment_check(
+                    checks.payment_lines(acked, set(acked) - db), self.history_since))
         status = await attempt("order count", adapter.tpcc_data_status())
         rules: dict[int, int | None] = {}
         full = await attempt("consistency rules", adapter.tpcc_consistency(checks.RULES_ALL_DATA))
+        # rules 10 and 12 check a sample of districts: a NEW sample every run (a fixed seed checked
+        # the same 20 districts every time), recorded so the run can be checked again
+        sample_seed = random.SystemRandom().randrange(1, 2**31)
+        assert self.workload.tpcc is not None
+        w_list, d_list = data.sample_districts(random.Random(sample_seed), self.workload.tpcc.warehouses,
+                                               checks.SAMPLE_DISTRICTS)
+        sample = {"seed": sample_seed, "districts": [[w, d] for w, d in zip(w_list, d_list)]}
         sampled = await attempt("consistency rules (sample)", adapter.tpcc_consistency(
-            checks.RULES_SAMPLED, district_sample=checks.SAMPLE_DISTRICTS, seed=self.seed))
+            checks.RULES_SAMPLED, district_sample=checks.SAMPLE_DISTRICTS, seed=sample_seed))
         rules.update(full or {})
         rules.update(sampled or {})
 
@@ -242,7 +260,8 @@ class TpccProfile(WorkloadProfile):
             acked_order_check=acked_check, lost_order_check=lost_check,
             orders_before=self.orders_at_prepare,
             orders_after=(status or {}).get("current_orders"),
-            rules=rules, torn_aborted_lines=torn)
+            acked_payment_check=acked_pay, lost_payment_check=lost_pay,
+            rules=rules, torn_aborted_lines=torn, sample=sample)
         measures, facts, reasons = checks.evaluate(ev)
         # context only: a driver-limited run already stopped with the workload's failure (abort)
         facts["driver_load"] = _driver_load(run_dir / "events.jsonl") or "the run's events could not be read"

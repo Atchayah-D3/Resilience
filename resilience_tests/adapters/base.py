@@ -503,6 +503,14 @@ class TpccSupport:
         have exactly ol_cnt lines. 0 = every one is complete."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
+    async def tpcc_clock(self) -> Any:
+        """The database's local time as history rows record it: the start of a run's own payments."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+    async def tpcc_payment_check(self, payments: Any, since: Any) -> dict[str, int]:
+        """Confirmed Payments without their history row (written since `since`): {checked, missing}."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
     async def tpcc_columns(self) -> dict[str, dict[str, int]]:
         """Live and dropped columns of each TPC-C table (the reset before a run, build step 9)."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")

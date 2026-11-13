@@ -93,6 +93,9 @@ class FakeAdapter:
     async def tpcc_install_functions(self):
         pass
 
+    async def tpcc_clock(self):
+        return "2026-11-12 10:00:00"
+
 
 def _profile(warehouses=4):
     return TpccProfile(Workload(profile="tpcc", concurrency=4, transaction_markers=True, rate_tps=10,

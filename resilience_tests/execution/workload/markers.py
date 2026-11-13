@@ -117,18 +117,23 @@ class MarkerJournals:
     are added to a line, e.g. the TPC-C transaction type, or the order number of a New-Order
     for the per-order check after a fault; without them each line is exactly as before."""
 
-    def __init__(self, run_dir: Path, index: int | None = None) -> None:
+    def __init__(self, run_dir: Path, index: int | None = None, processes: int = 1) -> None:
         """`index`: one worker process of several writes marker.<index>.jrnl and so on (the
-        TPC-C engine in several processes); without it the names are exactly as before."""
+        TPC-C engine in several processes); without it the names are exactly as before.
+        `processes`: how many there are, so the marker numbers (seq) of all processes are unique:
+        process i of N numbers its markers i+1, i+1+N, i+1+2N, ... (one process: 1, 2, 3, ...)."""
+        if processes < 1 or (index is not None and not 0 <= index < processes):
+            raise ValueError(f"process index {index} does not fit {processes} process(es)")
         self.run_dir = run_dir
         self._name = (lambda base: base) if index is None else (lambda base: base.replace(".jrnl", f".{index}.jrnl"))
         self.marker = DurableJournal(run_dir / self._name(MARKER_JOURNAL))
         self.acked = DurableJournal(run_dir / self._name(ACKED_JOURNAL))
         self._aborted: DurableJournal | None = None
-        self._seq = 0
+        self._seq = (index or 0) + 1 - processes      # the first next_marker() gives index + 1
+        self._step = processes
 
     def next_marker(self) -> tuple[int, str]:
-        self._seq += 1
+        self._seq += self._step
         return self._seq, str(uuidlib.uuid4())
 
     async def written(self, seq: int, uuid: str, t_pre: float, **extra: Any) -> None:

@@ -234,6 +234,7 @@ def _checked(**changes):
     samples = [_sample(**changes) for _ in range(60)]
     s = trial.summarize(samples, 60.0, 228.0)
     s.update({"rpo_txn": 0, "phantom": 0, "aborted_kept": 0, "orders_checked": s["commits"]["new_order"],
+              "payments_checked": s["commits"]["payment"], "payments_missing": 0,
               "orders_incomplete": 0, "rules": {1: 0, 4: 0}})
     return {name: ok for name, ok, _ in trial.verdicts(s)}, s
 
@@ -270,6 +271,7 @@ def test_trial_fails_when_fewer_orders_were_checked_than_new_orders_committed():
 def _verdicts(samples, seconds=10.0, rate=1.0):
     s = trial.summarize(samples, seconds, rate)
     s.update({"rpo_txn": 0, "phantom": 0, "aborted_kept": 0, "orders_checked": s["commits"]["new_order"],
+              "payments_checked": s["commits"]["payment"], "payments_missing": 0,
               "orders_incomplete": 0, "rules": {1: 0}})
     return {n: ok for n, ok, _ in trial.verdicts(s)}
 
@@ -279,3 +281,12 @@ def test_business_rollback_share_is_checked_only_with_enough_new_orders():
     assert _verdicts([_sample() for _ in range(10)])["business rollbacks about 1%"]                      # 1,000 at 1%
     assert not _verdicts([_sample(no_business=0) for _ in range(10)])["business rollbacks about 1%"]     # 1,000, none
     assert not _verdicts([_sample(no=90, no_business=10) for _ in range(10)])["business rollbacks about 1%"]  # 10%
+
+
+def test_trial_fails_when_a_payment_lost_its_history_row_or_was_not_checked():
+    """Fix 2: the trial checks every acknowledged Payment one by one."""
+    s = _checked()[1]
+    name = "every acknowledged Payment saved"
+    assert {n: ok for n, ok, _ in trial.verdicts(s)}[name]
+    assert not {n: ok for n, ok, _ in trial.verdicts({**s, "payments_missing": 1})}[name]
+    assert not {n: ok for n, ok, _ in trial.verdicts({**s, "payments_checked": 0})}[name]

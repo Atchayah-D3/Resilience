@@ -223,7 +223,7 @@ def test_each_worker_process_writes_its_own_journals_and_all_are_read(tmp_path):
 
     async def go():
         for idx in (None, 0, 1):
-            j = MarkerJournals(tmp_path, index=idx)
+            j = MarkerJournals(tmp_path, index=idx, processes=2)
             seq, uid = j.next_marker()
             await j.written(seq, uid, 1.0)
             await j.acknowledged(uid, 2.0)

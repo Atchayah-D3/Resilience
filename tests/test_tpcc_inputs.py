@@ -249,7 +249,8 @@ def test_requests_need_the_run_constants_from_prepare_first():
 
 
 def test_prepare_sets_run_constants_that_obey_clause_2_1_6_1():
-    status = {"loaded": True, "warehouses": 40, "items": inputs.ITEMS, "loader_version": 1,
+    from resilience_tests.execution.workload.tpcc.data import LOADER_VERSION
+    status = {"loaded": True, "warehouses": 40, "items": inputs.ITEMS, "loader_version": LOADER_VERSION,
               "c_last_load": 195, "loaded_orders": 1_200_000, "current_orders": 1_200_000}
 
     class Adapter:
@@ -261,6 +262,9 @@ def test_prepare_sets_run_constants_that_obey_clause_2_1_6_1():
 
         async def tpcc_consistency(self, rules, district_sample=None, seed=None):
             return {r: 0 for r in rules}
+
+        async def tpcc_clock(self):
+            return "2026-11-12 10:00:00"
 
     p = _profile()
     facts = asyncio.run(p.prepare(Adapter()))["tpcc_data"]["run_constants"]

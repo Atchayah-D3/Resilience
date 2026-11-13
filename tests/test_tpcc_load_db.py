@@ -170,3 +170,48 @@ def test_a_load_that_did_not_finish_is_not_used(adapter, loaded):
 def test_drop_leaves_nothing(adapter, loaded):
     assert asyncio.run(adapter.tpcc_drop()) is True
     assert asyncio.run(adapter.tpcc_data_status()) == {"loaded": False, "reason": f"schema {TPCC_SCHEMA} does not exist"}
+
+
+def _fingerprint(adapter) -> str:
+    """A checksum of every loaded value except the load's own timestamps."""
+    s = TPCC_SCHEMA
+    return _sql(adapter, f"""
+        SELECT md5(string_agg(x, '|' ORDER BY x)) FROM (
+          SELECT 'i' || i_id || i_im_id || i_name || i_price || i_data AS x FROM {s}.item
+          UNION ALL SELECT 'w' || w_id || w_name || w_street_1 || w_city || w_zip || w_tax FROM {s}.warehouse
+          UNION ALL SELECT 'c' || c_w_id || c_d_id || c_id || c_first || c_last || c_credit || c_discount || c_data
+                    FROM {s}.customer
+          UNION ALL SELECT 'o' || o_w_id || o_d_id || o_id || o_c_id || coalesce(o_carrier_id, 0) || o_ol_cnt FROM {s}.orders
+          UNION ALL SELECT 'l' || ol_w_id || ol_d_id || ol_o_id || ol_number || ol_i_id || ol_amount || ol_dist_info
+                    FROM {s}.order_line
+          UNION ALL SELECT 's' || s_w_id || s_i_id || s_quantity || s_dist_01 || s_dist_10 || s_data FROM {s}.stock) t""")
+
+
+def test_the_same_seed_gives_the_same_data_and_another_seed_other_data(adapter):
+    """Review fix 4a: the loader's seed now seeds the database's own random generator, per part,
+    so the parallel loaders' varying order does not matter. Was: --seed changed only C_LAST's constant."""
+    first = asyncio.run(adapter.tpcc_load(2, jobs=2, replace=True, seed=101))
+    a = _fingerprint(adapter)
+    assert asyncio.run(adapter.tpcc_data_status())["load_seed"] == 101 and first["load_seed"] == 101
+    asyncio.run(adapter.tpcc_load(2, jobs=1, replace=True, seed=101))           # other job count, same seed
+    assert _fingerprint(adapter) == a
+    asyncio.run(adapter.tpcc_load(2, jobs=2, replace=True, seed=102))
+    assert _fingerprint(adapter) != a
+    without = asyncio.run(adapter.tpcc_load(1, jobs=1, replace=True))           # no seed: one is chosen and kept
+    assert isinstance(without["load_seed"], int) and asyncio.run(adapter.tpcc_data_status())["load_seed"] == without["load_seed"]
+
+
+def test_random_texts_are_fresh_not_one_piece_repeated(adapter):
+    """Review fix 4b: loader version 1 repeated one 32-character piece, so the text compressed far
+    better than real text. Now no 32-character piece of C_DATA repeats inside the same value."""
+    asyncio.run(adapter.tpcc_load(1, jobs=1, replace=True, seed=5))
+    s = TPCC_SCHEMA
+    repeated = _sql(adapter, f"""
+        SELECT count(*) FROM {s}.customer
+         WHERE substr(c_data, 1, 32) = substr(c_data, 33, 32) OR substr(c_data, 1, 32) = substr(c_data, 129, 32)""")
+    assert repeated == 0
+    # stored size after the database's own compression: random hex keeps about half its size;
+    # loader version 1's repeated text shrank to a few percent
+    ratio = _sql(adapter, f"SELECT sum(pg_column_size(c_data))::float / sum(octet_length(c_data)) FROM {s}.customer")
+    assert ratio > 0.4, ratio
+    assert asyncio.run(adapter.tpcc_data_status())["loader_version"] == 2

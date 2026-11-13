@@ -137,5 +137,6 @@ CREATE TABLE resilience_tpcc.meta (
     loaded_orders  bigint      NOT NULL,  -- orders right after the load: the base of the growth check
     loaded_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
     load_seconds   numeric     NOT NULL,
-    capacity_tps   numeric                -- the target's measured maximum (build step 8)
+    capacity_tps   numeric,               -- the target's measured maximum (build step 8)
+    load_seed      bigint                 -- the loader's seed: the same seed gives the same data (loader version 2)
 );
