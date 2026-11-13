@@ -18,7 +18,11 @@ How each case is found:
                             run (sum of D_NEXT_O_ID - 1, after minus before) must equal the
                             New-Orders whose marker is in the database, after the two cases
                             above are accounted for. A difference is a partial commit.
-  Payment, Delivery         the TPC-C consistency rules (1-9 on all data, 10 and 12 on a sample)
+  acknowledged Payments     the per-payment check: each has its history row (this customer, this
+                            district, this amount, written during the run); missing = partial commit
+  lost Payments             the same check: a history row that IS there survived without its
+                            marker -- a partial commit, not a loss
+  Payment, Delivery         and the TPC-C consistency rules (1-9 on all data, 10 and 12 on a sample)
 
 Known limits, stated:
 - Two unknown New-Orders that fail in opposite ways (one kept its marker but lost its rows, the
@@ -59,7 +63,10 @@ class Evidence:
     lost_order_check: Mapping[str, int] | None   # per-order check of lost New-Orders
     orders_before: int | None                    # sum(D_NEXT_O_ID - 1) when the run was prepared
     orders_after: int | None                     # ...after recovery
+    acked_payment_check: Mapping[str, int] | None    # per-payment check of acknowledged Payments, marker present
+    lost_payment_check: Mapping[str, int] | None     # per-payment check of lost Payments
     rules: dict[int, int | None] = field(default_factory=dict)
+    sample: dict[str, Any] | None = None             # the districts rules 10 and 12 checked, and the seed that chose them
     torn_aborted_lines: int = 0
 
 
@@ -97,7 +104,7 @@ def evaluate(ev: Evidence) -> tuple[dict[str, Any], dict[str, Any], dict[str, st
 
     rules = {r: ev.rules.get(r) for r in RULES_ALL_DATA + RULES_SAMPLED}
     facts["consistency"] = {str(r): v for r, v in rules.items()}
-    facts["consistency_sample_districts"] = SAMPLE_DISTRICTS
+    facts["consistency_sample_districts"] = ev.sample if ev.sample is not None else SAMPLE_DISTRICTS
     if any(v is None for v in rules.values()):
         missing = sorted(r for r, v in rules.items() if v is None)
         reasons["tpcc_consistency_violations"] = f"consistency rule(s) {missing} could not be evaluated after recovery"
@@ -112,6 +119,11 @@ def _partial_commits(ev: Evidence, db: set[str], unknown_committed: set[str]) ->
         return None, {"reason": "the per-order check could not run after recovery"}
     if ev.orders_before is None or ev.orders_after is None:
         return None, {"reason": "the number of orders before or after the run could not be read"}
+    if ev.acked_payment_check is None or ev.lost_payment_check is None:
+        return None, {"reason": "the per-payment check could not run after recovery"}
+    pay_missing = int(ev.acked_payment_check.get("missing", 0))
+    lost_pay_checked = int(ev.lost_payment_check.get("checked", 0))
+    lost_pay_found = lost_pay_checked - int(ev.lost_payment_check.get("missing", 0))   # history row survived
     acked_missing = int(ev.acked_order_check.get("missing", 0))
     acked_incomplete = int(ev.acked_order_check.get("incomplete", 0))
     lost_checked = int(ev.lost_order_check.get("checked", 0))
@@ -124,10 +136,17 @@ def _partial_commits(ev: Evidence, db: set[str], unknown_committed: set[str]) ->
     parts.update({"acknowledged_order_missing": acked_missing, "acknowledged_order_incomplete": acked_incomplete,
                   "lost_but_rows_present": lost_found, "orders_created": created,
                   "new_orders_with_marker": new_orders_with_marker, "unexplained_order_count": unexplained,
-                  "unknown_committed": len(unknown_committed)})
-    return acked_missing + acked_incomplete + lost_found + abs(unexplained), parts
+                  "unknown_committed": len(unknown_committed),
+                  "payments_checked": int(ev.acked_payment_check.get("checked", 0)),
+                  "acknowledged_payment_missing": pay_missing, "lost_payment_rows_present": lost_pay_found})
+    return acked_missing + acked_incomplete + lost_found + abs(unexplained) + pay_missing + lost_pay_found, parts
 
 
 def new_order_lines(records: dict[str, dict[str, Any]], uuids: set[str]) -> list[dict[str, Any]]:
     """The {w, d, o_id, ol_cnt} of those acknowledged New-Orders (lines that carry an order number)."""
     return [records[u] for u in sorted(uuids) if u in records and "o_id" in records[u]]
+
+
+def payment_lines(records: dict[str, dict[str, Any]], uuids: set[str]) -> list[dict[str, Any]]:
+    """The {w, d, c_w, c_d, c, amt} of those acknowledged Payments (lines that carry an amount)."""
+    return [records[u] for u in sorted(uuids) if u in records and "amt" in records[u]]

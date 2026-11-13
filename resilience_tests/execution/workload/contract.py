@@ -67,6 +67,7 @@ SAMPLE_FIELDS: tuple[str, ...] = (
     "commits",
     "tps",               # commits / interval_s
     "p50_ms", "p95_ms", "p99_ms",   # over every attempt, committed or not
+    "p90_ms", "max_ms",  # likewise; added with NL-N-I03 (max_ms: the slowest attempt in the interval)
     "journal_p99_ms",    # marker journal flush on the driver host
     "errors",            # sure rollbacks that are not business rollbacks
     "indeterminate",     # outcome unknown
@@ -74,6 +75,12 @@ SAMPLE_FIELDS: tuple[str, ...] = (
     "reconnects",
     "connect_failures",
 )
+
+# Extra top-level fields of the TPC-C engine's samples (not of the custom workload's):
+#   p99_corrected_ms   p99 corrected for stalls and outages (coordinated omission), next to p99_ms
+#   missed             planned transaction starts that were never made (the database stuck or down)
+#   corrected_capped   true when p99_corrected_ms is a lower bound (too many late starts to keep)
+TPCC_EXTRA_SAMPLE_FIELDS: tuple[str, ...] = ("p99_corrected_ms", "missed", "corrected_capped")
 
 # New, extra fields: one entry per transaction type and per clerk group.
 BY_TYPE = "by_type"
@@ -181,6 +188,20 @@ OUTCOME_DEFINITELY_ABORTED = "definitely_aborted"
 OUTCOME_UNKNOWN = "unknown"
 OUTCOME_BUSINESS_ROLLBACK = "business_rollback"
 
+# What the TPC-C workload exists to prove after a fault: nothing confirmed was lost, nothing was
+# half saved, no rolled-back transaction was kept, the TPC-C consistency rules hold. A run with
+# the TPC-C workload is JUDGED on these, not only shown them: without the gate a partial commit
+# would be reported and the run would still pass. Added by --tpcc-warehouses
+# (hooks.with_tpcc_workload); required in a scenario file with profile tpcc (catalog/schema.py).
+TPCC_GATES: tuple[str, ...] = (
+    "rpo_txn == 0",
+    "partial_commits == 0",
+    "aborted_markers_present == 0",
+    "tpcc_consistency_violations == 0",
+)
+TPCC_GATED_MEASURES: tuple[str, ...] = ("rpo_txn", "partial_commits", "aborted_markers_present",
+                                        "tpcc_consistency_violations")
+
 # Measures a scenario may name in `measure:` and `accept:`. Existing names keep their meaning;
 # the new ones are produced once the tpcc profile is built (until then: refused as not built).
 EXISTING_MEASURES: frozenset[str] = frozenset({
@@ -196,6 +217,7 @@ NEW_MEASURES: frozenset[str] = frozenset({
     "aborted_markers_present",      # rolled-back transactions found in the database, Clause 3.5.4
     "tpcc_consistency_violations",  # TPC-C consistency rules failing after recovery, Clause 3.3.2
     "driver_limited",               # the harness could not keep the declared rate: run invalid
+    "missed_transactions",          # planned starts never made after the fault (database stuck or down)
     "capacity_tps",                 # the target's measured maximum
 })
 
@@ -243,8 +265,9 @@ TPCC_META = f"{TPCC_SCHEMA}.meta"            # warehouses, loader version, capac
 class ProfileHooks(Protocol):
     """Called by the orchestrator for every profile; the custom workload's hooks do nothing.
 
-    reset_data          init phase, after the target checks and before prepare: put the profile's
-                        data back to its loaded state when needed (TPC-C: reload, build step 9).
+    reset_data          init phase, after the target checks and before prepare: put the data the
+                        profile needs in place (TPC-C: load it when missing or of another size,
+                        reload it when grown or changed, or always when `fresh`).
                         `extend_phase(seconds, why)` asks for more time in the init phase for it.
                         Returns evidence; `_disclosures` lines go into the report
     prepare             init phase: the data the profile needs is present, the right size and
@@ -253,7 +276,7 @@ class ProfileHooks(Protocol):
                         measure name -> value (e.g. partial_commits, tpcc_consistency_violations)
     """
 
-    async def reset_data(self, adapter: Any, extend_phase: Any = None) -> dict[str, Any]: ...
+    async def reset_data(self, adapter: Any, extend_phase: Any = None, fresh: bool = False) -> dict[str, Any]: ...
 
     async def prepare(self, adapter: Any) -> dict[str, Any]: ...
 

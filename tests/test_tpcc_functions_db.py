@@ -469,7 +469,14 @@ def test_the_reset_before_a_run_reloads_changed_data_and_keeps_the_capacity(adap
     w = Workload(profile="tpcc", concurrency=4, transaction_markers=True, rate_tps=10, tpcc={"warehouses": 2})
     profile = TpccProfile(w)
     asked = []
-    out = asyncio.run(profile.reset_data(adapter, lambda s, why: asked.append(s)))
+
+    async def plenty():
+        return 500 * 1024 ** 3                    # the local test database has no SSH for df
+    adapter.data_fs_free_bytes = plenty
+    try:
+        out = asyncio.run(profile.reset_data(adapter, lambda s, why: asked.append(s)))
+    finally:
+        del adapter.data_fs_free_bytes
     r = out["tpcc_reset"]
     assert r["reloaded"] and any("history has 9 columns" in x for x in r["reasons"]), r
     assert asked and r["checkpoint"] == "done" and r["capacity_kept"] == 321.5
@@ -480,3 +487,77 @@ def test_the_reset_before_a_run_reloads_changed_data_and_keeps_the_capacity(adap
     assert status["capacity_tps"] == 321.5 and tdata.growth(status) == 1.0
     assert asyncio.run(profile.reset_data(adapter))["tpcc_reset"]["reloaded"] is False    # now clean
     asyncio.run(profile.prepare(adapter))                                                 # accepted
+
+
+def test_each_confirmed_payment_is_checked_against_its_history_row(adapter, tmp_path):
+    """Review fix 2 on a real database: after a run, every confirmed Payment has its history row;
+    with one row removed by hand (a half-saved Payment), the per-payment check and the checks after
+    a fault both find exactly that one."""
+    from resilience_tests.execution.workload.hooks import split_checks
+    from resilience_tests.execution.workload.markers import MarkerJournals, read_journal
+    from resilience_tests.observability.event_stream import EventStream
+
+    asyncio.run(adapter.tpcc_load(2, jobs=2, replace=True, seed=11))
+    asyncio.run(adapter.prepare_harness_state())
+    w = Workload(profile="tpcc", concurrency=4, transaction_markers=True, rate_tps=150, tpcc={"warehouses": 2})
+    profile = TpccProfile(w)
+    asyncio.run(profile.prepare(adapter))
+    assert profile.history_since is not None
+
+    async def go():
+        stream, journals = EventStream(tmp_path / "events.jsonl"), MarkerJournals(tmp_path)
+        drv = profile.make_driver(adapter, journals, stream)
+        await drv.start()
+        await asyncio.wait_for(drv.wait_until_ready(), 10)
+        await asyncio.sleep(4)
+        await drv.stop()
+        journals.close()
+        stream.close()
+    asyncio.run(go())
+
+    paid = [r for r in read_journal(tmp_path / "acked.jrnl").records if "amt" in r]
+    assert paid and all({"w", "d", "c_w", "c_d", "c", "amt"} <= set(r) for r in paid)
+    assert asyncio.run(adapter.tpcc_payment_check(paid, profile.history_since)) == {"checked": len(paid), "missing": 0}
+    clean, _, reasons = split_checks(asyncio.run(profile.consistency_checks(adapter, tmp_path)))
+    assert reasons == {} and clean["partial_commits"] == 0
+
+    p = paid[0]
+    where = (f"h_w_id={int(p['w'])} AND h_d_id={int(p['d'])} AND h_c_w_id={int(p['c_w'])} AND h_c_d_id={int(p['c_d'])} "
+             f"AND h_c_id={int(p['c'])} AND h_amount={int(p['amt'])}/100.0")
+    q(adapter, f"CREATE TABLE {S}.test_hold_h AS SELECT * FROM {S}.history WHERE {where}")
+    q(adapter, f"DELETE FROM {S}.history WHERE {where}")
+    try:
+        assert asyncio.run(adapter.tpcc_payment_check(paid, profile.history_since))["missing"] >= 1
+        broken, facts, _ = split_checks(asyncio.run(profile.consistency_checks(adapter, tmp_path)))
+        assert facts["partial_commit_parts"]["acknowledged_payment_missing"] >= 1 and broken["partial_commits"] >= 1
+    finally:
+        q(adapter, f"INSERT INTO {S}.history SELECT * FROM {S}.test_hold_h")
+        q(adapter, f"DROP TABLE {S}.test_hold_h")
+    # rows from before the run (the load's own 10.00 payments) are never taken for this run's payments
+    assert asyncio.run(adapter.tpcc_payment_check(
+        [{"w": 1, "d": 1, "c_w": 1, "c_d": 1, "c": 1, "amt": 1000}], profile.history_since))["missing"] == 1
+
+
+def test_the_run_loads_the_data_itself_when_missing_and_when_the_size_differs(adapter):
+    """The lead's request (13 November): the harness loads the TPC-C data in the run's init phase,
+    no manual load. On a real database: from nothing, then at another size, then used as it is."""
+    async def plenty():
+        return 500 * 1024 ** 3                    # the local test database has no SSH for df
+    adapter.data_fs_free_bytes = plenty
+    asyncio.run(adapter.tpcc_drop())
+    try:
+        def profile(w):
+            return TpccProfile(Workload(profile="tpcc", concurrency=4, transaction_markers=True, rate_tps=10,
+                                        tpcc={"warehouses": w}))
+        asked: list[float] = []
+        first = asyncio.run(profile(1).reset_data(adapter, lambda s, why: asked.append(s)))["tpcc_reset"]
+        assert first["action"] == "loaded" and first["checkpoint"] == "done"
+        assert asked and asked[0] == pytest.approx(300.0)          # the first allowance, then measured
+        asyncio.run(profile(1).prepare(adapter))                    # the data is accepted
+        second = asyncio.run(profile(2).reset_data(adapter))["tpcc_reset"]
+        assert second["action"] == "reloaded" and "has 1 warehouses, the scenario expects 2" in second["reasons"][0]
+        assert asyncio.run(adapter.tpcc_data_status())["warehouses"] == 2
+        assert asyncio.run(profile(2).reset_data(adapter))["tpcc_reset"]["reloaded"] is False   # now used as it is
+    finally:
+        del adapter.data_fs_free_bytes
+        asyncio.run(adapter.tpcc_load(2, jobs=2, replace=True, seed=11))   # as the other tests expect

@@ -445,6 +445,19 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
         return PostgreSQLSession(await self._connect(endpoint or self.node.client, timeout_s, command_timeout=None,
                                                      server_settings=dict(settings) if settings else None))
 
+    async def data_fs_free_bytes(self) -> int | None:
+        """Free bytes on the filesystem of the data directory (df, as the disk prober reads it), or
+        None when it cannot be read -- never a guess."""
+        try:
+            async with RemoteHost(self.node.ssh) as host:
+                r = await host.run(privileged(self.node.ssh, ["df", "-P", "-B1", self.node.pgdata]),
+                                   timeout_s=15.0, check=False)
+        except Exception:  # noqa: BLE001 -- unreadable is None; the caller refuses to load
+            return None
+        lines = r.stdout.strip().splitlines() if r.exit_status == 0 else []
+        fields = lines[-1].split() if len(lines) >= 2 else []
+        return int(fields[3]) if len(fields) >= 4 and fields[3].isdigit() else None
+
     async def prepare_harness_state(self) -> None:
         # Pre-grant required roles to harness user if running against a cluster with SSH access.
         # PostgreSQL 15+ restricts CHECKPOINT to superusers and members of 'pg_checkpoint',

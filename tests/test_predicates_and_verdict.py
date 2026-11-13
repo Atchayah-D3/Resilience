@@ -50,3 +50,12 @@ def test_boolean_measure():
 
 def test_empty_accept_is_not_a_pass():
     assert not evaluate([], {}).passed
+
+
+def test_nan_is_not_a_measurement_so_it_never_passes():
+    """Was (audit, 12 November): NaN -- what a failed calculation yields -- made `x != 0` pass."""
+    from resilience_tests.analysis.threshold_eval import evaluate
+    nan = float("nan")
+    for rule in ("x != 0", "x <= 1.5", "x == 0", "x >= 0", "not x > 5"):
+        r = evaluate([rule], {"x": nan})
+        assert not r.passed and r.results[0].outcome == "not_measured", rule

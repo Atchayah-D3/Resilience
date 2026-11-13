@@ -109,3 +109,24 @@ def test_a_slow_database_is_not_driver_limited():
     # clerks waiting for a slow database use no CPU and the loop stays on time
     watch = DriverLoadWatch()
     assert all(watch.update([0.05, 0.04], [0.01, 0.0]) is None for _ in range(60))
+
+
+def test_a_stall_also_counts_the_transactions_it_held_back():
+    """Coordinated omission (audit issue 4): a clerk due every 300 ms that waits 1,000 ms for one
+    answer also missed the starts at 300, 600 and 900 ms; they are recorded as 700, 400, 100 ms."""
+    assert samples.corrected_latencies(1000.0, 300.0) == [1000.0, 700.0, 400.0, 100.0]
+    assert samples.corrected_latencies(5.0, 300.0) == [5.0]                 # on time: nothing hidden
+    assert samples.corrected_latencies(5.0, None) == [5.0]                  # no rate: nothing to correct
+    long = samples.corrected_latencies(1e9, 1.0)
+    assert len(long) == samples.MAX_CORRECTION_SAMPLES + 1                  # bounded
+
+
+def test_the_corrected_p99_is_reported_next_to_the_measured_one():
+    r = raw(0, [2.0] * 99 + [2000.0])
+    r["corrected"] = [2.0] * 99 + samples.corrected_latencies(2000.0, 320.0)
+    s = merge_raws([r])
+    assert s["p99_ms"] == 2.0 or s["p99_ms"] == 2000.0
+    assert s["p99_corrected_ms"] > s["p99_ms"]                              # the stall shows
+    assert merge_raws([raw(0, [3.0] * 10)])["p99_corrected_ms"] == 3.0      # raw numbers without the field
+    w = merge_window([r], duration_s=1.0)
+    assert w["p99_corrected_ms"] > w["p99_ms"]

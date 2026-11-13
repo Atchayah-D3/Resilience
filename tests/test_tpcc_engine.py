@@ -163,7 +163,7 @@ def test_samples_report_five_types_and_the_totals(ran):
     samples = ran["samples"]
     assert samples
     for s in samples:
-        assert set(s) == set(c.SAMPLE_FIELDS) | {c.BY_TYPE, c.BY_GROUP}
+        assert set(s) == set(c.SAMPLE_FIELDS) | set(c.TPCC_EXTRA_SAMPLE_FIELDS) | {c.BY_TYPE, c.BY_GROUP}
         assert set(s[c.BY_TYPE]) == set(c.TPCC_TYPES) and set(s[c.BY_GROUP]) == {"all"}
         assert sum(t["commits"] for t in s[c.BY_TYPE].values()) == s["commits"] == s[c.BY_GROUP]["all"]["commits"]
         assert sum(t["errors"] for t in s[c.BY_TYPE].values()) == s["errors"]
@@ -234,6 +234,7 @@ def _checked(**changes):
     samples = [_sample(**changes) for _ in range(60)]
     s = trial.summarize(samples, 60.0, 228.0)
     s.update({"rpo_txn": 0, "phantom": 0, "aborted_kept": 0, "orders_checked": s["commits"]["new_order"],
+              "payments_checked": s["commits"]["payment"], "payments_missing": 0,
               "orders_incomplete": 0, "rules": {1: 0, 4: 0}})
     return {name: ok for name, ok, _ in trial.verdicts(s)}, s
 
@@ -270,6 +271,7 @@ def test_trial_fails_when_fewer_orders_were_checked_than_new_orders_committed():
 def _verdicts(samples, seconds=10.0, rate=1.0):
     s = trial.summarize(samples, seconds, rate)
     s.update({"rpo_txn": 0, "phantom": 0, "aborted_kept": 0, "orders_checked": s["commits"]["new_order"],
+              "payments_checked": s["commits"]["payment"], "payments_missing": 0,
               "orders_incomplete": 0, "rules": {1: 0}})
     return {n: ok for n, ok, _ in trial.verdicts(s)}
 
@@ -279,3 +281,147 @@ def test_business_rollback_share_is_checked_only_with_enough_new_orders():
     assert _verdicts([_sample() for _ in range(10)])["business rollbacks about 1%"]                      # 1,000 at 1%
     assert not _verdicts([_sample(no_business=0) for _ in range(10)])["business rollbacks about 1%"]     # 1,000, none
     assert not _verdicts([_sample(no=90, no_business=10) for _ in range(10)])["business rollbacks about 1%"]  # 10%
+
+
+def test_trial_fails_when_a_payment_lost_its_history_row_or_was_not_checked():
+    """Fix 2: the trial checks every acknowledged Payment one by one."""
+    s = _checked()[1]
+    name = "every acknowledged Payment saved"
+    assert {n: ok for n, ok, _ in trial.verdicts(s)}[name]
+    assert not {n: ok for n, ok, _ in trial.verdicts({**s, "payments_missing": 1})}[name]
+    assert not {n: ok for n, ok, _ in trial.verdicts({**s, "payments_checked": 0})}[name]
+
+
+# --- issue 5 (review, 13 November): planned starts, missed starts, the corrected p99 -----------------
+
+def test_the_pacer_plans_starts_and_counts_the_ones_a_gap_skipped():
+    async def go():
+        p = engine_mod.PlannedPacer(100)                 # one start planned every 10 ms
+        first = await p.acquire()
+        second = await p.acquire()
+        assert first[1] == 0 and second[1] == 0          # on schedule: nothing missed
+        assert abs((second[0] - first[0]) - 0.010) < 0.002
+        await asyncio.sleep(0.05)                        # 50 ms late: jitter, below the 0.1 s tolerance
+        jitter = await p.acquire()
+        assert jitter[1] == 0
+        second = jitter
+        await asyncio.sleep(0.3)                         # a gap: the database stuck or down
+        planned, missed = await p.acquire()
+        assert 27 <= missed <= 31                        # about 30 planned starts were never made
+        assert abs(planned - (second[0] + 0.010)) < 0.002   # this start was planned right after the last
+        t = asyncio.get_running_loop().time()
+        after = await p.acquire()                        # no burst to catch up: the pace goes on from now
+        assert after[1] == 0 and asyncio.get_running_loop().time() - t >= 0.008
+        assert (await engine_mod.PlannedPacer(None).acquire())[1] == 0   # no rate: nothing is planned
+    asyncio.run(go())
+
+
+class OutageAdapter(ScriptedAdapter):
+    """The database goes away for `down_s` once: open connections break at once and new ones are
+    refused until it is back -- as after kill -9 (a crash), not a freeze."""
+
+    def __init__(self, node, down_at, down_s):
+        super().__init__(node)
+        self.down_at, self.down_s = down_at, down_s
+        self.t0 = None
+
+    def down(self):
+        import time as _t
+        if self.t0 is None:
+            return False
+        e = _t.monotonic() - self.t0
+        return self.down_at <= e < self.down_at + self.down_s
+
+    async def session(self, endpoint=None, timeout_s=5.0, **kwargs):
+        if self.down():
+            raise ConnectionRefusedError("the database system is starting up")
+        adapter = self
+
+        class S(ScriptedSession):
+            async def tpcc_execute(self, txn_type, inputs, marker):
+                if adapter.down():
+                    self._closed = True
+                    return ("unknown", {}, None)
+                return await super().tpcc_execute(txn_type, inputs, marker)
+        return S()
+
+
+def _run_with(adapter, monkeypatch, seconds=2.4, **workload):
+    import time as _t
+    ScriptedSession.log, ScriptedSession.counts = [], Counter()
+    monkeypatch.setattr(engine_mod, "SAMPLE_INTERVAL_S", 0.2)
+    monkeypatch.setattr(engine_mod, "RECONNECT_PAUSE_S", 0.05)
+    profile = TpccProfile(_workload(**workload))
+    profile.set_run_constants(100)
+
+    async def go():
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stream, journals = EventStream(d / "events.jsonl"), MarkerJournals(d)
+            drv = profile.make_driver(adapter, journals, stream)
+            await drv.start()
+            await asyncio.wait_for(drv.wait_until_ready(), 5)
+            adapter.t0 = _t.monotonic()
+            drv.begin_window()
+            await asyncio.sleep(seconds)
+            window = drv.end_window()
+            await drv.stop()
+            journals.close()
+            stream.close()
+            return window, [e.data for e in stream.events() if e.kind == "sample"]
+    return asyncio.run(go())
+
+
+def test_a_crash_outage_now_shows_in_the_corrected_p99_and_as_missed_starts(monkeypatch):
+    """Was (review): in a crash the connections break at once and the clerks reconnect, so no
+    slow answer exists and p99_corrected_ms equalled p99_ms; the skipped work appeared nowhere."""
+    window, samples = _run_with(OutageAdapter(NODE, down_at=0.6, down_s=0.8), monkeypatch)
+    missed = sum(s["missed"] for s in samples)
+    assert missed >= 0.8 * 400 * 0.6                     # most of the ~320 starts planned during the outage
+    assert window.p99_corrected_ms > 500 > window.p99_ms  # the 0.8 s outage is in the corrected value only
+    assert any((s["p99_corrected_ms"] or 0) > 500 for s in samples)   # seconds with no transaction have none
+
+
+def test_without_a_gap_nothing_is_missed_and_both_p99_agree(monkeypatch):
+    window, samples = _run_with(OutageAdapter(NODE, down_at=99, down_s=0), monkeypatch, seconds=1.2)
+    assert sum(s["missed"] for s in samples) == 0
+    assert window.p99_corrected_ms < 50 and abs(window.p99_corrected_ms - window.p99_ms) < 20
+
+
+class FreezeAdapter(OutageAdapter):
+    """The database stays connected but answers nothing for `down_s` once (a lock, a stall)."""
+
+    async def session(self, endpoint=None, timeout_s=5.0, **kwargs):
+        adapter = self
+
+        class S(ScriptedSession):
+            async def tpcc_execute(self, txn_type, inputs, marker):
+                while adapter.down():
+                    await asyncio.sleep(0.01)
+                return await super().tpcc_execute(txn_type, inputs, marker)
+        return S()
+
+
+def test_latency_from_the_intended_start_puts_a_freeze_in_the_measured_p99_without_a_burst(monkeypatch):
+    """workload.latency_from: intended_start (NL-N-I03a/b, merged with the planned pacer): a
+    transaction held back by a stall carries the wait from its planned start in its own latency,
+    so the measured p99 shows the freeze too -- and the pace never bursts to catch up: the starts
+    the stall skipped are counted as missed, not sent afterwards."""
+    window, samples = _run_with(FreezeAdapter(NODE, down_at=0.6, down_s=0.8), monkeypatch,
+                                latency_from="intended_start")
+    missed = sum(s["missed"] for s in samples)
+    assert missed >= 0.8 * 400 * 0.6
+    # the ~320 skipped starts enter the ordinary figures with their waits (0-800 ms), so even the
+    # p95 shows the freeze; timed from the send, or with only the transactions that ran, the p95
+    # stays at a few ms (test_a_freeze_shows_in_the_corrected_p99_and_as_missed_starts)
+    assert window.p95_ms > 300
+    # no burst: the transactions made stay near the planned pace minus what the freeze skipped
+    assert window.tps <= 400 * 1.05
+
+
+def test_a_freeze_shows_in_the_corrected_p99_and_as_missed_starts(monkeypatch):
+    window, samples = _run_with(FreezeAdapter(NODE, down_at=0.6, down_s=0.8), monkeypatch)
+    assert sum(s["missed"] for s in samples) >= 0.8 * 400 * 0.6
+    # only one call per clerk was frozen (4 of several hundred, under 1%): the measured p99 does not
+    # show the freeze at all -- exactly the coordinated-omission problem -- the corrected p99 does
+    assert window.p99_corrected_ms > 500 > window.p99_ms

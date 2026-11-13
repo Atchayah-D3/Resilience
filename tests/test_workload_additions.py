@@ -36,7 +36,10 @@ def wl(**changes) -> Workload:
 def test_every_existing_scenario_still_loads_unchanged():
     catalog = load_catalog()
     assert not catalog.errors
+    # the scenarios that choose the TPC-C workload (NL-N-I03a/b) use the new fields on purpose
     for sc in catalog.scenarios.values():
+        if sc.workload.profile == "tpcc":
+            continue
         assert sc.workload.session == {} and sc.workload.groups == () and sc.workload.tpcc is None
 
 
@@ -223,7 +226,7 @@ def test_each_worker_process_writes_its_own_journals_and_all_are_read(tmp_path):
 
     async def go():
         for idx in (None, 0, 1):
-            j = MarkerJournals(tmp_path, index=idx)
+            j = MarkerJournals(tmp_path, index=idx, processes=2)
             seq, uid = j.next_marker()
             await j.written(seq, uid, 1.0)
             await j.acknowledged(uid, 2.0)

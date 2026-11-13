@@ -10,7 +10,7 @@ A resilience test harness for ShaktiDB (standalone PostgreSQL 17) and DistDB. It
 breaks a running database -- kills it, restarts it, floods it, crashes it mid-operation -- and
 measures what the failure cost: transactions lost (RPO), time to recover (RTO), corruption.
 
-- Specs: `docs/DistDB-050826-050505.pdf` is the **Framework** (155 scenarios; cite as
+- Specs: `docs/DistDB-091026-095255.pdf` is the **Framework** (162 scenarios; cite as
   `Framework §n`), `docs/BP-Resilience Test Harness Architecture-050826-050547.pdf` is the
   **Architecture** (cite as `Arch §n`). Their section numbers differ -- never cite a bare `§n`.
 - `docs/infra-requirements.md` lists what the lab still lacks (data disk, power control,
@@ -25,10 +25,11 @@ measures what the failure cost: transactions lost (RPO), time to recover (RTO), 
 | `catalog/schema.py` | Scenario schema + catalog checks (`FaultType`, `FaultDuring`, `InfraFeature`, ...) |
 | `envs/*.yaml` | Machines, ports, paths, drivers, phase bounds, safety allowlist, disclosures, `infra` |
 | `resilience_tests/control/orchestrator.py` | The 9 phases: reset, init, baseline, pre_fault, fault_inject, recovery, validate, report, cleanup |
-| `resilience_tests/adapters/postgresql/adapter.py` | The ONLY place that knows PostgreSQL |
-| `resilience_tests/execution/injectors/process.py` | os_ssh driver: kill, restart, reload, idle txn, connection flood |
+| `resilience_tests/control/faults/` | Per-fault and per-`during` behaviour the phases call (no fault-type branches in the orchestrator); behaviours see the run only through `context.py`; held faults subclass `HeldFault` |
+| `resilience_tests/adapters/postgresql/` | All database-session knowledge of PostgreSQL (the OS/SSH drivers also run PostgreSQL tools; see the review note in `docs/code-improvement/`) (`adapter.py` core + corruption/operations/sessions mixins, one per interface group in `adapters/base.py`; `host.py` declares what the mixins use from the core) |
+| `resilience_tests/execution/injectors/process.py` | os_ssh driver: kill, restart, reload, idle txn, connection flood (one class per fault; shared helpers in `os_ssh.py`) |
 | `resilience_tests/execution/workload/driver.py` | asyncpg marker workload (+ Elle list-append mode) |
-| `resilience_tests/analysis/` | RTO decomposer, predicates/verdict, report, Elle checker |
+| `resilience_tests/analysis/` | RTO decomposer, repeated-fault cycles, hold-window load ratios, predicates/verdict, report, Elle checker |
 | `tests/` | Unit tests with fake engines -- plumbing, not scenarios |
 | `vendor/elle/` | `setup_elle.sh` installs the pinned elle-cli jar (Java 21+) |
 | `specs/` | Spec Kit features (one per scenario or shared change) |
@@ -41,6 +42,7 @@ Behaviour comes only from catalog fields:
   (`checkpoint` NL-C-02, `large_transaction` NL-C-03, `concurrent_index_build` NL-C-06) and
   confirms it from the engine before injecting.
 - `fault.duration` -> held faults (NL-R-04 flood) hold for this many seconds.
+- A fault type with no behaviour in `control/faults/` is not built: skipped by the run plan and refused in init.
 - `workload.history: list_append` -> real Elle-checkable history (NL-C-03).
 - `requires` (engine capabilities) / `needs_infra` (environment) -> skipped with a reason.
 - Measures such as `fault_confirmed`, `operation_in_progress_at_fault` prove the fault landed.
@@ -92,7 +94,7 @@ with `pip install -e '.[test]'` on Python 3.11+).
 | Owner | Scenarios |
 |---|---|
 | Owner A | NL-C-01, NL-C-03, NL-C-04 (blocked: needs a dedicated pg_wal volume), NL-C-06, NL-M-03, NL-M-06, NL-M-07, NL-R-04 |
-| Owner B | NL-C-02, NL-C-05, NL-M-05 |
+| Owner B | NL-C-02, NL-C-05, NL-M-05, NL-I-01, NL-I-02 |
 
 Change another owner's scenario only with that owner (constitution, workflow section).
 Next candidates: NL-N-02 (cgroup CPU throttling, P0) with NL-R-01/02 (shared resource_limit driver).
@@ -137,4 +139,6 @@ Principles I-VII. Feature creation does not create git branches; it writes `spec
   title in the same command.
 - NL-M-03 keeps `resilience.avac_target` (1M rows, ~40 MB) between runs, seeded once; a run
   takes ~15-20 min at a 60 s `autovacuum_naptime` (worker wait per cycle up to 2 x naptime + 30 s).
-- `observe_fault_settings` gets `during=` only when the scenario sets one (keeps older fakes valid).
+- Engine settings a fault depends on are read by its behaviour's `observe_settings()` through a
+  named adapter method (`observe_idle_transaction_settings`, `observe_autovacuum_settings`); the
+  adapter never chooses by fault type.

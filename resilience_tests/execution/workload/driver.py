@@ -126,6 +126,10 @@ class MeasuredWindow:
     connect_failures: int = 0
     p50_ms: float | None = None   # reported context; the SLO is defined on p99 (Framework §6.2)
     p95_ms: float | None = None
+    # p99 corrected for stalls (coordinated omission); only the TPC-C engine reports it
+    # (tpcc/samples.py corrected_latencies). None: not computed.
+    p99_corrected_ms: float | None = None
+    missed: int | None = None     # planned starts never made in the window (TPC-C engine); None: not counted
 
 
 def percentile(values: list[float], q: float) -> float | None:

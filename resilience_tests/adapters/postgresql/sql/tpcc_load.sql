@@ -10,10 +10,20 @@ CREATE FUNCTION resilience_tpcc.rnd_int(lo int, hi int) RETURNS int
 LANGUAGE sql VOLATILE
 AS $$ SELECT lo + floor(random() * (hi - lo + 1))::int $$;
 
--- random text of a random length in [lo, hi] (at most 512 characters)
+-- random text of a random length in [lo, hi] (at most 512), made of fresh random pieces (128 characters each).
+-- Loader version 1 repeated ONE piece to the length; such text compresses far better than real
+-- text, so the database read and wrote less than with real data (review, 12 November).
+CREATE FUNCTION resilience_tpcc.rnd_text(n int) RETURNS text
+LANGUAGE sql VOLATILE
+AS $$
+    SELECT left(encode(sha512(random()::text::bytea), 'hex')
+                || CASE WHEN n > 128 THEN encode(sha512(random()::text::bytea), 'hex') ELSE '' END
+                || CASE WHEN n > 256 THEN encode(sha512(random()::text::bytea), 'hex') ELSE '' END
+                || CASE WHEN n > 384 THEN encode(sha512(random()::text::bytea), 'hex') ELSE '' END, n)
+$$;
 CREATE FUNCTION resilience_tpcc.rnd_str(lo int, hi int) RETURNS text
 LANGUAGE sql VOLATILE
-AS $$ SELECT left(repeat(md5(random()::text), 16), resilience_tpcc.rnd_int(lo, hi)) $$;
+AS $$ SELECT resilience_tpcc.rnd_text(resilience_tpcc.rnd_int(lo, hi)) $$;
 
 -- I_DATA / S_DATA: [lo, hi] characters; 10% contain "ORIGINAL" at a random place (Clause 4.3.3.1)
 CREATE FUNCTION resilience_tpcc.rnd_data(lo int, hi int) RETURNS text
