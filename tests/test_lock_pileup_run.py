@@ -40,7 +40,7 @@ LOCK_TIMEOUT_S = 2.0    # ddl_lock_timeout_s of the shortened runs 3a and 3c
 HOLD_S = 8.0            # fault.duration: the hold's upper bound
 BASELINE_S = 6          # longer than the fixture's 2 s SLO sustain, so rto_to_slo_s is measurable
 OTHERS_BUDGET = "other_tables_tps_lost_pct <= 10"
-TPCC_ONLY = {"partial_commits == 0", "tpcc_consistency_violations == 0"}
+TPCC_ONLY = {"partial_commits == 0", "tpcc_consistency_violations == 0", "aborted_markers_present == 0"}
 SHORT_OTHERS_BUDGET = "other_tables_tps_lost_pct <= 75"   # ~2.6 s paused in a few seconds observed
 QUEUE_DRAIN_S = 0.6     # a queued table user finishes this long after the queue clears (longer than
                         # the behaviour's state poll, so a window closed at the clear misses it)

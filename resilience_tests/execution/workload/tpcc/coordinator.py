@@ -59,7 +59,7 @@ async def _child(cfg: dict[str, Any], cmd_q: Any, out_q: Any) -> None:
         workload = Workload.model_validate(cfg["workload"])
         profile = TpccProfile(workload, seed=cfg["seed"])
         profile.constants = RunConstants(*cfg["constants"])
-        journals = MarkerJournals(Path(cfg["run_dir"]), index=idx)
+        journals = MarkerJournals(Path(cfg["run_dir"]), index=idx, processes=cfg["processes"])
         drv = TpccWorkloadDriver(adapter, workload, journals, None, profile, worker_ids=cfg["worker_ids"],
                                  rate_tps=cfg["rate_tps"], raw_sink=lambda raw: out_q.put(("raw", idx, raw)))
         await drv.start()
@@ -111,7 +111,7 @@ class TpccCoordinator:
         rate = workload.rate_tps
         consts = profile.constants
         self._configs = [{
-            "index": i, "engine": adapter.engine, "node": adapter.node.model_dump(mode="json"),
+            "index": i, "processes": processes, "engine": adapter.engine, "node": adapter.node.model_dump(mode="json"),
             "workload": workload.model_dump(mode="json"), "seed": profile.seed,
             "constants": (consts.c_last, consts.c_id, consts.ol_i_id), "run_dir": str(journals.run_dir),
             "worker_ids": ids, "rate_tps": (rate * len(ids) / workload.concurrency) if rate else None,

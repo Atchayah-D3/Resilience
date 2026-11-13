@@ -21,6 +21,8 @@ is sent" holds for every transaction individually.
 from __future__ import annotations
 
 import asyncio
+import gzip
+import hashlib
 import json
 import os
 import queue
@@ -115,18 +117,23 @@ class MarkerJournals:
     are added to a line, e.g. the TPC-C transaction type, or the order number of a New-Order
     for the per-order check after a fault; without them each line is exactly as before."""
 
-    def __init__(self, run_dir: Path, index: int | None = None) -> None:
+    def __init__(self, run_dir: Path, index: int | None = None, processes: int = 1) -> None:
         """`index`: one worker process of several writes marker.<index>.jrnl and so on (the
-        TPC-C engine in several processes); without it the names are exactly as before."""
+        TPC-C engine in several processes); without it the names are exactly as before.
+        `processes`: how many there are, so the marker numbers (seq) of all processes are unique:
+        process i of N numbers its markers i+1, i+1+N, i+1+2N, ... (one process: 1, 2, 3, ...)."""
+        if processes < 1 or (index is not None and not 0 <= index < processes):
+            raise ValueError(f"process index {index} does not fit {processes} process(es)")
         self.run_dir = run_dir
         self._name = (lambda base: base) if index is None else (lambda base: base.replace(".jrnl", f".{index}.jrnl"))
         self.marker = DurableJournal(run_dir / self._name(MARKER_JOURNAL))
         self.acked = DurableJournal(run_dir / self._name(ACKED_JOURNAL))
         self._aborted: DurableJournal | None = None
-        self._seq = 0
+        self._seq = (index or 0) + 1 - processes      # the first next_marker() gives index + 1
+        self._step = processes
 
     def next_marker(self) -> tuple[int, str]:
-        self._seq += 1
+        self._seq += self._step
         return self._seq, str(uuidlib.uuid4())
 
     async def written(self, seq: int, uuid: str, t_pre: float, **extra: Any) -> None:
@@ -175,19 +182,29 @@ class MarkerDiff:
     acked: int
     in_db: int
     lost: frozenset[str]  # acked but absent from the database -> RPO
-    indeterminate: frozenset[str]  # written, never acknowledged -> reported, not counted
+    indeterminate: frozenset[str]  # written, never acknowledged nor surely rolled back -> reported, not counted
     indeterminate_committed: frozenset[str]  # the subset of indeterminate that did commit
     phantom: frozenset[str]  # in the database but never written by the driver -> integrity violation
     unjournalled_ack: frozenset[str]  # acked without a marker record -> harness defect
+    # Written, then answered "rolled back" by the database (the aborted journal; the TPC-C engine
+    # writes it, the custom workload does not, so for it these stay empty). They had an answer,
+    # so they are not indeterminate. One that is nevertheless in the database is a rollback
+    # that was kept -- an atomicity failure, shown here and judged by the profile's checks.
+    rolled_back: frozenset[str] = frozenset()
+    rolled_back_kept: frozenset[str] = frozenset()
 
     @property
     def rpo_txn(self) -> int:
         return len(self.lost)
 
 
-def diff_markers(written: Iterable[str], acked: Iterable[str], db: Iterable[str]) -> MarkerDiff:
+def diff_markers(written: Iterable[str], acked: Iterable[str], db: Iterable[str],
+                 aborted: Iterable[str] = ()) -> MarkerDiff:
     w, a, d = frozenset(written), frozenset(acked), frozenset(db)
-    indeterminate = w - a
+    # an acknowledgement wins over a rollback line (both would be a harness defect; the
+    # acknowledged one is then still checked for loss)
+    rolled_back = (frozenset(aborted) & w) - a
+    indeterminate = w - a - rolled_back
     return MarkerDiff(
         written=len(w),
         acked=len(a),
@@ -197,7 +214,28 @@ def diff_markers(written: Iterable[str], acked: Iterable[str], db: Iterable[str]
         indeterminate_committed=indeterminate & d,
         phantom=d - w,
         unjournalled_ack=a - w,
+        rolled_back=rolled_back,
+        rolled_back_kept=rolled_back & d,
     )
+
+
+DB_MARKERS_FILE = "markers_db.txt.gz"
+
+
+def write_db_markers(run_dir: Path, db_uuids: Iterable[str]) -> dict[str, Any]:
+    """Keep the markers the database held after recovery in the run folder (sorted, one per
+    line, gzip), so the RPO comparison -- journals against database -- can be redone later from
+    the evidence alone. Returns its count and SHA-256 (of the uncompressed text) for the results."""
+    lines = sorted(str(u) for u in db_uuids)
+    text = ("\n".join(lines) + ("\n" if lines else "")).encode()
+    with gzip.open(run_dir / DB_MARKERS_FILE, "wb") as fh:
+        fh.write(text)
+    return {"file": DB_MARKERS_FILE, "count": len(lines), "sha256": hashlib.sha256(text).hexdigest()}
+
+
+def read_db_markers(run_dir: Path) -> set[str]:
+    with gzip.open(run_dir / DB_MARKERS_FILE, "rt") as fh:
+        return {line.strip() for line in fh if line.strip()}
 
 
 def journal_paths(run_dir: Path, name: str) -> list[Path]:
@@ -226,9 +264,11 @@ def diff_from_journals(run_dir: Path, db_uuids: Iterable[str]) -> tuple[MarkerDi
             raise FileNotFoundError(expected)
     markers = [read_journal(p) for p in marker_paths]
     acks = [read_journal(p) for p in acked_paths]
+    aborts = [read_journal(p) for p in journal_paths(run_dir, ABORTED_JOURNAL)]
     result = diff_markers(
         (r["uuid"] for j in markers for r in j.records),
         (r["uuid"] for j in acks for r in j.records),
         db_uuids,
+        (r["uuid"] for j in aborts for r in j.records),
     )
-    return result, sum(j.torn_lines for j in markers + acks)
+    return result, sum(j.torn_lines for j in markers + acks + aborts)

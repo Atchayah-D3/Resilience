@@ -15,6 +15,7 @@ import pytest
 
 from catalog.schema import Workload, load_catalog
 from resilience_tests.execution.workload.contract import DELIVERY, NEW_ORDER, PAYMENT
+from resilience_tests.execution.workload.contract import TPCC_GATED_MEASURES, TPCC_GATES
 from resilience_tests.execution.workload.hooks import split_checks, tpcc_override_note, with_tpcc_workload
 from resilience_tests.execution.workload.tpcc import checks
 from resilience_tests.execution.workload.tpcc.profile import TpccProfile
@@ -27,12 +28,15 @@ def evidence(**changes) -> checks.Evidence:
     base = dict(
         written={"n1": NEW_ORDER, "n2": NEW_ORDER, "n3": NEW_ORDER, "p1": PAYMENT, "d1": DELIVERY, "r1": NEW_ORDER},
         acked={"n1": {"w": 1, "d": 1, "o_id": 3001, "ol_cnt": 5}, "n2": {"w": 1, "d": 2, "o_id": 3001, "ol_cnt": 7},
-               "n3": {"w": 1, "d": 3, "o_id": 3001, "ol_cnt": 9}, "p1": {}, "d1": {}},
+               "n3": {"w": 1, "d": 3, "o_id": 3001, "ol_cnt": 9},
+               "p1": {"w": 1, "d": 4, "c_w": 1, "c_d": 4, "c": 17, "amt": 25000}, "d1": {}},
         aborted={"r1": {"business_rollback": True}},
         db={"n1", "n2", "n3", "p1", "d1"},
         acked_order_check={"checked": 3, "missing": 0, "incomplete": 0},
         lost_order_check={"checked": 0, "missing": 0, "incomplete": 0},
-        orders_before=1000, orders_after=1003, rules=dict(CLEAN_RULES))
+        orders_before=1000, orders_after=1003,
+        acked_payment_check={"checked": 1, "missing": 0}, lost_payment_check={"checked": 0, "missing": 0},
+        rules=dict(CLEAN_RULES))
     base.update(changes)
     return checks.Evidence(**base)
 
@@ -166,7 +170,16 @@ class FakeAdapter:
 
     async def tpcc_consistency(self, rules, district_sample=None, seed=None):
         await self._maybe_fail("tpcc_consistency")
+        self.calls.append(("consistency", tuple(rules), district_sample, seed))
         return {r: 0 for r in rules}
+
+    async def tpcc_payment_check(self, payments, since):
+        await self._maybe_fail("tpcc_payment_check")
+        self.calls.append(("payment_check", [p["c"] for p in payments], since))
+        missing = sum(1 for p in payments if p["c"] in self.missing_payments)
+        return {"checked": len(payments), "missing": missing}
+
+    missing_payments: set = set()
 
 
 def _write(path: Path, records):
@@ -177,7 +190,8 @@ def _run_dir(tmp_path):
     _write(tmp_path / "marker.jrnl", [{"seq": 1, "uuid": "a", "type": NEW_ORDER}, {"seq": 2, "uuid": "b", "type": NEW_ORDER},
                                       {"seq": 3, "uuid": "c", "type": PAYMENT}, {"seq": 4, "uuid": "r", "type": NEW_ORDER}])
     _write(tmp_path / "acked.jrnl", [{"uuid": "a", "w": 1, "d": 1, "o_id": 3001, "ol_cnt": 5},
-                                     {"uuid": "b", "w": 1, "d": 2, "o_id": 3001, "ol_cnt": 6}, {"uuid": "c"}])
+                                     {"uuid": "b", "w": 1, "d": 2, "o_id": 3001, "ol_cnt": 6},
+                                     {"uuid": "c", "w": 1, "d": 3, "c_w": 1, "c_d": 3, "c": 42, "amt": 1234}])
     _write(tmp_path / "aborted.jrnl", [{"uuid": "r", "business_rollback": True, "sqlstate": "TP001"}])
     return tmp_path
 
@@ -185,6 +199,7 @@ def _run_dir(tmp_path):
 def _profile():
     p = TpccProfile(Workload(profile="tpcc", concurrency=4, transaction_markers=True, rate_tps=10, tpcc={"warehouses": 2}))
     p.orders_at_prepare = 1000
+    p.history_since = "2026-11-12 10:00:00"
     return p
 
 
@@ -228,5 +243,98 @@ def test_with_tpcc_workload_keeps_clerks_rate_and_session_and_drops_the_elle_his
     assert tried.workload.profile == "tpcc" and tried.workload.tpcc.warehouses == 16
     assert tried.workload.concurrency == nlc03.workload.concurrency and tried.workload.rate_tps == nlc03.workload.rate_tps
     assert tried.workload.history == "none"
-    assert tried.fault == nlc03.fault and tried.accept == nlc03.accept      # the scenario itself is unchanged
-    assert "16 warehouses" in tpcc_override_note(16) and "was not changed" in tpcc_override_note(16)
+    assert tried.fault == nlc03.fault
+    # the scenario's own acceptance is kept, in order, and the TPC-C gates are added after it
+    assert tried.accept[:len(nlc03.accept)] == nlc03.accept
+    assert all(g in tried.accept for g in TPCC_GATES) and len(tried.accept) == len(set(tried.accept))
+    assert set(TPCC_GATED_MEASURES) <= set(tried.measure) and len(tried.measure) == len(set(tried.measure))
+    note = tpcc_override_note(16)
+    assert "16 warehouses" in note and "was not changed" in note and "TPC-C-like" in note and "partial_commits == 0" in note
+
+
+def test_without_the_tpcc_gates_a_partial_commit_would_have_passed_nl_c_05():
+    """Was (audit, 12 November): NL-C-05 run with --tpcc-warehouses gated neither rpo_txn nor any TPC-C
+    check, so a partial commit would be reported and the run would still pass."""
+    from resilience_tests.analysis.threshold_eval import evaluate
+    nlc05 = load_catalog().scenarios["NL-C-05"]
+    clean = {"cycles_recovered": 10, "cycles_run": 10, "recovery_ratio_last_over_first": 0.3,
+             "structural_integrity_errors": 0, "corruption_count": 0, "rpo_txn": 0, "partial_commits": 0,
+             "aborted_markers_present": 0, "tpcc_consistency_violations": 0}
+    broken = {**clean, "partial_commits": 1}
+    assert evaluate(nlc05.accept, broken).passed                          # the scenario's own rules alone: PASS
+    tried = with_tpcc_workload(nlc05, 32)
+    assert evaluate(tried.accept, clean).passed
+    assert not evaluate(tried.accept, broken).passed                      # with the gates: FAIL
+    for name in TPCC_GATED_MEASURES:                                       # and a check that could not run fails too
+        assert not evaluate(tried.accept, {k: v for k, v in clean.items() if k != name}).passed
+
+
+def test_a_scenario_file_with_the_tpcc_profile_must_gate_the_tpcc_checks():
+    from catalog.schema import Scenario
+    data = load_catalog().scenarios["NL-C-01"].model_dump(mode="json")
+    data["workload"] = {**data["workload"], "profile": "tpcc", "tpcc": {"warehouses": 16}, "history": "none"}
+    with pytest.raises(ValueError, match="profile tpcc needs these accept predicates"):
+        Scenario.model_validate(data)
+    data["measure"] = list(dict.fromkeys([*data["measure"], *TPCC_GATED_MEASURES]))
+    data["accept"] = [*data["accept"], *(g for g in TPCC_GATES if g not in data["accept"])]
+    assert Scenario.model_validate(data).workload.profile == "tpcc"
+
+
+def test_every_tpcc_run_is_labelled_tpcc_like_with_its_differences():
+    p = TpccProfile(Workload(profile="tpcc", concurrency=64, transaction_markers=True, rate_tps=200,
+                             tpcc={"warehouses": 32}))
+    label = p.label()
+    for text in ("TPC-C-like", "not an audited TPC-C", "not tpmC", "no keying or thinking time", "200 TPS",
+                 "2 clerks per warehouse", "Delivery runs at once", "READ COMMITTED", "Clause 3.4", "RPO marker"):
+        assert text in label, text
+
+
+# --- review fixes, 12 November -------------------------------------------------------------------
+
+def test_an_acknowledged_payment_without_its_history_row_is_a_partial_commit():
+    """Fix 2: a Payment is now checked one by one, as New-Orders are."""
+    measures, facts, _ = checks.evaluate(evidence(acked_payment_check={"checked": 1, "missing": 1}))
+    assert measures["partial_commits"] == 1 and facts["partial_commit_parts"]["acknowledged_payment_missing"] == 1
+
+
+def test_a_lost_payment_whose_history_row_survived_is_a_partial_commit_not_only_a_loss():
+    ev = evidence(db={"n1", "n2", "n3", "d1"},                                  # p1's marker is gone
+                  lost_payment_check={"checked": 1, "missing": 0})            # ...but its history row is there
+    measures, facts, _ = checks.evaluate(ev)
+    assert measures["partial_commits"] == 1 and facts["partial_commit_parts"]["lost_payment_rows_present"] == 1
+    assert facts["lost"] == 1                                                 # and it is a loss (rpo) too
+
+
+@pytest.mark.parametrize("which", ["acked_payment_check", "lost_payment_check"])
+def test_a_payment_check_that_could_not_run_is_not_measured_never_zero(which):
+    measures, _, reasons = checks.evaluate(evidence(**{which: None}))
+    assert "partial_commits" not in measures and "per-payment check" in reasons["partial_commits"]
+
+
+def test_payment_lines_are_the_confirmed_payments_with_their_details():
+    acked = {"p1": {"w": 1, "d": 2, "c_w": 1, "c_d": 2, "c": 9, "amt": 500}, "n1": {"w": 1, "d": 1, "o_id": 3001,
+             "ol_cnt": 5}, "d1": {}}
+    assert checks.payment_lines(acked, {"p1", "n1", "d1"}) == [acked["p1"]]
+
+
+def test_the_profile_checks_each_payment_since_the_run_started_and_samples_new_districts(tmp_path):
+    adapter = FakeAdapter(db={"a", "b", "c"})
+    p = _profile()
+    measures, facts, reasons = split_checks(asyncio.run(p.consistency_checks(adapter, _run_dir(tmp_path))))
+    assert reasons == {} and measures["partial_commits"] == 0
+    assert ("payment_check", [42], p.history_since) in adapter.calls          # the confirmed Payment, from the run start
+    sample = facts["consistency_sample_districts"]
+    sampled_calls = [c for c in adapter.calls if c[0] == "consistency" and c[2]]
+    assert sampled_calls and sampled_calls[0][3] == sample["seed"]            # the recorded seed is the one used
+    assert len(sample["districts"]) == checks.SAMPLE_DISTRICTS
+    assert all(1 <= w <= 2 and 1 <= d <= 10 for w, d in sample["districts"])
+    seeds = {split_checks(asyncio.run(_profile().consistency_checks(FakeAdapter(db={"a", "b", "c"}), _run_dir(tmp_path))))
+             [1]["consistency_sample_districts"]["seed"] for _ in range(5)}
+    assert len(seeds) > 1                                                     # a new sample each run, not a fixed one
+
+
+def test_without_the_run_start_time_the_payment_check_is_not_measured(tmp_path):
+    p = _profile()
+    p.history_since = None
+    _, _, reasons = split_checks(asyncio.run(p.consistency_checks(FakeAdapter(db={"a", "b", "c"}), _run_dir(tmp_path))))
+    assert "partial_commits" in reasons and "start time" in reasons["partial_commits"]

@@ -69,7 +69,7 @@ class WorkloadProfile(ABC):
     def required_capabilities(self) -> set[Capability]:
         return set()
 
-    async def reset_data(self, adapter: Any, extend_phase: Any = None) -> dict[str, Any]:
+    async def reset_data(self, adapter: Any, extend_phase: Any = None, fresh: bool = False) -> dict[str, Any]:
         """Init, before prepare(): put this profile's data back to its loaded state if needed.
         Profiles without data of their own do nothing."""
         return {}

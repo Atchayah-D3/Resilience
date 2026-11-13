@@ -114,7 +114,7 @@ measure:
   - settings_unchanged           # document 2.3 cleanup check: settings equal what was recorded
   - partial_commits              # TPC-C: transactions only partly kept (atomicity)
   - tpcc_consistency_violations  # TPC-C consistency rules after the fault
-  - aborted_markers_present      # reported: rolled-back transactions whose marker was kept
+  - aborted_markers_present      # gated: rolled-back transactions whose marker was kept
 
 accept:
   - fault_confirmed == true
@@ -130,6 +130,7 @@ accept:
   - structural_integrity_errors == 0
   - partial_commits == 0              # document check 8: no damaged data (TPC-C atomicity)
   - tpcc_consistency_violations == 0  # document check 8: no damaged data (TPC-C consistency rules)
+  - aborted_markers_present == 0      # TPC-C gate (required for profile tpcc): no rolled-back transaction kept its marker
   - probe_column_absent == true       # document check 7
   - harness_sessions_left == 0        # document table 20
   - settings_unchanged == true        # document 2.3 cleanup check

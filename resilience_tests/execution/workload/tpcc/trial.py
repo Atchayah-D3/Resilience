@@ -91,6 +91,10 @@ def verdicts(summary: dict[str, Any]) -> list[tuple[str, bool, str]]:
          summary.get("orders_incomplete") == 0
          and (summary.get("orders_checked") or 0) >= summary["commits"].get(contract.NEW_ORDER, 0) > 0,
          f"{summary.get('orders_checked')} checked, {summary.get('orders_incomplete')} incomplete"),
+        ("every acknowledged Payment saved",
+         summary.get("payments_missing") == 0
+         and (summary.get("payments_checked") or 0) >= summary["commits"].get(contract.PAYMENT, 0) > 0,
+         f"{summary.get('payments_checked')} checked, {summary.get('payments_missing')} without their history row"),
         ("consistency rules 1-10, 12 hold", bool(summary.get("rules")) and not any(summary["rules"].values()),
          json.dumps(summary.get("rules"))),
     ]
@@ -155,7 +159,8 @@ async def _main(a: argparse.Namespace) -> int:
 
     samples = [e.data for e in stream.events() if e.kind == "sample"]
     summary = summarize(samples, window.duration_s, a.rate)
-    summary.update({"p50_ms": window.p50_ms, "p99_ms": window.p99_ms, "prepare": prepared,
+    summary.update({"p50_ms": window.p50_ms, "p99_ms": window.p99_ms, "p99_corrected_ms": window.p99_corrected_ms,
+                    "prepare": prepared,
                     "processes": getattr(drv, "processes", 1)})
     db = await adapter.marker_ids()
     diff, torn = diff_from_journals(out, db)
@@ -163,15 +168,19 @@ async def _main(a: argparse.Namespace) -> int:
     aborted = [r for p in journal_paths(out, ABORTED_JOURNAL) for r in read_journal(p).records]
     orders = [r for p in journal_paths(out, ACKED_JOURNAL) for r in read_journal(p).records if "o_id" in r]
     incomplete = await adapter.tpcc_orders_incomplete(orders)
+    payments = [r for p in journal_paths(out, ACKED_JOURNAL) for r in read_journal(p).records if "amt" in r]
+    pay_check = await adapter.tpcc_payment_check(payments, profile.history_since)
     summary.update({"rpo_txn": diff.rpo_txn if not torn else None, "phantom": len(diff.phantom),
                     "indeterminate_txn": len(diff.indeterminate), "aborted_kept": len({r["uuid"] for r in aborted} & db),
                     "orders_checked": len(orders), "orders_incomplete": incomplete,
+                    "payments_checked": pay_check["checked"], "payments_missing": pay_check["missing"],
                     "rules": await adapter.tpcc_consistency([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])})
     checks = verdicts(summary)
     (out / "summary.json").write_text(json.dumps({"summary": summary, "checks": checks}, indent=2, default=str) + "\n")
     load = [e.data for e in stream.events() if e.kind == "driver_load"]
     summary["max_cpu_share"] = max((c for d in load for c in d["cpu_share"]), default=None)
-    print(f"\n{window.tps:.0f} TPS, p50 {summary['p50_ms']:.1f} ms, p99 {summary['p99_ms']:.1f} ms, "
+    print(f"\n{window.tps:.0f} TPS, p50 {summary['p50_ms']:.1f} ms, p99 {summary['p99_ms']:.1f} ms "
+          f"(corrected for stalls: {summary['p99_corrected_ms'] or 0:.1f} ms), "
           f"{summary['processes']} worker process(es), busiest at {summary['max_cpu_share'] or 0:.0%} of a core")
     for name, ok, detail in checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")

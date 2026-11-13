@@ -68,6 +68,7 @@ class TpccProfile(WorkloadProfile):
         self.seed = seed
         self.constants: inputs.RunConstants | None = None      # set by prepare() from the loaded data
         self.orders_at_prepare: int | None = None                # sum(D_NEXT_O_ID - 1) at prepare, for step 7
+        self.history_since: Any = None                           # database time at prepare: this run's payments
         self._terminals: list[Terminal] | None = None
         self._clerks: dict[int, tuple[random.Random, inputs.Deck]] = {}
 
@@ -79,44 +80,76 @@ class TpccProfile(WorkloadProfile):
     def required_capabilities(self) -> set[Capability]:
         return {Capability.TPCC_WORKLOAD}
 
-    async def reset_data(self, adapter: Any, extend_phase: Any = None) -> dict[str, Any]:
-        """Init, after the target checks (build step 9, option A): reload the data -- back to
-        exactly the loaded state -- when it has grown past data.RESET_GROWTH, fails a consistency
-        rule, was loaded by another loader version, or its tables' columns changed. Nothing is
-        reset when the data is missing or has another number of warehouses: prepare() then
-        refuses the run with the load command. Every reset is recorded and disclosed."""
+    async def reset_data(self, adapter: Any, extend_phase: Any = None, fresh: bool = False) -> dict[str, Any]:
+        """Init, after the target checks: the harness puts the data the scenario needs in place
+        itself (no manual load). It LOADS when there is no TPC-C data, when the data has another
+        number of warehouses than the scenario, when it should be reset (grown past
+        data.RESET_GROWTH, a consistency rule failing, another loader version, columns changed),
+        or always when a fresh load is asked for (`fresh`, --tpcc-fresh-load); otherwise the data
+        is used as it is. Before loading: enough free space, or the run is refused. The init
+        phase bound is extended from measurements: this target's last load time when it loaded
+        this size before, else a first allowance and then the load's own measured speed. After:
+        a CHECKPOINT. Every load is recorded and disclosed."""
         assert self.workload.tpcc is not None
         warehouses = self.workload.tpcc.warehouses
         status = await adapter.tpcc_data_status()
-        if not data.resettable(status, warehouses):
-            return {}
-        columns = await adapter.tpcc_columns()
-        rules = None
-        if status.get("loader_version") == data.LOADER_VERSION:      # the rules' SQL comes with the loader
-            rules = await adapter.tpcc_consistency(data.PREPARE_RULES, district_sample=data.PREPARE_DISTRICT_SAMPLE)
-        reasons = data.reset_reasons(status, columns, rules)
-        before = {"growth": data.growth(status), "size_bytes": status.get("size_bytes")}
-        if not reasons:
-            return {"tpcc_reset": {"reloaded": False, **before}}
-        budget = data.reload_budget_s(status)
-        if extend_phase is not None and budget is not None:
-            extend_phase(budget, f"TPC-C data reload (twice the {status['load_seconds']:.0f} s this target's "
-                                 f"last load took, plus {data.RELOAD_EXTRA_S:.0f} s)")
-        capacity = status.get("capacity_tps")
+        same_size = data.resettable(status, warehouses)
+        columns = rules = None
+        if same_size and not fresh:
+            columns = await adapter.tpcc_columns()
+            if status.get("loader_version") == data.LOADER_VERSION:      # the rules' SQL comes with the loader
+                rules = await adapter.tpcc_consistency(data.PREPARE_RULES, district_sample=data.PREPARE_DISTRICT_SAMPLE)
+        action, reasons = data.data_action(status, warehouses, columns, rules, fresh=fresh)
+        before = {"loaded": bool(status.get("loaded")), "warehouses": status.get("warehouses"),
+                  "growth": data.growth(status) if status.get("loaded") else None,
+                  "size_bytes": status.get("size_bytes")}
+        if action == "use":
+            return {"tpcc_reset": {"reloaded": False, "growth": before["growth"], "size_bytes": before["size_bytes"]}}
+
+        free = await adapter.data_fs_free_bytes()
+        problem = data.space_problem(free, int(status.get("size_bytes") or 0) if status.get("loaded") else 0, warehouses)
+        if problem:
+            raise TpccDataError(problem)
+
+        granted = 0.0
+
+        def ask(seconds: float, why: str) -> None:
+            nonlocal granted
+            if extend_phase is not None and seconds > granted:
+                extend_phase(seconds - granted, why)
+                granted = seconds
+
+        if same_size and status.get("load_seconds"):
+            ask(data.reload_budget_s(status) or 0.0, f"TPC-C data reload (twice the {status['load_seconds']:.0f} s "
+                                                     f"this target's last load took, plus {data.RELOAD_EXTRA_S:.0f} s)")
+        else:
+            ask(data.FIRST_LOAD_ALLOWANCE_S, f"TPC-C data load of {warehouses} warehouses: first allowance, "
+                                             "until the first warehouse is measured")
+
+        def measured(done: int, total: int, elapsed: float) -> None:
+            ask(data.load_budget_s(done, total, elapsed),
+                f"TPC-C data load: {done} of {total} warehouses in {elapsed:.0f} s, "
+                f"{data.LOAD_BUDGET_FACTOR:g} x the expected total plus {data.RELOAD_EXTRA_S:.0f} s")
+
+        capacity = status.get("capacity_tps") if same_size else None
         started = time.monotonic()
-        load = await adapter.tpcc_load(warehouses, jobs=RESET_JOBS, replace=True)
+        load = await adapter.tpcc_load(warehouses, jobs=RESET_JOBS, replace=bool(status.get("loaded")),
+                                       on_warehouse=measured)
         if capacity is not None:
             await adapter.tpcc_record_capacity(capacity)    # same target, same size: still its capacity
         checkpoint_error = await adapter.tpcc_checkpoint()
         seconds = time.monotonic() - started
         after = await adapter.tpcc_data_status()
-        disclosures = [f"The TPC-C data was reloaded before this run ({'; '.join(reasons)}); the reload took "
-                       f"{seconds:.0f} s and passed every row count and all 12 consistency rules."]
+        verb = "loaded" if not status.get("loaded") else "reloaded"
+        disclosures = [f"The TPC-C data ({warehouses} warehouses) was {verb} by this run before the baseline "
+                       f"({'; '.join(reasons)}); the load took {seconds:.0f} s and passed every row count and all "
+                       f"12 consistency rules (loader version {data.LOADER_VERSION}, seed {load.get('load_seed')})."]
         if checkpoint_error:
-            disclosures.append(f"After the reload the harness could not run a CHECKPOINT ({checkpoint_error}): "
-                               "the baseline may include the database writing the reloaded data to disk.")
-        return {"tpcc_reset": {"reloaded": True, "reasons": reasons, "seconds": round(seconds, 1),
-                               "load_seconds": round(load["seconds"], 1), "before": before,
+            disclosures.append(f"After the load the harness could not run a CHECKPOINT ({checkpoint_error}): "
+                               "the baseline may include the database writing the loaded data to disk.")
+        return {"tpcc_reset": {"reloaded": True, "action": verb, "reasons": reasons, "seconds": round(seconds, 1),
+                               "load_seconds": round(load["seconds"], 1), "load_seed": load.get("load_seed"),
+                               "before": before, "free_bytes_before": free,
                                "after": {"growth": data.growth(after), "size_bytes": after.get("size_bytes")},
                                "checkpoint": checkpoint_error or "done", "capacity_kept": capacity},
                 "_disclosures": disclosures}
@@ -138,6 +171,8 @@ class TpccProfile(WorkloadProfile):
             raise TpccDataError("the TPC-C data cannot be used: " + "; ".join(problems))
         consts = self.set_run_constants(status["c_last_load"])
         self.orders_at_prepare = status.get("current_orders")
+        # history rows written from now on are this run's payments (the per-payment check after a fault)
+        self.history_since = await adapter.tpcc_clock()
         return {"tpcc_data": {
             "run_constants": {"c_last": consts.c_last, "c_id": consts.c_id, "ol_i_id": consts.ol_i_id,
                               "c_last_load": status["c_last_load"]},
@@ -146,7 +181,13 @@ class TpccProfile(WorkloadProfile):
             "size_bytes": status.get("size_bytes"),
             "consistency": {str(r): results[r] for r in data.PREPARE_RULES},
             "district_sample": data.PREPARE_DISTRICT_SAMPLE,
-        }}
+            "history_since": str(self.history_since), "load_seed": status.get("load_seed"),
+        }, "_disclosures": [self.label()]}
+
+    def label(self) -> str:
+        from resilience_tests.execution.workload.hooks import tpcc_label
+        assert self.workload.tpcc is not None
+        return tpcc_label(self.workload.concurrency, self.workload.tpcc.warehouses, self.workload.rate_tps)
 
     def terminal(self, worker_id: int) -> Terminal:
         """Clerk `worker_id`: its group, home warehouse and fixed district (terminals.py)."""
@@ -218,17 +259,31 @@ class TpccProfile(WorkloadProfile):
                 return None
 
         db = await attempt("markers", adapter.marker_ids())
-        acked_check = lost_check = None
+        acked_check = lost_check = acked_pay = lost_pay = None
         if db is not None:
             acked_check = await attempt("per-order check", adapter.tpcc_order_check(
                 checks.new_order_lines(acked, set(acked) & db)))
             lost_check = await attempt("per-order check of lost New-Orders", adapter.tpcc_order_check(
                 checks.new_order_lines(acked, set(acked) - db)))
+            if self.history_since is None:
+                problems.append("per-payment check: the run's start time was not recorded at prepare")
+            else:
+                acked_pay = await attempt("per-payment check", adapter.tpcc_payment_check(
+                    checks.payment_lines(acked, set(acked) & db), self.history_since))
+                lost_pay = await attempt("per-payment check of lost Payments", adapter.tpcc_payment_check(
+                    checks.payment_lines(acked, set(acked) - db), self.history_since))
         status = await attempt("order count", adapter.tpcc_data_status())
         rules: dict[int, int | None] = {}
         full = await attempt("consistency rules", adapter.tpcc_consistency(checks.RULES_ALL_DATA))
+        # rules 10 and 12 check a sample of districts: a NEW sample every run (a fixed seed checked
+        # the same 20 districts every time), recorded so the run can be checked again
+        sample_seed = random.SystemRandom().randrange(1, 2**31)
+        assert self.workload.tpcc is not None
+        w_list, d_list = data.sample_districts(random.Random(sample_seed), self.workload.tpcc.warehouses,
+                                               checks.SAMPLE_DISTRICTS)
+        sample = {"seed": sample_seed, "districts": [[w, d] for w, d in zip(w_list, d_list)]}
         sampled = await attempt("consistency rules (sample)", adapter.tpcc_consistency(
-            checks.RULES_SAMPLED, district_sample=checks.SAMPLE_DISTRICTS, seed=self.seed))
+            checks.RULES_SAMPLED, district_sample=checks.SAMPLE_DISTRICTS, seed=sample_seed))
         rules.update(full or {})
         rules.update(sampled or {})
 
@@ -237,7 +292,8 @@ class TpccProfile(WorkloadProfile):
             acked_order_check=acked_check, lost_order_check=lost_check,
             orders_before=self.orders_at_prepare,
             orders_after=(status or {}).get("current_orders"),
-            rules=rules, torn_aborted_lines=torn)
+            acked_payment_check=acked_pay, lost_payment_check=lost_pay,
+            rules=rules, torn_aborted_lines=torn, sample=sample)
         measures, facts, reasons = checks.evaluate(ev)
         # context only: a driver-limited run already stopped with the workload's failure (abort)
         facts["driver_load"] = _driver_load(run_dir / "events.jsonl") or "the run's events could not be read"
