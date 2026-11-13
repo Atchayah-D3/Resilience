@@ -77,6 +77,11 @@ class FaultBehaviour:
         scenario's own definition is stricter than the Framework §6.2 80%. None: the Framework's."""
         return None
 
+    def slo_tps_window_s(self) -> float | None:
+        """Judge "back to normal" TPS over a window of this many seconds instead of in every
+        1 s sample (rto_decomposer._slo_recovery_windowed). None: per second, the default."""
+        return None
+
     def samplers(self) -> list[Sampler]:
         """Extra background measurements for this fault (OS counters, cgroup files, ...). Built
         when the baseline starts, after the run's own probes, and stopped with them. Each

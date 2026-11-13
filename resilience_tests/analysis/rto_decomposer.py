@@ -161,18 +161,65 @@ class BaselineSloCheck:
 
 
 def baseline_slo_check(events: Sequence[Event], window_t0_ns: int, window_end_ns: int,
-                       baseline: Baseline, tps_fraction: float | None = None) -> BaselineSloCheck:
+                       baseline: Baseline, tps_fraction: float | None = None,
+                       tps_window_s: float | None = None) -> BaselineSloCheck:
+    """`compliant` counts the 1 s samples that meet the SLO on their own (evidence); whether a
+    sustained window exists is decided by the same rule slo_recovery applies after the fault,
+    including `tps_window_s` when the scenario judges TPS over the sustain window."""
     samples = [e for e in sorted(events, key=lambda e: e.t_mono_ns)
                if e.kind == "sample" and e.source == "workload"
                and e.t_mono_ns - int(e.data["interval_s"] * 1e9) >= window_t0_ns and e.t_mono_ns <= window_end_ns]
-    start, _ = slo_recovery(samples, window_t0_ns, baseline, tps_fraction=tps_fraction)
+    start, _ = slo_recovery(samples, window_t0_ns, baseline, tps_fraction=tps_fraction, tps_window_s=tps_window_s)
     return BaselineSloCheck(len(samples), sum(1 for e in samples if sample_meets_slo(e, baseline, tps_fraction=tps_fraction)),
                             start is not None)
 
 
+def _sample_commits(e: Event) -> float:
+    """Transactions committed in a sample's interval (older streams carry only the rate)."""
+    commits = e.data.get("commits")
+    return float(commits) if commits is not None else float(e.data["tps"]) * float(e.data["interval_s"])
+
+
+def _slo_recovery_windowed(events: Sequence[Event], t0_ns: int, baseline: Baseline, max_sample_interval_s: float,
+                           tps_fraction: float | None, window_s: float) -> tuple[float | None, float | None]:
+    """The earliest window of `window_s` after T0, made of consecutive 1 s samples, in which
+    the committed TPS over the WHOLE window is >= the fraction of baseline TPS and EVERY
+    sample's p99 is <= 1.5x the baseline p99. Every sample must also be short (not a starved
+    sampler) and follow the previous one without a gap -- the same rules as the per-second form.
+
+    Why the TPS is taken over the window: at tens of TPS a 1 s count is dominated by when the
+    commits happen to land (a stall of a few hundred ms moves a third of a second's commits into
+    the next second), so a per-second 95% bound fails an undisturbed service most seconds. The
+    thresholds are unchanged; p99 is still held per second, which is stricter than a window p99."""
+    fraction = SLO_TPS_FRACTION if tps_fraction is None else tps_fraction
+    samples = [e for e in events if e.kind == "sample" and e.source == "workload"]
+    for j, first in enumerate(samples):
+        start_ns = first.t_mono_ns - int(first.data["interval_s"] * 1e9)
+        if start_ns < t0_ns:
+            continue
+        commits = 0.0
+        prev_end_ns: int | None = None
+        for e in samples[j:]:
+            interval_ns = int(e.data["interval_s"] * 1e9)
+            p99 = e.data.get("p99_ms")
+            if (e.data["interval_s"] > max_sample_interval_s or p99 is None
+                    or p99 > SLO_P99_MULTIPLIER * baseline.p99_ms
+                    or (prev_end_ns is not None and (e.t_mono_ns - interval_ns) - prev_end_ns > interval_ns // 2)):
+                break
+            commits += _sample_commits(e)
+            prev_end_ns = e.t_mono_ns
+            span_s = (e.t_mono_ns - start_ns) / 1e9
+            if span_s >= window_s - 1e-9:
+                if commits / span_s >= fraction * baseline.tps:
+                    return (start_ns - t0_ns) / 1e9, (e.t_mono_ns - t0_ns) / 1e9
+                break
+    return None, None
+
+
 def slo_recovery(events: Sequence[Event], t0_ns: int, baseline: Baseline,
                  max_sample_interval_s: float = MAX_SAMPLE_INTERVAL_S,
-                 tps_fraction: float | None = None) -> tuple[float | None, float | None]:
+                 tps_fraction: float | None = None,
+                 tps_window_s: float | None = None) -> tuple[float | None, float | None]:
     """Earliest run of consecutive 1 s workload samples after T0, spanning SLO_SUSTAIN_S, in
     which every sample meets the SLO. Returns (start, end) relative to T0 in seconds.
 
@@ -180,7 +227,14 @@ def slo_recovery(events: Sequence[Event], t0_ns: int, baseline: Baseline,
     because neither can show what happened inside them: a gap in the sample stream (samples
     missing from the record), and a sample whose own interval is far longer than the sampling
     period (a starved sampler averaging over the dip it should have exposed).
+
+    `tps_window_s`: judge TPS over a window of this length instead of in every 1 s sample (see
+    _slo_recovery_windowed); a scenario opts in through FaultBehaviour.slo_tps_window_s. None:
+    the per-second form.
     """
+    if tps_window_s is not None:
+        return _slo_recovery_windowed(sorted(events, key=lambda e: e.t_mono_ns), t0_ns, baseline,
+                                      max_sample_interval_s, tps_fraction, tps_window_s)
     run_start_ns: int | None = None
     prev_end_ns: int | None = None
     for e in events:
@@ -283,13 +337,15 @@ def mttd_from_log(events: Sequence[Event], t0_ns: int, patterns: Sequence[str]) 
 
 def decompose(events: Sequence[Event], t0_ns: int, baseline: Baseline, *, clustered: bool,
               detection_patterns: Sequence[str] = (), recovery_patterns: Sequence[str] = (),
-              expect_outage: bool = False, slo_tps_fraction: float | None = None) -> RtoDecomposition:
+              expect_outage: bool = False, slo_tps_fraction: float | None = None,
+              slo_tps_window_s: float | None = None) -> RtoDecomposition:
     """`expect_outage`: the fault must interrupt writes (kill, restart, power loss). If the
     probes never saw it do so, rto_first_write_s is NOT_MEASURED -- the outage was shorter
     than the probe interval or the fault did not take effect, and either way the harness
     has no gap to report."""
     ordered = sorted(events, key=lambda e: e.t_mono_ns)
-    slo_start, slo_end = slo_recovery(ordered, t0_ns, baseline, tps_fraction=slo_tps_fraction)
+    slo_start, slo_end = slo_recovery(ordered, t0_ns, baseline, tps_fraction=slo_tps_fraction,
+                                      tps_window_s=slo_tps_window_s)
     components: dict[str, Any]
     if clustered:
         # Patroni / etcd signals arrive with the Tier-2 probes (Phase 4). Until then a

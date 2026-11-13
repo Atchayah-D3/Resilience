@@ -45,6 +45,11 @@ PROBE_EDGE_S = 2.0
 # least 95% of the baseline and p99 at most 1.5x, for the sustain period -- stricter than the
 # Framework §6.2 80%. NEEDS SIGN-OFF: the document lists the exact values as an open decision.
 NORMAL_TPS_FRACTION = 0.95
+# The document's "for 60 s in a row" is judged as one window of the sustain period
+# (rto_decomposer.SLO_SUSTAIN_S, 60 s): TPS over the whole window, p99 in every second of it. At
+# the scenario's 60 TPS a 1 s count swings with when commits land (measured on .112: 3..108 per
+# second with no fault, 36 of 119 baseline seconds under 95%), so a per-second 95% bound could
+# never be met, not even by the undisturbed baseline. See slo_tps_window_s().
 # Run 3a gates rto_to_slo_s <= 60 (counted from the moment the queue cleared). The recovery watch
 # must therefore last until a return starting at that limit has been held for the full sustain
 # period, or a late-but-passing return would read as not measured.
@@ -66,6 +71,9 @@ class LockPileupFault(HeldFault):
 
     def slo_tps_fraction(self) -> float | None:
         return NORMAL_TPS_FRACTION
+
+    def slo_tps_window_s(self) -> float | None:
+        return rto_decomposer.SLO_SUSTAIN_S      # read at call time: the window IS the sustain period
 
     def phase_extension_s(self, phase: str) -> float:
         if phase != "recovery":
@@ -94,8 +102,10 @@ class LockPileupFault(HeldFault):
             "(counted as indeterminate, never as lost).")
         ctx.disclosures.append(
             f"Back to normal (rto_to_slo_s) uses this scenario's definition: TPS >= {NORMAL_TPS_FRACTION:.0%} "
-            f"of the baseline and p99 <= {rto_decomposer.SLO_P99_MULTIPLIER:g}x for "
-            f"{rto_decomposer.SLO_SUSTAIN_S:g} s straight, counted from the moment the lock queue cleared.")
+            f"of the baseline over a {rto_decomposer.SLO_SUSTAIN_S:g} s window and p99 <= "
+            f"{rto_decomposer.SLO_P99_MULTIPLIER:g}x in every second of it ({rto_decomposer.SLO_SUSTAIN_S:g} s "
+            f"straight), counted from the moment the lock queue cleared. TPS is judged over the window, "
+            f"not per second, because a 1 s count at this rate swings with when commits land.")
 
     async def hold_and_release(self) -> dict[str, Any]:
         ctx = self.ctx

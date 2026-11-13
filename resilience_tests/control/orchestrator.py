@@ -492,13 +492,16 @@ class TestOrchestrator:
         await self.fault_behaviour.baseline_ended()
         self.stream.emit("orchestrator", "baseline", **asdict(self.baseline))
         tps_fraction = self.fault_behaviour.slo_tps_fraction()
+        tps_window_s = self.fault_behaviour.slo_tps_window_s()
         check = baseline_slo_check(self.stream.events(), self.workload.window_t0_ns, time.monotonic_ns(),
-                                   Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0), tps_fraction)
+                                   Baseline(self.baseline.tps, self.baseline.p99_ms or 0.0), tps_fraction,
+                                   tps_window_s=tps_window_s)
         self.facts["baseline_slo_check"] = asdict(check) | {"compliant_fraction": check.compliant_fraction}
         if not check.sustained_window_found:
             fraction = rto_decomposer.SLO_TPS_FRACTION if tps_fraction is None else tps_fraction
             self.disclosures.append(
-                f"The undisturbed baseline never held the SLO definition (>= {fraction:.0%} TPS, p99 <= 1.5x, "
+                f"The undisturbed baseline never held the SLO definition (>= {fraction:.0%} TPS"
+                f"{f' over {tps_window_s:g} s' if tps_window_s else ''}, p99 <= 1.5x, "
                 f"{rto_decomposer.SLO_SUSTAIN_S:.0f} s straight) -- {check.compliant} of {check.samples} seconds compliant -- "
                 f"so time-to-SLO after the fault cannot be measured on this target and is reported as not measured.")
         return asdict(self.baseline)
@@ -708,7 +711,8 @@ class TestOrchestrator:
                               detection_patterns=self.adapter.fault_detection_log_patterns(),
                               recovery_patterns=self.adapter.recovery_start_log_patterns(),
                               expect_outage=False,
-                              slo_tps_fraction=self.fault_behaviour.slo_tps_fraction())
+                              slo_tps_fraction=self.fault_behaviour.slo_tps_fraction(),
+                          slo_tps_window_s=self.fault_behaviour.slo_tps_window_s())
                 if d.rto_to_slo_s is not None:
                     detail["slo_reached_s"] = d.rto_to_slo_s
                 await asyncio.sleep(RECOVERY_POLL_S)
@@ -728,7 +732,8 @@ class TestOrchestrator:
                           detection_patterns=self.adapter.fault_detection_log_patterns(),
                           recovery_patterns=self.adapter.recovery_start_log_patterns(),
                           expect_outage=self.fault_behaviour.expects_outage,
-                          slo_tps_fraction=self.fault_behaviour.slo_tps_fraction())
+                          slo_tps_fraction=self.fault_behaviour.slo_tps_fraction(),
+                          slo_tps_window_s=self.fault_behaviour.slo_tps_window_s())
             if d.rto_to_slo_s is not None:
                 detail["slo_reached_s"] = d.rto_to_slo_s
                 return detail
@@ -773,7 +778,8 @@ class TestOrchestrator:
                       clustered=False, detection_patterns=self.adapter.fault_detection_log_patterns(),
                       recovery_patterns=self.adapter.recovery_start_log_patterns(),
                       expect_outage=expect_outage,
-                      slo_tps_fraction=self.fault_behaviour.slo_tps_fraction())
+                      slo_tps_fraction=self.fault_behaviour.slo_tps_fraction(),
+                          slo_tps_window_s=self.fault_behaviour.slo_tps_window_s())
         m.update(d.as_measured())
         self.facts["outage_observed"] = d.outage_observed
         if not (self.facts.get("baseline_slo_check") or {}).get("sustained_window_found", True):
