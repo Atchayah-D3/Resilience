@@ -92,6 +92,8 @@ class RunOptions:
     stop_before_fault: bool = False
     # disclosed in the report when the run changed the scenario (e.g. --tpcc-warehouses)
     workload_note: str | None = None
+    # load the workload's data again even when it is fine (--tpcc-fresh-load)
+    tpcc_fresh_load: bool = False
 
 
 @dataclass
@@ -414,7 +416,8 @@ class TestOrchestrator:
         # Profile hooks (docs/tpcc-contract.md §6): the custom workload's do nothing.
         self.workload_hooks = hooks_for(self.scenario.workload)
         # after the target checks above: a reset writes to the target
-        reset = await self.workload_hooks.reset_data(self.adapter, self._extend_phase)
+        reset = await self.workload_hooks.reset_data(self.adapter, self._extend_phase,
+                                                     fresh=self.options.tpcc_fresh_load)
         if reset:
             self.disclosures.extend(reset.pop("_disclosures", []))
             self.facts["workload_reset"] = reset
@@ -770,6 +773,11 @@ class TestOrchestrator:
         m["failed_transactions"] = sum(e.data.get("errors", 0) for e in after)
         m["dropped_connections"] = sum(e.data.get("drops", 0) for e in after)
         m["connect_failures"] = sum(e.data.get("connect_failures", 0) for e in after)
+        # planned starts never made (the database stuck or down): only workloads that plan their
+        # starts report them (the TPC-C engine); reported, not a failure -- failed_transactions
+        # keeps its meaning (transactions the database refused)
+        if any("missed" in e.data for e in after):
+            m["missed_transactions"] = sum(e.data.get("missed", 0) for e in after)
         self.facts["slo_window_end_s"] = d.slo_window_end_s
         # Framework §10.1: the database starts unattended -- a successful write started after
         # T1, with no harness action on the database. For a fault that must cause an outage,

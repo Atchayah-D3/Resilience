@@ -134,7 +134,10 @@ def _sql(name: str) -> str:
 class TpccMixin(TpccSupport, PostgreSQLCore):
 
     async def tpcc_load(self, warehouses: int, *, jobs: int = 4, replace: bool = False,
-                        progress: Callable[[str], None] | None = None, seed: int | None = None) -> dict[str, Any]:
+                        progress: Callable[[str], None] | None = None, seed: int | None = None,
+                        on_warehouse: Callable[[int, int, float], None] | None = None) -> dict[str, Any]:
+        """`on_warehouse(done, total, seconds so far)` after each warehouse: lets the caller measure
+        the load's speed (the harness extends its init phase bound from it)."""
         if warehouses < 1 or jobs < 1:
             raise ValueError("warehouses and jobs must be at least 1")
         say = progress or (lambda _msg: None)
@@ -184,6 +187,8 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                     await c.execute(f"SELECT {TPCC_SCHEMA}.load_warehouse($1, $2, $3)", w, data.ITEMS, c_last)
                     done += 1
                     say(f"warehouse {w} loaded ({done}/{warehouses})")
+                    if on_warehouse is not None:
+                        on_warehouse(done, warehouses, time.perf_counter() - started)
             finally:
                 await c.close()
 

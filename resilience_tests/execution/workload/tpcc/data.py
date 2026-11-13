@@ -134,6 +134,62 @@ def data_problems(status: Mapping[str, Any], warehouses: int) -> list[str]:
     return problems
 
 
+# The harness loads the data itself, in the init phase (a manual load is no longer needed).
+# Space: free space on the data filesystem, plus what the old TPC-C data frees, must be at least
+# FREE_SPACE_MARGIN x the expected size. NEEDS SIGN-OFF.
+FREE_SPACE_MARGIN = 1.5
+EXPECTED_BYTES_PER_WAREHOUSE = 110 * 1024 ** 2    # measured: about 105-110 MB per warehouse, with indexes
+EXPECTED_ITEM_BYTES = 15 * 1024 ** 2
+# Time: a load of a size this target has not loaded before has no measured time yet, so the init
+# phase is first extended by this allowance; once the first warehouse is loaded, the expected
+# total is measured and the bound becomes LOAD_BUDGET_FACTOR x that. NEEDS SIGN-OFF.
+FIRST_LOAD_ALLOWANCE_S = 300.0
+LOAD_BUDGET_FACTOR = 3.0
+
+
+def expected_size_bytes(warehouses: int) -> int:
+    return warehouses * EXPECTED_BYTES_PER_WAREHOUSE + EXPECTED_ITEM_BYTES
+
+
+def data_action(status: Mapping[str, Any], warehouses: int, columns: Mapping[str, Mapping[str, int]] | None,
+                rules: Mapping[int, int | None] | None, fresh: bool = False) -> tuple[str, list[str]]:
+    """("use" | "load", why). Load when a fresh load is asked for, when there is no data, when it
+    has another size, or when it should be reset (reset_reasons). `columns` and `rules` are read
+    only for data of the right size; None there means "not read"."""
+    if fresh:
+        return "load", ["a fresh load was asked for (--tpcc-fresh-load)"]
+    if not status.get("loaded"):
+        return "load", [str(status.get("reason") or "no TPC-C data is loaded")]
+    if status.get("warehouses") != warehouses:
+        return "load", [f"the loaded data has {status.get('warehouses')} warehouses, the scenario expects {warehouses}"]
+    if status.get("items") != ITEMS:
+        return "load", [f"the loaded data has {status.get('items')} items, TPC-C has {ITEMS}"]
+    reasons = reset_reasons(status, columns, rules)
+    return ("load", reasons) if reasons else ("use", [])
+
+
+def space_problem(free_bytes: int | None, freed_bytes: int, warehouses: int) -> str | None:
+    """Why there is not enough room to load (None: enough). An unreadable free space refuses too."""
+    need = int(FREE_SPACE_MARGIN * expected_size_bytes(warehouses))
+    if free_bytes is None:
+        return ("the free space on the target's data filesystem could not be read, so a load of "
+                f"{warehouses} warehouses (about {expected_size_bytes(warehouses) / 1024 ** 3:.1f} GB) is not started")
+    have = free_bytes + max(0, freed_bytes)
+    if have < need:
+        return (f"not enough free space to load {warehouses} warehouses: {have / 1024 ** 3:.1f} GB available "
+                f"(free plus the old TPC-C data), {need / 1024 ** 3:.1f} GB needed "
+                f"({FREE_SPACE_MARGIN} x about {expected_size_bytes(warehouses) / 1024 ** 3:.1f} GB)")
+    return None
+
+
+def load_budget_s(done: int, total: int, elapsed_s: float) -> float:
+    """The init-phase time a load needs, from its own progress: LOAD_BUDGET_FACTOR x the expected
+    total (the rate so far over all warehouses), plus RELOAD_EXTRA_S for the indexes and checks."""
+    if done <= 0:
+        return FIRST_LOAD_ALLOWANCE_S
+    return LOAD_BUDGET_FACTOR * elapsed_s * total / done + RELOAD_EXTRA_S
+
+
 def resettable(status: Mapping[str, Any], warehouses: int) -> bool:
     """A reset gives back the loaded state; it does not create or resize the data set. Missing
     data or another number of warehouses is a setup step (disk space, time) for a person: the

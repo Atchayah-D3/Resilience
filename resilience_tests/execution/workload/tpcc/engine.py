@@ -39,18 +39,58 @@ from resilience_tests.execution.workload.driver import (
     RECONNECT_PAUSE_S,
     TXN_TIMEOUT_S,
     MeasuredWindow,
-    RateLimiter,
     _Window,
     percentile,
     p99,
 )
-from resilience_tests.execution.workload.tpcc.samples import DriverLoadWatch, corrected_latencies, merge_raws
+from resilience_tests.execution.workload.tpcc.samples import (
+    MAX_CORRECTED_PER_INTERVAL,
+    MAX_CORRECTION_SAMPLES,
+    DriverLoadWatch,
+    corrected_latencies,
+    merge_raws,
+)
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.execution.workload.profiles.base import Request, Terminal, WorkloadProfile
 from resilience_tests.observability.event_stream import EventStream
 
 SAMPLE_INTERVAL_S = 1.0
 STOP_GRACE_S = 5.0          # at stop, each clerk may finish its running transaction for this long
+
+
+class PlannedPacer:
+    """Spreads transaction starts evenly at `rate` per second (as the shared driver.RateLimiter),
+    and also says WHEN each start was planned. On schedule, a start's planned time is its slot.
+    After a gap -- the database frozen, or down while the clerks reconnect -- the first start is
+    given the oldest planned time that was not used, and the planned starts in between are
+    reported as missed. It never sends a burst to catch up: after a gap the pace continues from
+    now. A lateness below GAP_TOLERANCE_S is pacing jitter (a slow journal flush, the event loop),
+    not a stall: it is neither counted as missed nor added to the corrected response time.
+    (TPC-C engine only; the custom workload keeps driver.RateLimiter unchanged.)"""
+
+    GAP_TOLERANCE_S = 0.1
+
+    def __init__(self, rate: float | None) -> None:
+        self.interval = 1.0 / rate if rate else 0.0
+        self._next: float | None = None             # set by the first start: connecting is not a gap
+
+    async def acquire(self) -> tuple[float, int]:
+        """(planned start, planned starts missed before this one)."""
+        now = time.monotonic()
+        if not self.interval:
+            return now, 0
+        if self._next is None:
+            self._next = now
+        if now - self._next > max(self.interval, self.GAP_TOLERANCE_S):     # a real gap in the plan
+            planned = self._next
+            missed = int((now - self._next) / self.interval)
+            self._next = now + self.interval
+            return planned, missed
+        slot = max(now, self._next)
+        self._next = slot + self.interval
+        if slot > now:
+            await asyncio.sleep(slot - now)
+        return slot, 0
 
 
 class TpccWorkloadDriver:
@@ -72,14 +112,16 @@ class TpccWorkloadDriver:
         self.raw_sink = raw_sink
         self.profile = profile
         rate = workload.rate_tps if rate_tps is None else rate_tps
-        self.limiter = RateLimiter(rate)
+        self.pacer = PlannedPacer(rate)
         self.session_settings = dict(workload.session)
         ids = list(range(workload.concurrency)) if worker_ids is None else list(worker_ids)
         self.terminals: dict[int, Terminal] = {i: profile.terminal(i) for i in ids}
-        # how often each clerk is due to start a transaction, for the stall correction
-        self.expected_interval_ms = 1000.0 * len(ids) / rate if rate and ids else None
+        # response times corrected for stalls and outages, and the planned starts never made
         self._corrected: list[float] = []
+        self._capped = False
+        self._missed = 0
         self._measure_corrected: list[float] | None = None
+        self._measure_missed = 0
         self.load_watch = DriverLoadWatch()
         self._seq = 0
         self._last_t: float | None = None
@@ -112,6 +154,7 @@ class TpccWorkloadDriver:
     def begin_window(self) -> None:
         self._measure = _Window()
         self._measure_corrected = []
+        self._measure_missed = 0
         self._measure_t0 = time.monotonic()
         self.window_t0_ns = time.monotonic_ns()
 
@@ -127,7 +170,7 @@ class TpccWorkloadDriver:
             p99_ms=p99(lat), journal_p99_ms=p99(w.journal_ms or []), errors=w.errors,
             indeterminate=w.indeterminate, drops=w.drops, reconnects=w.reconnects,
             connect_failures=w.connect_failures, p50_ms=percentile(lat, 0.50), p95_ms=percentile(lat, 0.95),
-            p99_corrected_ms=p99(corrected))
+            p99_corrected_ms=p99(corrected), missed=self._measure_missed)
 
     async def stop(self) -> None:
         """Graceful: no new transaction starts; each clerk finishes the one it is running, for at
@@ -199,7 +242,8 @@ class TpccWorkloadDriver:
                     pass
 
     async def _one_transaction(self, session: DatabaseSession, terminal: Terminal) -> DatabaseSession | None:
-        await self.limiter.acquire()
+        planned, missed = await self.pacer.acquire()
+        late_ms = max(0.0, time.monotonic() - planned) * 1000      # 0 on schedule; the gap after a stall
         if self._stop.is_set():                 # stopping: start nothing new
             return session
         req: Request = self.profile.next_request(terminal)
@@ -222,6 +266,7 @@ class TpccWorkloadDriver:
         except Exception:  # noqa: BLE001 -- anything not classified is unknown, never guessed
             outcome, journal, sqlstate = contract.OUTCOME_UNKNOWN, {}, None
         latency_ms = (time.monotonic() - t0) * 1000
+        self._record_planned(latency_ms + late_ms, missed)
 
         if outcome == contract.OUTCOME_COMMITTED:
             if marker is not None:
@@ -272,11 +317,19 @@ class TpccWorkloadDriver:
                 w.latencies_ms.append(latency_ms)
             if journal_ms is not None:
                 w.journal_ms.append(journal_ms)
-        if latency_ms is not None:
-            hidden = corrected_latencies(latency_ms, self.expected_interval_ms)
-            self._corrected.extend(hidden)
-            if self._measure_corrected is not None:
-                self._measure_corrected.extend(hidden)
+
+    def _record_planned(self, from_planned_ms: float, missed: int) -> None:
+        """The response time counted from the PLANNED start, and the planned starts skipped before
+        it (each recorded as it would have waited: L - I, L - 2I, ...; tpcc/samples.py)."""
+        values = corrected_latencies(from_planned_ms, self.pacer.interval * 1000)[:missed + 1] if missed else [from_planned_ms]
+        self._missed += missed
+        if self._measure_corrected is not None:
+            self._measure_missed += missed
+            self._measure_corrected.extend(values[:MAX_CORRECTION_SAMPLES])
+        room = MAX_CORRECTED_PER_INTERVAL - len(self._corrected)
+        if len(values) > room:
+            self._capped = True
+        self._corrected.extend(values[:max(0, room)])
 
     async def _sampler(self) -> None:
         """One interval at a time, over the interval actually measured (as the custom driver):
@@ -331,6 +384,8 @@ class TpccWorkloadDriver:
         business, self._business = self._business, Counter()
         groups, self._groups = self._groups, {g: _Window() for g in self._groups}
         corrected, self._corrected = self._corrected, []
+        missed, self._missed = self._missed, 0
+        capped, self._capped = self._capped, False
         self._seq += 1
         return {
             "seq": self._seq, "t_end_ns": time.monotonic_ns(),
@@ -339,7 +394,7 @@ class TpccWorkloadDriver:
             "totals": {"commits": w.commits, "errors": w.errors, "indeterminate": w.indeterminate, "drops": w.drops,
                        "reconnects": w.reconnects, "connect_failures": w.connect_failures},
             "latencies": list(w.latencies_ms or []), "journal_ms": list(w.journal_ms or []),
-            "corrected": corrected,
+            "corrected": corrected, "missed": missed, "corrected_capped": capped,
             "types": {t: {"commits": tw.commits, "errors": tw.errors, "business_rollbacks": business[t],
                           "latencies": list(tw.latencies_ms or [])} for t, tw in types.items()},
             "groups": {g: {"commits": gw.commits, "errors": gw.errors, "indeterminate": gw.indeterminate,

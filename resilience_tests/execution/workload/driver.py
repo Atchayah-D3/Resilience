@@ -103,6 +103,7 @@ class MeasuredWindow:
     # p99 corrected for stalls (coordinated omission); only the TPC-C engine reports it
     # (tpcc/samples.py corrected_latencies). None: not computed.
     p99_corrected_ms: float | None = None
+    missed: int | None = None     # planned starts never made in the window (TPC-C engine); None: not counted
 
 
 def percentile(values: list[float], q: float) -> float | None:

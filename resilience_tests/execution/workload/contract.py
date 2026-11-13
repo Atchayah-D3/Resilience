@@ -75,9 +75,11 @@ SAMPLE_FIELDS: tuple[str, ...] = (
     "connect_failures",
 )
 
-# Extra top-level field of the TPC-C engine's samples (not of the custom workload's):
-#   p99_corrected_ms   p99 corrected for stalls (coordinated omission), next to p99_ms
-TPCC_EXTRA_SAMPLE_FIELDS: tuple[str, ...] = ("p99_corrected_ms",)
+# Extra top-level fields of the TPC-C engine's samples (not of the custom workload's):
+#   p99_corrected_ms   p99 corrected for stalls and outages (coordinated omission), next to p99_ms
+#   missed             planned transaction starts that were never made (the database stuck or down)
+#   corrected_capped   true when p99_corrected_ms is a lower bound (too many late starts to keep)
+TPCC_EXTRA_SAMPLE_FIELDS: tuple[str, ...] = ("p99_corrected_ms", "missed", "corrected_capped")
 
 # New, extra fields: one entry per transaction type and per clerk group.
 BY_TYPE = "by_type"
@@ -214,6 +216,7 @@ NEW_MEASURES: frozenset[str] = frozenset({
     "aborted_markers_present",      # rolled-back transactions found in the database, Clause 3.5.4
     "tpcc_consistency_violations",  # TPC-C consistency rules failing after recovery, Clause 3.3.2
     "driver_limited",               # the harness could not keep the declared rate: run invalid
+    "missed_transactions",          # planned starts never made after the fault (database stuck or down)
     "capacity_tps",                 # the target's measured maximum
 })
 
@@ -261,8 +264,9 @@ TPCC_META = f"{TPCC_SCHEMA}.meta"            # warehouses, loader version, capac
 class ProfileHooks(Protocol):
     """Called by the orchestrator for every profile; the custom workload's hooks do nothing.
 
-    reset_data          init phase, after the target checks and before prepare: put the profile's
-                        data back to its loaded state when needed (TPC-C: reload, build step 9).
+    reset_data          init phase, after the target checks and before prepare: put the data the
+                        profile needs in place (TPC-C: load it when missing or of another size,
+                        reload it when grown or changed, or always when `fresh`).
                         `extend_phase(seconds, why)` asks for more time in the init phase for it.
                         Returns evidence; `_disclosures` lines go into the report
     prepare             init phase: the data the profile needs is present, the right size and
@@ -271,7 +275,7 @@ class ProfileHooks(Protocol):
                         measure name -> value (e.g. partial_commits, tpcc_consistency_violations)
     """
 
-    async def reset_data(self, adapter: Any, extend_phase: Any = None) -> dict[str, Any]: ...
+    async def reset_data(self, adapter: Any, extend_phase: Any = None, fresh: bool = False) -> dict[str, Any]: ...
 
     async def prepare(self, adapter: Any) -> dict[str, Any]: ...
 

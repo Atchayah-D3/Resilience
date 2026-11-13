@@ -48,7 +48,7 @@ def test_growth_up_to_the_reset_limit_is_kept_and_the_reset_comes_before_the_ref
     assert data.RESET_GROWTH < data.GROWTH_LIMIT
 
 
-def test_a_reset_never_creates_or_resizes_the_data():
+def test_resettable_means_loaded_with_the_same_size():
     assert data.resettable(STATUS, 4)
     assert not data.resettable(STATUS, 8)                                  # another size: a person loads it
     assert not data.resettable({"loaded": False, "reason": "no schema"}, 4)
@@ -63,9 +63,14 @@ def test_the_reload_bound_comes_from_the_targets_own_load_time():
 # --- reset_data(): what init does --------------------------------------------------------------
 
 class FakeAdapter:
-    def __init__(self, status=STATUS, columns=COLUMNS, rules=CLEAN_RULES, checkpoint_error=None):
+    def __init__(self, status=STATUS, columns=COLUMNS, rules=CLEAN_RULES, checkpoint_error=None,
+                 free_bytes=100 * 1024 ** 3, progress=((1, 4, 10.0), (2, 4, 20.0), (4, 4, 40.0))):
         self.status, self.columns, self.rules = dict(status), columns, rules
         self.checkpoint_error, self.calls = checkpoint_error, []
+        self.free_bytes, self.progress = free_bytes, progress
+
+    async def data_fs_free_bytes(self):
+        return self.free_bytes
 
     async def tpcc_data_status(self):
         return dict(self.status)
@@ -76,11 +81,16 @@ class FakeAdapter:
     async def tpcc_consistency(self, rules, district_sample=None, seed=None):
         return {r: (self.rules or {}).get(r) for r in rules}
 
-    async def tpcc_load(self, warehouses, *, jobs=4, replace=False, progress=None, seed=None):
+    async def tpcc_load(self, warehouses, *, jobs=4, replace=False, progress=None, seed=None, on_warehouse=None):
         self.calls.append(("load", warehouses, replace))
-        self.status.update(current_orders=self.status["loaded_orders"], capacity_tps=None, load_seconds=55.0)
+        for done, total, elapsed in self.progress:
+            if on_warehouse is not None:
+                on_warehouse(done, total, elapsed)
+        self.status.update(loaded=True, warehouses=warehouses, items=data.ITEMS, loader_version=data.LOADER_VERSION,
+                           loaded_orders=30_000 * warehouses, current_orders=30_000 * warehouses,
+                           capacity_tps=None, load_seconds=55.0)
         self.columns, self.rules = COLUMNS, CLEAN_RULES
-        return {"seconds": 55.0}
+        return {"seconds": 55.0, "load_seed": 77}
 
     async def tpcc_record_capacity(self, tps):
         self.calls.append(("capacity", tps))
@@ -123,7 +133,7 @@ def test_grown_data_is_reloaded_with_more_time_asked_first_and_everything_record
     r = out["tpcc_reset"]
     assert r["reloaded"] and "grown to 1.25 times" in r["reasons"][0]
     assert r["after"]["growth"] == 1.0 and r["checkpoint"] == "done" and r["capacity_kept"] == 1472.9
-    assert len(out["_disclosures"]) == 1 and "reloaded before this run" in out["_disclosures"][0]
+    assert len(out["_disclosures"]) == 1 and "was reloaded by this run before the baseline" in out["_disclosures"][0]
 
 
 def test_a_checkpoint_that_cannot_run_is_disclosed_not_hidden():
@@ -140,12 +150,54 @@ def test_a_column_left_behind_by_a_scenario_is_reset():
     assert out["tpcc_reset"]["reloaded"] and adapter.calls[0] == ("load", 4, True)
 
 
-def test_another_size_is_not_reloaded_and_prepare_then_refuses_with_the_load_command():
-    adapter = FakeAdapter()
+# --- the harness loads the data itself (the lead's request, 13 November) ----------------------------
+
+def test_another_size_is_loaded_by_the_run_with_the_time_measured_from_the_load_itself():
+    adapter = FakeAdapter()                                         # 4 warehouses loaded, the scenario wants 8
     out, extended = _reset(adapter, warehouses=8)
-    assert out == {} and adapter.calls == [] and extended == []
-    with pytest.raises(TpccDataError, match="reload with --warehouses 8"):
-        asyncio.run(_profile(8).prepare(adapter))
+    assert adapter.calls[0] == ("load", 8, True)
+    assert ("capacity", 1472.9) not in adapter.calls               # another size: the old capacity does not apply
+    r = out["tpcc_reset"]
+    assert r["action"] == "reloaded" and "has 4 warehouses, the scenario expects 8" in r["reasons"][0]
+    # first a fixed allowance, then 3 x the expected total from the measured speed (4 of 4 in 40 s here)
+    assert extended[0][0] == data.FIRST_LOAD_ALLOWANCE_S
+    total = data.FIRST_LOAD_ALLOWANCE_S + sum(s for s, _ in extended[1:])
+    assert total == max(data.FIRST_LOAD_ALLOWANCE_S, data.load_budget_s(1, 4, 10.0), data.load_budget_s(4, 4, 40.0))
+    asyncio.run(_profile(8).prepare(adapter))                      # and the run can go on
+
+
+def test_missing_data_is_loaded_by_the_run():
+    adapter = FakeAdapter(status={"loaded": False, "reason": "schema resilience_tpcc does not exist"})
+    out, _ = _reset(adapter)
+    r = out["tpcc_reset"]
+    assert adapter.calls[0] == ("load", 4, False)                  # nothing to replace
+    assert r["action"] == "loaded" and "does not exist" in r["reasons"][0]
+    assert "was loaded by this run before the baseline" in out["_disclosures"][0] and "seed 77" in out["_disclosures"][0]
+
+
+def test_a_fresh_load_is_done_even_for_clean_data_when_asked():
+    adapter = FakeAdapter()
+    out = asyncio.run(_profile().reset_data(adapter, None, fresh=True))
+    assert out["tpcc_reset"]["reloaded"] and "--tpcc-fresh-load" in out["tpcc_reset"]["reasons"][0]
+
+
+@pytest.mark.parametrize("free, message", [
+    (1 * 1024 ** 3, "not enough free space to load 8 warehouses"),
+    (None, "could not be read"),
+])
+def test_no_load_without_enough_free_space(free, message):
+    adapter = FakeAdapter(status={"loaded": False, "reason": "no data"}, free_bytes=free)
+    with pytest.raises(TpccDataError, match=message):
+        _reset(adapter, warehouses=8)
+    assert adapter.calls == []                                     # refused before anything was changed
+
+
+def test_the_space_rule_counts_what_the_old_data_frees():
+    need = data.FREE_SPACE_MARGIN * data.expected_size_bytes(8)
+    assert data.space_problem(int(need) - 1000, 0, 8) is not None
+    assert data.space_problem(int(need) - 1000, 2000, 8) is None    # the old data is dropped first
+    assert data.load_budget_s(0, 8, 0.0) == data.FIRST_LOAD_ALLOWANCE_S
+    assert data.load_budget_s(2, 8, 30.0) == data.LOAD_BUDGET_FACTOR * 120.0 + data.RELOAD_EXTRA_S
 
 
 # --- the orchestrator: reset after the target checks, init bound extended, disclosed -------------
@@ -156,7 +208,7 @@ class SlowReset:
     def __init__(self, ask: bool):
         self.ask = ask
 
-    async def reset_data(self, adapter, extend_phase=None):
+    async def reset_data(self, adapter, extend_phase=None, fresh=False):
         if self.ask:
             extend_phase(5.0, "test reload")
         await asyncio.sleep(2.0)

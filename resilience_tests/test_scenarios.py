@@ -52,6 +52,7 @@ def test_scenario(plan_item: RunPlanItem, request: pytest.FixtureRequest) -> Non
         target_is_disposable=cfg.getoption("--target-is-disposable"),
         stop_before_fault=cfg.getoption("--stop-before-fault"),
         workload_note=tpcc_override_note(warehouses) if warehouses else None,
+        tpcc_fresh_load=cfg.getoption("--tpcc-fresh-load"),
     )
     results = asyncio.run(run_item(plan_item, profile, options))
     props = request.node.user_properties

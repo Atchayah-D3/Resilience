@@ -503,6 +503,10 @@ class TpccSupport:
         have exactly ol_cnt lines. 0 = every one is complete."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
+    async def data_fs_free_bytes(self) -> int | None:
+        """Free bytes on the target's data filesystem, or None when it cannot be read."""
+        return None
+
     async def tpcc_clock(self) -> Any:
         """The database's local time as history rows record it: the start of a run's own payments."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")

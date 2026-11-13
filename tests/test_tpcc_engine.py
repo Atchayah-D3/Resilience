@@ -290,3 +290,121 @@ def test_trial_fails_when_a_payment_lost_its_history_row_or_was_not_checked():
     assert {n: ok for n, ok, _ in trial.verdicts(s)}[name]
     assert not {n: ok for n, ok, _ in trial.verdicts({**s, "payments_missing": 1})}[name]
     assert not {n: ok for n, ok, _ in trial.verdicts({**s, "payments_checked": 0})}[name]
+
+
+# --- issue 5 (review, 13 November): planned starts, missed starts, the corrected p99 -----------------
+
+def test_the_pacer_plans_starts_and_counts_the_ones_a_gap_skipped():
+    async def go():
+        p = engine_mod.PlannedPacer(100)                 # one start planned every 10 ms
+        first = await p.acquire()
+        second = await p.acquire()
+        assert first[1] == 0 and second[1] == 0          # on schedule: nothing missed
+        assert abs((second[0] - first[0]) - 0.010) < 0.002
+        await asyncio.sleep(0.05)                        # 50 ms late: jitter, below the 0.1 s tolerance
+        jitter = await p.acquire()
+        assert jitter[1] == 0
+        second = jitter
+        await asyncio.sleep(0.3)                         # a gap: the database stuck or down
+        planned, missed = await p.acquire()
+        assert 27 <= missed <= 31                        # about 30 planned starts were never made
+        assert abs(planned - (second[0] + 0.010)) < 0.002   # this start was planned right after the last
+        t = asyncio.get_running_loop().time()
+        after = await p.acquire()                        # no burst to catch up: the pace goes on from now
+        assert after[1] == 0 and asyncio.get_running_loop().time() - t >= 0.008
+        assert (await engine_mod.PlannedPacer(None).acquire())[1] == 0   # no rate: nothing is planned
+    asyncio.run(go())
+
+
+class OutageAdapter(ScriptedAdapter):
+    """The database goes away for `down_s` once: open connections break at once and new ones are
+    refused until it is back -- as after kill -9 (a crash), not a freeze."""
+
+    def __init__(self, node, down_at, down_s):
+        super().__init__(node)
+        self.down_at, self.down_s = down_at, down_s
+        self.t0 = None
+
+    def down(self):
+        import time as _t
+        if self.t0 is None:
+            return False
+        e = _t.monotonic() - self.t0
+        return self.down_at <= e < self.down_at + self.down_s
+
+    async def session(self, endpoint=None, timeout_s=5.0, **kwargs):
+        if self.down():
+            raise ConnectionRefusedError("the database system is starting up")
+        adapter = self
+
+        class S(ScriptedSession):
+            async def tpcc_execute(self, txn_type, inputs, marker):
+                if adapter.down():
+                    self._closed = True
+                    return ("unknown", {}, None)
+                return await super().tpcc_execute(txn_type, inputs, marker)
+        return S()
+
+
+def _run_with(adapter, monkeypatch, seconds=2.4):
+    import time as _t
+    ScriptedSession.log, ScriptedSession.counts = [], Counter()
+    monkeypatch.setattr(engine_mod, "SAMPLE_INTERVAL_S", 0.2)
+    monkeypatch.setattr(engine_mod, "RECONNECT_PAUSE_S", 0.05)
+    profile = TpccProfile(_workload())
+    profile.set_run_constants(100)
+
+    async def go():
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            stream, journals = EventStream(d / "events.jsonl"), MarkerJournals(d)
+            drv = profile.make_driver(adapter, journals, stream)
+            await drv.start()
+            await asyncio.wait_for(drv.wait_until_ready(), 5)
+            adapter.t0 = _t.monotonic()
+            drv.begin_window()
+            await asyncio.sleep(seconds)
+            window = drv.end_window()
+            await drv.stop()
+            journals.close()
+            stream.close()
+            return window, [e.data for e in stream.events() if e.kind == "sample"]
+    return asyncio.run(go())
+
+
+def test_a_crash_outage_now_shows_in_the_corrected_p99_and_as_missed_starts(monkeypatch):
+    """Was (review): in a crash the connections break at once and the clerks reconnect, so no
+    slow answer exists and p99_corrected_ms equalled p99_ms; the skipped work appeared nowhere."""
+    window, samples = _run_with(OutageAdapter(NODE, down_at=0.6, down_s=0.8), monkeypatch)
+    missed = sum(s["missed"] for s in samples)
+    assert missed >= 0.8 * 400 * 0.6                     # most of the ~320 starts planned during the outage
+    assert window.p99_corrected_ms > 500 > window.p99_ms  # the 0.8 s outage is in the corrected value only
+    assert any((s["p99_corrected_ms"] or 0) > 500 for s in samples)   # seconds with no transaction have none
+
+
+def test_without_a_gap_nothing_is_missed_and_both_p99_agree(monkeypatch):
+    window, samples = _run_with(OutageAdapter(NODE, down_at=99, down_s=0), monkeypatch, seconds=1.2)
+    assert sum(s["missed"] for s in samples) == 0
+    assert window.p99_corrected_ms < 50 and abs(window.p99_corrected_ms - window.p99_ms) < 20
+
+
+class FreezeAdapter(OutageAdapter):
+    """The database stays connected but answers nothing for `down_s` once (a lock, a stall)."""
+
+    async def session(self, endpoint=None, timeout_s=5.0, **kwargs):
+        adapter = self
+
+        class S(ScriptedSession):
+            async def tpcc_execute(self, txn_type, inputs, marker):
+                while adapter.down():
+                    await asyncio.sleep(0.01)
+                return await super().tpcc_execute(txn_type, inputs, marker)
+        return S()
+
+
+def test_a_freeze_shows_in_the_corrected_p99_and_as_missed_starts(monkeypatch):
+    window, samples = _run_with(FreezeAdapter(NODE, down_at=0.6, down_s=0.8), monkeypatch)
+    assert sum(s["missed"] for s in samples) >= 0.8 * 400 * 0.6
+    # only one call per clerk was frozen (4 of several hundred, under 1%): the measured p99 does not
+    # show the freeze at all -- exactly the coordinated-omission problem -- the corrected p99 does
+    assert window.p99_corrected_ms > 500 > window.p99_ms

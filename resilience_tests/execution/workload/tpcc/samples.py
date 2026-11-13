@@ -30,15 +30,19 @@ DRIVER_LIMIT_SECONDS = 5
 
 TOTAL_FIELDS = ("commits", "errors", "indeterminate", "drops", "reconnects", "connect_failures")
 
-# Coordinated omission. Response times are measured from the moment a transaction is SENT. When
-# the database stalls, a clerk waits inside one call and does not send the transactions it was
-# due to send meanwhile; their waiting is in no measurement, so percentiles look better than what
-# users would feel. The standard correction (HdrHistogram's recordValueWithExpectedInterval, as
-# YCSB and wrk2 use): a response of L ms from a clerk due every E ms also stands for the
-# transactions it missed, recorded as L - E, L - 2E, ... (while above 0). E = clerks / rate.
-# Reported NEXT TO the measured values (p99_corrected_ms), never instead of them. Meaningful
-# when the declared rate is reachable; at an unreachable rate every response above E counts as late.
-MAX_CORRECTION_SAMPLES = 10_000      # per response: bounds memory after a very long stall
+# Coordinated omission. Response times are measured from the moment a transaction is SENT. The
+# scenario's rate stands for requests ARRIVING at the planned times (customers do not stop
+# arriving because the database is slow); while the database is stuck -- frozen, or down and
+# being reconnected to -- the clerks send nothing, so the requests planned meanwhile appear in
+# no measurement and percentiles look better than what users would feel. The correction, from
+# the pacing's planned start times (engine.PlannedPacer): the first transaction after a gap is
+# timed from its PLANNED start, and the planned starts that were skipped are recorded too, as
+# L - I, L - 2I, ... (I = the planned interval; HdrHistogram's recordValueWithExpectedInterval,
+# as YCSB and wrk2 use), and counted as `missed`. Reported NEXT TO the measured values
+# (p99_corrected_ms), never instead of them. Meaningful when the declared rate is reachable; at
+# an unreachable rate (a maximum-load trial) nearly every planned start is late.
+MAX_CORRECTION_SAMPLES = 10_000      # per gap: bounds memory after a very long stall
+MAX_CORRECTED_PER_INTERVAL = 50_000  # per 1 s sample of one process; beyond it the value is a lower bound
 
 
 def corrected_latencies(latency_ms: float, expected_ms: float | None) -> list[float]:
@@ -88,6 +92,8 @@ def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None) -> 
     journal = [v for r in raws for v in r["journal_ms"]]
     tps = _rate(raws, lambda r: r["totals"]["commits"])
     corrected = [v for r in raws for v in r.get("corrected", r["latencies"])]
+    missed = sum(r.get("missed", 0) for r in raws)
+    capped = any(r.get("corrected_capped") for r in raws)
 
     by_type: dict[str, Any] = {}
     for t in contract.TPCC_TYPES:
@@ -113,7 +119,7 @@ def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None) -> 
     return {"interval_s": interval, **totals, "tps": tps,
             "p99_ms": p99(lat), "journal_p99_ms": p99(journal),
             "p50_ms": percentile(lat, 0.50), "p95_ms": percentile(lat, 0.95),
-            "p99_corrected_ms": p99(corrected),
+            "p99_corrected_ms": p99(corrected), "missed": missed, "corrected_capped": capped,
             contract.BY_TYPE: by_type, contract.BY_GROUP: by_group}
 
 
@@ -127,7 +133,7 @@ def merge_window(raws: Iterable[dict[str, Any]], duration_s: float) -> dict[str,
     totals = {f: sum(r["totals"][f] for r in raws) for f in TOTAL_FIELDS}
     tps = _rate(raws, lambda r: r["totals"]["commits"])
     corrected = [v for r in raws for v in r.get("corrected", r["latencies"])]
-    return {"duration_s": duration_s, **totals, "tps": tps,
+    return {"duration_s": duration_s, **totals, "tps": tps, "missed": sum(r.get("missed", 0) for r in raws),
             "p99_ms": p99(lat), "journal_p99_ms": p99(journal),
             "p50_ms": percentile(lat, 0.50), "p95_ms": percentile(lat, 0.95),
             "p99_corrected_ms": p99(corrected)}
