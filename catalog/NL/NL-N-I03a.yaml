@@ -23,7 +23,8 @@
 #   4 other_tables_tps_lost_pct <= 10: what the others lost over the minute after the schema change
 #   5 blocker_visible: the server names the schema change and what it waits for
 #   6 rto_to_slo_s <= 60: back to normal (TPS >= 95% of baseline, p99 <= 1.5x, 60 s straight --
-#     the document's working definition) within 60 s of the queue clearing
+#     the document's working definition) within 60 s of the queue clearing. TPS is judged over
+#     the 60 s window, p99 in every second of it (LockPileupFault.slo_tps_window_s)
 #   7 probe_column_absent: the probe column is gone after the run (and cleanup's revert keeps the
 #     ledger entry outstanding while one is left); harness_sessions_left == 0 (table 20)
 #   8 rpo_txn == 0, corruption_count == 0, structural_integrity_errors == 0 (Framework §16.3),
@@ -47,8 +48,8 @@ environment:
   env_sensitive: false
 
 steady_state:
-  tps_min: 45
-  p99_latency_ms_max: 3000
+  tps_min: 45                    # ~75% of rate_tps (as 150 of 200 in NL-C-01)
+  p99_latency_ms_max: 3000       # re-baselined on TPC-C at 60 TPS on .112 (measured p99 ~1.6 s, spikes ~2.5 s); NEEDS SIGN-OFF
   duration_s: 120                # the document: 2 minutes of undisturbed baseline
   warmup_s: 300                  # the document (table 0): 5 minutes of warm-up, not measured
 
@@ -56,11 +57,11 @@ workload:
   profile: tpcc                  # the document: TPC-C-like workload, New-Order ... Stock-Level
   concurrency: 64
   transaction_markers: true
-  rate_tps: 60                  # NEEDS SIGN-OFF: the document asks ~60% of the target's measured
+  rate_tps: 60                   # NEEDS SIGN-OFF: the document asks ~60% of the target's measured
                                  # maximum (tpcc.capacity); set it from that result
   latency_from: intended_start   # the document: latency from when the transaction should have started
   tpcc:
-    warehouses: 64              # must equal the loaded data (standard size: 5 per clerk)
+    warehouses: 64               # must equal the loaded data (loaded on .112: 64)
 
 fault:
   type: lock_pileup

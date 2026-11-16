@@ -3,14 +3,23 @@
 Scenario sessions (resilience_tests/test_scenarios.py) -> DIR/scenarios-junit.xml (the CI
 gate input), DIR/gate.txt (the P0 decision), DIR/index.html (links to each run's report.html).
 Other tests (the harness unit tests) -> DIR/unit-summary.html; their JUnit XML is pytest's own
---junitxml. Reporting never changes a test outcome; a reporting failure is printed."""
+--junitxml. Reporting never changes a test outcome; a reporting failure is printed.
+
+A scenario session (one given --env) writes its reports without being asked: when --report-dir
+is not given, DIR is reports/<UTC date-time>/, so every session keeps its own folder. Each run's
+report.html is copied into DIR/runs/ and the index links to the copy, so DIR is complete on its
+own (it can be copied off the harness host and opened anywhere)."""
 
 from __future__ import annotations
 
+import datetime as dt
+import shutil
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+DEFAULT_REPORT_ROOT = Path("reports")
 
 SCENARIO_TEST = "test_scenarios.py::test_scenario"
 
@@ -21,15 +30,34 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="write JUnit XML / HTML reports for this session into DIR (Arch §10.4)")
 
 
+def default_report_dir(now: dt.datetime | None = None) -> Path:
+    """reports/<UTC date-time>: one folder per scenario session, never overwritten."""
+    return DEFAULT_REPORT_ROOT / (now or dt.datetime.now(dt.UTC)).strftime("%Y%m%dT%H%M%SZ")
+
+
+def report_dir_for(config: pytest.Config) -> Path | None:
+    """--report-dir when given; otherwise the default folder for a scenario session (--env
+    given); otherwise none (the unit tests write no reports unless asked)."""
+    given = config.getoption("--report-dir")
+    if given:
+        return Path(given)
+    if config.getoption("--env", default=None):
+        return default_report_dir()
+    return None
+
+
 def pytest_configure(config: pytest.Config) -> None:
-    if config.getoption("--report-dir") and not hasattr(config, "workerinput"):
-        config.pluginmanager.register(ReportCollector(config), "resilience-report-collector")
+    if hasattr(config, "workerinput"):
+        return
+    report_dir = report_dir_for(config)
+    if report_dir is not None:
+        config.pluginmanager.register(ReportCollector(config, report_dir), "resilience-report-collector")
 
 
 class ReportCollector:
-    def __init__(self, config: pytest.Config) -> None:
+    def __init__(self, config: pytest.Config, report_dir: Path) -> None:
         self.config = config
-        self.dir = Path(config.getoption("--report-dir"))
+        self.dir = report_dir
         self.records: dict[str, dict[str, Any]] = {}
         self.lines: list[str] = []
 
@@ -53,6 +81,8 @@ class ReportCollector:
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         scenario = [r for r in self.records.values() if SCENARIO_TEST in r["nodeid"]]
         unit = [r for r in self.records.values() if SCENARIO_TEST not in r["nodeid"]]
+        if not scenario and not unit:       # nothing ran (e.g. --collect-only): no empty folder
+            return
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
             if scenario:
@@ -74,7 +104,7 @@ class ReportCollector:
             case_id = r["nodeid"].split("[", 1)[1][:-1] if "[" in r["nodeid"] else r["nodeid"]
             props = r["props"]
             if props.get("results"):
-                cases.append(case_from_run(case_id, props["results"], report_path=props.get("report"),
+                cases.append(case_from_run(case_id, props["results"], report_path=self._copy_run_report(props),
                                            report_error=props.get("report_error")))
             elif r["outcome"] == "skipped":
                 cases.append(case_from_skip(case_id, r["message"], lookup))
@@ -86,9 +116,26 @@ class ReportCollector:
         gate_text = gate.render(decision)
         (self.dir / "gate.txt").write_text(gate_text + "\n")
         index = render_index(cases, self.dir / "index.html", gate_text=gate_text)
-        self.lines += [f"scenario JUnit XML: {xml}", f"scenario index:     {index}",
+        self.lines += [f"report folder:      {self.dir}",
+                       f"scenario JUnit XML: {xml}", f"scenario index:     {index}",
                        f"run reports:        {sum(1 for c in cases if c.report_path)} of {len(cases)} cases",
                        gate_text.splitlines()[0]]
+
+    def _copy_run_report(self, props: dict[str, Any]) -> str | None:
+        """Copy the run's report.html to DIR/runs/<run folder name>.html and return the copy's
+        path (the index links to it). The page is self-contained (inline CSS and SVG), so the
+        copy reads the same anywhere. If the copy fails, the original is linked instead."""
+        source = props.get("report")
+        if not source:
+            return None
+        try:
+            target = self.dir / "runs" / f"{Path(props['results']).name}.html"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            return str(target)
+        except OSError as exc:
+            self.lines.append(f"run report not copied ({source}): {type(exc).__name__}: {exc}")
+            return source
 
     def _unit_report(self, records: list[dict[str, Any]]) -> None:
         from resilience_tests.reporting.html import render_unit_summary

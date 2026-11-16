@@ -339,6 +339,62 @@ def test_a_crash_restart_in_the_log_is_counted_and_no_log_is_not_measured():
     assert m["server_crash_restarts"] is NOT_MEASURED
 
 
+def _bursty(t0: int, n: int, counts: list[int], p99_ms: float = 5.0) -> list[Event]:
+    """n consecutive 1 s workload samples after t0 whose commit counts cycle through `counts`."""
+    return [ev(t0 + (i + 1) * S, "workload", "sample", interval_s=1.0, commits=counts[i % len(counts)],
+               tps=float(counts[i % len(counts)]), p99_ms=p99_ms) for i in range(n)]
+
+
+def test_back_to_normal_judges_tps_over_the_60_s_window_not_each_second():
+    b = behaviour(state(), "NL-N-I03a")
+    window = b.slo_tps_window_s()
+    assert window == rto_decomposer.SLO_SUSTAIN_S
+    baseline = rto_decomposer.Baseline(60.0, 100.0)
+    # 60 TPS delivered in bursts (30 / 90 per second): every other second is under 95%, the
+    # per-second form never finds a window; over 60 s the service is at 100% of its baseline
+    samples = _bursty(T0, 70, [30, 90])
+    assert rto_decomposer.slo_recovery(samples, T0, baseline, tps_fraction=0.95) == (None, None)
+    assert rto_decomposer.slo_recovery(samples, T0, baseline, tps_fraction=0.95,
+                                       tps_window_s=window) == (0.0, 60.0)
+
+
+def test_the_60_s_window_still_fails_a_service_below_95_percent():
+    baseline = rto_decomposer.Baseline(60.0, 100.0)
+    # 56 TPS on average (93%): steady or bursty, it is not back to normal
+    for counts in ([56], [26, 86]):
+        samples = _bursty(T0, 90, counts)
+        assert rto_decomposer.slo_recovery(samples, T0, baseline, tps_fraction=0.95, tps_window_s=60.0) == (None, None)
+
+
+def test_the_60_s_window_holds_p99_in_every_second_and_breaks_on_gaps_and_starved_samples():
+    baseline = rto_decomposer.Baseline(60.0, 100.0)
+    samples = _bursty(T0, 90, [60])
+    # one second with p99 above 1.5x: the window can only start after it
+    slow = [ev(e.t_mono_ns, "workload", "sample", **{**e.data, "p99_ms": 151.0}) if i == 9 else e
+            for i, e in enumerate(samples)]
+    assert rto_decomposer.slo_recovery(slow, T0, baseline, tps_fraction=0.95, tps_window_s=60.0)[0] == 10.0
+    # a missing sample breaks the window (what happened in it is unknown)
+    gapped = samples[:30] + samples[31:]
+    assert rto_decomposer.slo_recovery(gapped, T0, baseline, tps_fraction=0.95, tps_window_s=60.0) == (None, None)
+    # a starved sampler (5 s interval) cannot certify the window it averages over
+    starved = [ev(e.t_mono_ns, "workload", "sample", **{**e.data, "interval_s": 5.0}) if i == 20 else e
+               for i, e in enumerate(samples)]
+    assert rto_decomposer.slo_recovery(starved, T0, baseline, tps_fraction=0.95, tps_window_s=60.0)[0] == 21.0
+
+
+def test_the_baseline_check_uses_the_same_window_rule():
+    baseline = rto_decomposer.Baseline(60.0, 100.0)
+    samples = _bursty(T0, 119, [30, 90])
+    per_second = rto_decomposer.baseline_slo_check(samples, T0, T0 + 120 * S, baseline, 0.95)
+    windowed = rto_decomposer.baseline_slo_check(samples, T0, T0 + 120 * S, baseline, 0.95, tps_window_s=60.0)
+    assert not per_second.sustained_window_found and windowed.sustained_window_found
+    assert windowed.compliant == per_second.compliant      # per-second evidence is unchanged
+
+
+def test_scenarios_other_than_lock_pileup_keep_the_per_second_rule():
+    assert faults_base.FaultBehaviour.slo_tps_window_s(object()) is None
+
+
 def test_back_to_normal_is_the_documents_95_percent_watched_long_enough_to_judge_60_s():
     b = behaviour(state(), "NL-N-I03a")
     assert b.slo_tps_fraction() == 0.95

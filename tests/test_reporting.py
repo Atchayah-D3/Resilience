@@ -283,3 +283,48 @@ def test_unit_summary_counts_and_failures(tmp_path):
     html = render_unit_summary(rows, tmp_path / "u.html", now=NOW).read_text()
     assert "passed: 1" in html and "failed: 1" in html and "skipped: 1" in html
     assert "assert 1 == 2" in html and "tests/a.py::t2" in html
+
+
+# --- automatic report folder for scenario sessions (reporting/plugin.py) ---
+
+class _Config:
+    def __init__(self, **opts):
+        self.opts = opts
+
+    def getoption(self, name, default=None):
+        return self.opts.get(name.lstrip("-").replace("-", "_"), default)
+
+
+def test_a_scenario_session_gets_its_own_report_folder_without_being_asked():
+    from resilience_tests.reporting import plugin
+    assert plugin.default_report_dir(NOW) == Path("reports/20261007T090000Z")
+    auto = plugin.report_dir_for(_Config(env="e2-dedicated-vm-u22-2"))
+    assert auto is not None and auto.parent == Path("reports")
+    # an explicit --report-dir wins; the unit tests (no --env) write nothing unless asked
+    assert plugin.report_dir_for(_Config(env="e2", report_dir="out/x")) == Path("out/x")
+    assert plugin.report_dir_for(_Config()) is None
+
+
+def test_the_report_folder_holds_a_copy_of_each_runs_page_and_the_index_links_it(tmp_path):
+    from resilience_tests.reporting.plugin import ReportCollector
+    run = write_run(tmp_path, rules=[PASS_RULE], name="NL-C-01-20261007T090000Z-abcdef")
+    page = render_run(run, now=NOW)
+    out = tmp_path / "reports" / "20261007T090000Z"
+    collector = ReportCollector(_Config(), out)
+    collector.records = {"n": {"nodeid": "resilience_tests/test_scenarios.py::test_scenario[NL-C-01[E2]]",
+                               "outcome": "passed", "duration_s": 1.0, "message": "",
+                               "props": {"results": str(run), "report": str(page)}}}
+    collector.pytest_sessionfinish(None, 0)
+    copy = out / "runs" / f"{run.name}.html"
+    assert copy.read_text(encoding="utf-8") == page.read_text(encoding="utf-8")
+    index = (out / "index.html").read_text(encoding="utf-8")
+    assert f'runs/{run.name}.html' in index and (out / "scenarios-junit.xml").exists()
+    assert any(line.startswith("report folder:") for line in collector.lines)
+
+
+def test_a_run_page_that_cannot_be_copied_is_still_linked_at_its_original_place(tmp_path):
+    from resilience_tests.reporting.plugin import ReportCollector
+    collector = ReportCollector(_Config(), tmp_path / "out")
+    missing = tmp_path / "gone" / "report.html"
+    assert collector._copy_run_report({"results": str(tmp_path / "run"), "report": str(missing)}) == str(missing)
+    assert collector.lines and "not copied" in collector.lines[0]
