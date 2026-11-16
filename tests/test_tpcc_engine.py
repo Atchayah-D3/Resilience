@@ -422,6 +422,7 @@ def test_latency_from_the_intended_start_puts_a_freeze_in_the_measured_p99_witho
 def test_a_freeze_shows_in_the_corrected_p99_and_as_missed_starts(monkeypatch):
     window, samples = _run_with(FreezeAdapter(NODE, down_at=0.6, down_s=0.8), monkeypatch)
     assert sum(s["missed"] for s in samples) >= 0.8 * 400 * 0.6
-    # only one call per clerk was frozen (4 of several hundred, under 1%): the measured p99 does not
-    # show the freeze at all -- exactly the coordinated-omission problem -- the corrected p99 does
-    assert window.p99_corrected_ms > 500 > window.p99_ms
+    # only one call per clerk was frozen (4 of a few hundred): the measured figures do not show the
+    # freeze -- exactly the coordinated-omission problem -- the corrected p99 does. Judged on p95: on a
+    # busy machine fewer than 400 transactions complete, and 4 frozen calls are then above 1% (p99)
+    assert window.p99_corrected_ms > 500 > window.p95_ms

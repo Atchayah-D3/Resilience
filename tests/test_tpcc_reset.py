@@ -72,6 +72,16 @@ class FakeAdapter:
     async def data_fs_free_bytes(self):
         return self.free_bytes
 
+    # the layout and capacity records of NL-N-I01 (tpcc/sizing.py); none stored here
+    def set_tpcc_layout(self, layout):
+        self.layout = layout
+
+    async def tpcc_cache_bytes(self):
+        return None
+
+    async def tpcc_capacity_records(self):
+        return list(getattr(self, "records", []))
+
     async def tpcc_data_status(self):
         return dict(self.status)
 
@@ -121,7 +131,9 @@ def _reset(adapter, warehouses=4):
 def test_clean_data_is_used_as_it_is():
     adapter = FakeAdapter()
     out, extended = _reset(adapter)
-    assert out == {"tpcc_reset": {"reloaded": False, "growth": 130_000 / 120_000, "size_bytes": 4e8}}
+    assert out["tpcc_reset"] == {"reloaded": False, "growth": 130_000 / 120_000, "size_bytes": 4e8}
+    # the run's layout is recorded too (NL-N-I01): here 4 warehouses, every one used by the clerks
+    assert out["tpcc_layout"]["warehouses"] == 4 and out["tpcc_layout"]["active_warehouses"] is None
     assert adapter.calls == [] and extended == []
 
 

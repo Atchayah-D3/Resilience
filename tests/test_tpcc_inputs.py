@@ -257,6 +257,9 @@ def test_prepare_sets_run_constants_that_obey_clause_2_1_6_1():
         async def tpcc_data_status(self):
             return status
 
+        def set_tpcc_layout(self, layout):
+            pass
+
         async def tpcc_install_functions(self):
             pass
 

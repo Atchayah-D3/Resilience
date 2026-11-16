@@ -24,7 +24,7 @@ FORMER_UNATTENDED_FAULTS = {"process_kill", "service_restart", "config_reload", 
 FORMER_FAULT_FACT_KEY = {"idle_in_transaction": "idle_transaction", "connection_exhaustion": "connection_exhaustion",
                          "data_corruption": "data_corruption"}
 # fault types built after the move, with the fact key each keeps its detail under
-ADDED_FAULT_FACT_KEY = {"lock_pileup": "lock_pileup"}
+ADDED_FAULT_FACT_KEY = {"lock_pileup": "lock_pileup", "analytics_load": "analytics_load"}
 ALL_FAULT_TYPES = set(FaultType.__args__)
 
 
@@ -193,6 +193,7 @@ def test_the_report_names_no_fault_and_each_fault_supplies_its_own_section():
     a new fault meant editing the report. Each behaviour supplies its own section, and the report
     is handed them when it is written -- it keeps no list that importing a module fills in."""
     from resilience_tests.analysis import report
+    from resilience_tests.control.faults.analytics import AnalyticsLoadFault
     from resilience_tests.control.faults.corruption import DataCorruption
     from resilience_tests.control.faults.during import Checkpoint
     from resilience_tests.control.faults.idle_transaction import IdleTransaction
@@ -200,7 +201,7 @@ def test_the_report_names_no_fault_and_each_fault_supplies_its_own_section():
 
     sections = faults.summary_sections()
     assert [s.__func__ for s in sections] == [
-        DataCorruption.summary_lines.__func__, IdleTransaction.summary_lines.__func__,
+        AnalyticsLoadFault.summary_lines.__func__, DataCorruption.summary_lines.__func__, IdleTransaction.summary_lines.__func__,
         LockPileupFault.summary_lines.__func__, Checkpoint.summary_lines.__func__]
     source = Path(report.__file__).read_text()
     for fact_key in ("checkpoint_injection", "idle_transaction", "data_corruption"):

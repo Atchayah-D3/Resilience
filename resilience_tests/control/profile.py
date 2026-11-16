@@ -83,6 +83,10 @@ class Node(_Model):
     # extension -- the harness never installs anything -- and must be checkable within the
     # validate phase bound.
     integrity_databases: list[str] | None = Field(default=None, min_length=1)
+    # The login report sessions use (NL-N-I01, fault type analytics_load): a role the operator
+    # created with its own limits. Its password comes from ~/.pgpass, never from the profile.
+    # Required when the profile lists the infrastructure feature `analytics_login`.
+    analytics: DbEndpoint | None = None
 
 
 class DriverHost(_Model):
@@ -194,6 +198,8 @@ class EnvProfile(_Model):
         re.compile(self.safety.allowlist.hostname_pattern)
         if self.driver_host.host in {n.ssh.host for n in self.nodes} | {n.db.host for n in self.nodes}:
             raise ValueError("driver_host must not be a node under test (Arch §6.2)")
+        if "analytics_login" in self.infra and any(n.analytics is None for n in self.nodes):
+            raise ValueError("infra analytics_login needs every node's `analytics` endpoint (the report login)")
         return self
 
     def node(self, name: str) -> Node:

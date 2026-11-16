@@ -9,6 +9,7 @@ attribute is read from the run at the moment it is used.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from resilience_tests.analysis.predicates import NOT_MEASURED
@@ -58,6 +59,11 @@ class RunContext:
     def disclosures(self) -> list[str]:
         """Limitations of this run, printed with its verdict."""
         return self._run.disclosures
+
+    @property
+    def run_dir(self) -> Path:
+        """The run's evidence folder (journals, events), for measures read from the evidence."""
+        return self._run.run_dir
 
     @property
     def baseline(self) -> MeasuredWindow | None:

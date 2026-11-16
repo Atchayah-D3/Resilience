@@ -90,6 +90,9 @@ class FakeTpccAdapter:
     def __init__(self, status, consistency=None):
         self.status, self.consistency, self.calls = status, consistency or {1: 0, 2: 0, 3: 0, 4: 0}, []
 
+    def set_tpcc_layout(self, layout):
+        self.layout = layout
+
     async def tpcc_data_status(self):
         return self.status
 

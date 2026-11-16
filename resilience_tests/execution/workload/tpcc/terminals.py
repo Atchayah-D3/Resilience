@@ -22,7 +22,8 @@ from resilience_tests.execution.workload.tpcc.inputs import DISTRICTS
 def place_clerks(workload: Workload) -> list[Terminal]:
     if workload.tpcc is None:
         raise ValueError("clerk placement needs workload.tpcc (warehouses, ...)")
-    warehouses = workload.tpcc.warehouses
+    # the warehouses the clerks use: the active ones when the scenario sets them (sizing.py)
+    warehouses = int(workload.tpcc.active_warehouses or workload.tpcc.warehouses)
     pinned = dict(workload.tpcc.home_warehouse)          # group -> warehouse
     groups = group_of_workers(workload)
     free = [w for w in range(1, warehouses + 1) if w not in set(pinned.values())]

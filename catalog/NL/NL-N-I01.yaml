@@ -1,0 +1,139 @@
+# NL-N-I01 -- Noisy analytics against priority customer work (internal NL-N scenario, modelled on the
+# Framework's NL-N-07 row of Framework §10.6; the team numbers the new noisy-neighbour list itself).
+# Plan: docs/Noisy Neighbour/Resilience Scenario 1 Noisy analytics vs priority OLTP.md (3 November 2026);
+# Spec Kit feature specs/006-nl-n-i01-noisy-analytics.
+#
+# Big reports of a separate login, limited by the operator, run for 5 minutes on the same TPC-C tables
+# the customers use, and compete with them for CPU, the memory cache and the disk:
+#   full-table sessions (Q1 -> Q2 -> Q3)  read the whole of order_line with 2 helpers each, sort to
+#                                          temporary files; one per three cores (by_cores)
+#   one index session (Q4)                 reads old orders of the warehouses the customers do not use,
+#                                          pulling cold pages into the memory cache
+#   the two limit tests                    the first query of full-table sessions 1 and 2: a sort that
+#                                          needs more than temp_file_limit, a query longer than
+#                                          statement_timeout
+# The sizes are calculated from the target at every run, never written here (tpcc/sizing.py):
+# order_line about 8 x the memory cache; the customers use only as many warehouses as fit in half of
+# it; their rate is 60% of the maximum the capacity test stored for that layout (run it first:
+# python -m resilience_tests.execution.workload.tpcc.capacity --env <env> --clerks 64
+#   --active-warehouses by_cache).
+#
+# Invalid (stopped, never a pass): the login cannot log in or allows fewer sessions than needed; a limit
+# the limit tests need is not set; the customers' baseline cache hit ratio is below 99%; the baseline
+# missed the planned rate; the reports cannot occupy every core.
+#
+# Judged (document section 9):
+#   1 fault_confirmed: at minute 1 every report session active, helpers working
+#   2 oltp_tps_ratio >= 0.70 and 3 oltp_p99_ratio <= 2.0           Framework §10.6 NL-N-07
+#   4 customer_p90_max_s <= 5.0: 90% of New-Order, Payment, Order-Status within 5 s (TPC-C Clause 5.2.5.3)
+#   5 customer_cache_hit_ratio_vs_baseline >= 0.80                  Framework §10.6 NL-N-07
+#   6 helpers_over_limit == 0: no report has more helpers than the login allows
+#   7 temp_limit_enforced (53400) and 8 statement_timeout_enforced (57014 within 1 s; NEEDS SIGN-OFF)
+#   9 customer_limit_errors == 0: no customer stopped by 53300, 53400 or 57014
+#  10 rto_to_slo_s <= 60: TPS >= 95%, p99 <= 1.5x, 60 s straight (NEEDS SIGN-OFF)
+#  11 rpo_txn, corruption_count, structural_integrity_errors (Framework §16.3), the TPC-C gates
+# Also judged: no report session and no temporary file left, settings unchanged.
+id: NL-N-I01
+name: Noisy analytics against priority customer work
+tier: node_local
+category: NL-N
+applies_to: [standalone]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false
+
+requires: [transactional_markers, structural_integrity_check, tpcc_workload, analytics_sessions]
+needs_infra: [analytics_login]
+
+steady_state:
+  tps_min: 50                    # floor, not a throughput target; the planned rate is checked before the fault
+  p99_latency_ms_max: 3000
+  duration_s: 600                # the document: 10 minutes of undisturbed baseline
+  warmup_s: 300                  # the document: 5 minutes of warm-up, not measured
+
+workload:
+  profile: tpcc                  # the document: the TPC-C-like workload, all five types are the customers
+  concurrency: 64
+  transaction_markers: true
+  rate_fraction_of_capacity: 0.6 # the document: about 60% of the measured maximum (NEEDS SIGN-OFF, Framework §7.5)
+  latency_from: intended_start   # the document: latency from when the transaction should have started
+  tpcc:
+    warehouses: by_cache
+    order_line_cache_multiple: 8 # the document: order_line about 8 x the memory cache
+    active_warehouses: by_cache
+    active_cache_share: 0.5      # the document: the customers' warehouses about half the memory cache
+
+fault:
+  type: analytics_load
+  section: os_ssh
+  target: primary
+  duration: 300                  # the document: a 5-minute fault (Framework §10.6 NL-N-07)
+  analytics_load:
+    full_table_sessions: by_cores
+    index_sessions: 1
+    limit_tests: true
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - rto_to_slo_s
+  - corruption_count
+  - structural_integrity_errors
+  - fault_confirmed
+  - oltp_tps_ratio
+  - oltp_p99_ratio
+  - customer_p90_max_s
+  - customer_cache_hit_ratio_baseline   # reported
+  - customer_cache_hit_ratio_hold       # reported
+  - customer_cache_hit_ratio_vs_baseline
+  - report_helpers_max                  # reported
+  - helpers_over_limit
+  - analytics_active_share              # reported: share of samples with every report session open
+  - temp_limit_enforced
+  - statement_timeout_enforced
+  - statement_timeout_overrun_s         # reported
+  - customer_limit_errors
+  - analytics_sessions_left
+  - temp_files_left
+  - settings_unchanged
+  - missed_transactions                 # reported: planned starts a stall skipped
+  - partial_commits
+  - tpcc_consistency_violations
+  - aborted_markers_present
+
+accept:
+  - fault_confirmed == true
+  - oltp_tps_ratio >= 0.70
+  - oltp_p99_ratio <= 2.0
+  - customer_p90_max_s <= 5.0
+  - customer_cache_hit_ratio_vs_baseline >= 0.80
+  - helpers_over_limit == 0
+  - temp_limit_enforced == true
+  - statement_timeout_enforced == true
+  - customer_limit_errors == 0
+  - rto_to_slo_s <= 60
+  - rpo_txn == 0
+  - corruption_count == 0
+  - structural_integrity_errors == 0
+  - partial_commits == 0
+  - tpcc_consistency_violations == 0
+  - aborted_markers_present == 0
+  - analytics_sessions_left == 0
+  - temp_files_left == 0
+  - settings_unchanged == true
+
+priority: P0
+
+description: >
+  Report sessions of a separate, limited login run big reads on the TPC-C tables for 5 minutes next
+  to the customer workload. The customers must keep at least 70% of their TPS, at most 2x their p99,
+  90% of their main transactions within 5 s and at least 80% of their cache hit ratio; the login's
+  temp_file_limit and statement_timeout must stop its oversized reports and nobody else; service must
+  be back to normal within 60 s, with nothing lost or damaged. Internal scenario of category NL-N,
+  modelled on the Framework's noisy-analytics row (Framework §10.6).

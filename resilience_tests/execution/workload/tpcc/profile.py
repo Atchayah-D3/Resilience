@@ -34,7 +34,7 @@ from resilience_tests.execution.workload.markers import (
     journal_paths,
     read_journal,
 )
-from resilience_tests.execution.workload.tpcc import checks, data, inputs
+from resilience_tests.execution.workload.tpcc import checks, data, inputs, sizing
 from resilience_tests.execution.workload.tpcc.samples import choose_processes
 from resilience_tests.execution.workload.tpcc.terminals import place_clerks
 from resilience_tests.execution.workload.profiles.base import (
@@ -71,6 +71,64 @@ class TpccProfile(WorkloadProfile):
         self.history_since: Any = None                           # database time at prepare: this run's payments
         self._terminals: list[Terminal] | None = None
         self._clerks: dict[int, tuple[random.Random, inputs.Deck]] = {}
+        # the layout this run uses (tpcc/sizing.py): calculated from the target when a size is
+        # `by_cache`, then self.workload carries numbers only (resolve_layout)
+        self.layout: sizing.Layout | None = None
+        self.rate: dict[str, Any] | None = None                  # the rate taken from the stored maximum
+
+    async def resolve_layout(self, adapter: Any) -> sizing.Layout:
+        """The layout of this run, calculated once from the target (its memory cache) when the
+        scenario states rules (`by_cache`), and handed to the adapter, so a fault acting on the same
+        data uses the same warehouses (NL-N-I01's reports). From here on self.workload carries
+        numbers only, so every later step (data step, checks, clerks, engine) reads one layout."""
+        assert self.workload.tpcc is not None
+        if self.layout is None:
+            cache = await adapter.tpcc_cache_bytes() if sizing.needs_cache(self.workload.tpcc) else None
+            try:
+                self.layout = sizing.resolve_layout(self.workload.tpcc, cache)
+            except sizing.SizingError as exc:
+                raise TpccDataError(str(exc)) from None
+            self.workload = self.workload.model_copy(
+                update={"tpcc": sizing.resolved_options(self.workload.tpcc, self.layout)})
+            self._terminals = None
+        adapter.set_tpcc_layout(self.layout.as_dict())
+        return self.layout
+
+    @property
+    def clerk_warehouses(self) -> int:
+        """The warehouses the clerks work on (1 .. this): the active ones, or every warehouse."""
+        assert self.workload.tpcc is not None
+        tpcc = self.workload.tpcc
+        return int(tpcc.active_warehouses or tpcc.warehouses)
+
+    async def resolve_rate(self, adapter: Any) -> dict[str, Any] | None:
+        """`rate_fraction_of_capacity`: the rate is that share of the maximum the capacity test
+        stored for this layout (the same clerks, loaded warehouses and active warehouses). Without
+        such a record the run is refused with the command that measures it -- never a guessed rate."""
+        fraction = self.workload.rate_fraction_of_capacity
+        if fraction is None or self.rate is not None:
+            return self.rate
+        assert self.workload.tpcc is not None
+        tpcc = self.workload.tpcc
+        records = await adapter.tpcc_capacity_records()
+        match = [r for r in records if r["clerks"] == self.workload.concurrency and r["warehouses"] == tpcc.warehouses
+                 and (r["active_warehouses"] or None) == (tpcc.active_warehouses or None)]
+        if not match:
+            active = f" on {tpcc.active_warehouses} active" if tpcc.active_warehouses else ""
+            option = f" --active-warehouses {tpcc.active_warehouses}" if tpcc.active_warehouses else ""
+            raise TpccDataError(
+                f"workload.rate_fraction_of_capacity needs the maximum measured for {self.workload.concurrency} clerks"
+                f"{active} of {tpcc.warehouses} warehouses, and none is stored on this target; measure it with: "
+                f"python -m resilience_tests.execution.workload.tpcc.capacity --env <env> "
+                f"--clerks {self.workload.concurrency}{option}")
+        record = max(match, key=lambda r: r["measured_at"])
+        rate = round(fraction * record["tps"], 1)
+        # a valid workload on its own (worker processes validate it again): the rate as a number,
+        # the share kept in self.rate for the evidence
+        self.workload = self.workload.model_copy(update={"rate_tps": rate, "rate_fraction_of_capacity": None})
+        self.rate = {"fraction": fraction, "capacity_tps": record["tps"], "measured_at": record["measured_at"],
+                     "rate_tps": rate}
+        return self.rate
 
     def set_run_constants(self, c_last_load: int) -> inputs.RunConstants:
         """The run's NURand constants, chosen against the load's C_LAST constant (Clause 2.1.6.1)."""
@@ -91,7 +149,9 @@ class TpccProfile(WorkloadProfile):
         this size before, else a first allowance and then the load's own measured speed. After:
         a CHECKPOINT. Every load is recorded and disclosed."""
         assert self.workload.tpcc is not None
-        warehouses = self.workload.tpcc.warehouses
+        layout = await self.resolve_layout(adapter)
+        layout_fact = {"tpcc_layout": layout.as_dict()}
+        warehouses = layout.warehouses
         status = await adapter.tpcc_data_status()
         same_size = data.resettable(status, warehouses)
         columns = rules = None
@@ -104,7 +164,8 @@ class TpccProfile(WorkloadProfile):
                   "growth": data.growth(status) if status.get("loaded") else None,
                   "size_bytes": status.get("size_bytes")}
         if action == "use":
-            return {"tpcc_reset": {"reloaded": False, "growth": before["growth"], "size_bytes": before["size_bytes"]}}
+            return {"tpcc_reset": {"reloaded": False, "growth": before["growth"], "size_bytes": before["size_bytes"]},
+                    **layout_fact}
 
         free = await adapter.data_fs_free_bytes()
         problem = data.space_problem(free, int(status.get("size_bytes") or 0) if status.get("loaded") else 0, warehouses)
@@ -132,9 +193,14 @@ class TpccProfile(WorkloadProfile):
                 f"{data.LOAD_BUDGET_FACTOR:g} x the expected total plus {data.RELOAD_EXTRA_S:.0f} s")
 
         capacity = status.get("capacity_tps") if same_size else None
+        # same target, same size: the maxima measured per layout still hold
+        records = await adapter.tpcc_capacity_records() if same_size else []
         started = time.monotonic()
         load = await adapter.tpcc_load(warehouses, jobs=RESET_JOBS, replace=bool(status.get("loaded")),
                                        on_warehouse=measured)
+        for record in records:
+            await adapter.tpcc_record_capacity(record["tps"], clerks=record["clerks"],
+                                               active_warehouses=record["active_warehouses"])
         if capacity is not None:
             await adapter.tpcc_record_capacity(capacity)    # same target, same size: still its capacity
         checkpoint_error = await adapter.tpcc_checkpoint()
@@ -151,8 +217,9 @@ class TpccProfile(WorkloadProfile):
                                "load_seconds": round(load["seconds"], 1), "load_seed": load.get("load_seed"),
                                "before": before, "free_bytes_before": free,
                                "after": {"growth": data.growth(after), "size_bytes": after.get("size_bytes")},
-                               "checkpoint": checkpoint_error or "done", "capacity_kept": capacity},
-                "_disclosures": disclosures}
+                               "checkpoint": checkpoint_error or "done", "capacity_kept": capacity,
+                               "capacity_records_kept": len(records)},
+                **layout_fact, "_disclosures": disclosures}
 
     async def prepare(self, adapter: Any) -> dict[str, Any]:
         """Init: refuse the run unless the loaded data is present, has the scenario's number of
@@ -160,6 +227,7 @@ class TpccProfile(WorkloadProfile):
         consistency rules 1-3 (all data) and 4 (a sample of districts). The data must be
         correct BEFORE the test (Clause 3.3.3.1); it is never reloaded silently."""
         assert self.workload.tpcc is not None      # the catalog requires it for profile tpcc
+        layout = await self.resolve_layout(adapter)    # already resolved when the data step ran
         status = await adapter.tpcc_data_status()
         problems = data.data_problems(status, self.workload.tpcc.warehouses)
         results: dict[int, int] = {}
@@ -169,6 +237,7 @@ class TpccProfile(WorkloadProfile):
             problems = data.consistency_problems({r: results.get(r) for r in data.PREPARE_RULES})
         if problems:
             raise TpccDataError("the TPC-C data cannot be used: " + "; ".join(problems))
+        rate = await self.resolve_rate(adapter)
         consts = self.set_run_constants(status["c_last_load"])
         self.orders_at_prepare = status.get("current_orders")
         # history rows written from now on are this run's payments (the per-payment check after a fault)
@@ -182,12 +251,29 @@ class TpccProfile(WorkloadProfile):
             "consistency": {str(r): results[r] for r in data.PREPARE_RULES},
             "district_sample": data.PREPARE_DISTRICT_SAMPLE,
             "history_since": str(self.history_since), "load_seed": status.get("load_seed"),
-        }, "_disclosures": [self.label()]}
+            "layout": layout.as_dict(), "rate": rate,
+        }, "_disclosures": [self.label(), *self._layout_disclosures(layout, rate)]}
+
+    def _layout_disclosures(self, layout: sizing.Layout, rate: dict[str, Any] | None) -> list[str]:
+        out = []
+        if layout.by_cache:
+            out.append(f"TPC-C layout calculated from the target's memory cache "
+                       f"({(layout.cache_bytes or 0) / 1024 ** 2:.0f} MB): {layout.warehouses} warehouses loaded, "
+                       f"the clerks use {layout.active_warehouses or layout.warehouses} "
+                       f"(calculated: {', '.join(layout.by_cache)}; tpcc/sizing.py).")
+        elif layout.active_warehouses is not None:
+            out.append(f"TPC-C layout: {layout.warehouses} warehouses loaded, the clerks use "
+                       f"{layout.active_warehouses}.")
+        if rate is not None:
+            out.append(f"Workload rate {rate['rate_tps']:g} TPS = {rate['fraction']:.0%} of the maximum "
+                       f"{rate['capacity_tps']:g} TPS the capacity test stored for this layout "
+                       f"({rate['measured_at']}).")
+        return out
 
     def label(self) -> str:
         from resilience_tests.execution.workload.hooks import tpcc_label
         assert self.workload.tpcc is not None
-        return tpcc_label(self.workload.concurrency, self.workload.tpcc.warehouses, self.workload.rate_tps)
+        return tpcc_label(self.workload.concurrency, self.clerk_warehouses, self.workload.rate_tps)
 
     def terminal(self, worker_id: int) -> Terminal:
         """Clerk `worker_id`: its group, home warehouse and fixed district (terminals.py)."""
@@ -203,7 +289,9 @@ class TpccProfile(WorkloadProfile):
         rng, deck = self._clerks.setdefault(
             terminal.worker_id, (r := random.Random(self.seed * 1_000 + terminal.worker_id), inputs.Deck(r)))
         card = deck.draw()
-        w, home = self.workload.tpcc.warehouses, terminal.home
+        # remote choices (another supplying warehouse, a customer of another warehouse) stay within
+        # the warehouses the clerks use, so the warehouses only others read stay untouched
+        w, home = self.clerk_warehouses, terminal.home
         if card == NEW_ORDER:
             values = inputs.new_order(rng, home, w, self.constants)
         elif card == PAYMENT:

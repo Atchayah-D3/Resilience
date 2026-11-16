@@ -1,6 +1,7 @@
 """Per-fault behaviours of a run (see base.py). Importing the package registers them all."""
 
 from resilience_tests.control.faults import (  # noqa: F401  (registers behaviours)
+    analytics,
     connection_exhaustion,
     corruption,
     during,

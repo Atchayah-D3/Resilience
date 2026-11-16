@@ -32,6 +32,7 @@ class Capability(str, Enum):
     LIST_APPEND_HISTORY = "list_append_history"
     TPCC_WORKLOAD = "tpcc_workload"
     CONTENDED_TABLE = "contended_table"
+    ANALYTICS_SESSIONS = "analytics_sessions"
 
 
 class TransactionOutcome(str, Enum):
@@ -564,6 +565,8 @@ class TpccSupport:
     `tpcc` profile itself never sees SQL. An engine declares Capability.TPCC_WORKLOAD only when
     it implements all of it (build step 6); until then the defaults refuse."""
 
+    _tpcc_layout: dict[str, Any] | None = None     # the run's TPC-C layout (set_tpcc_layout)
+
     async def tpcc_load(self, warehouses: int, *, jobs: int = 4, replace: bool = False,
                         progress: Callable[[str], None] | None = None, seed: int | None = None) -> dict[str, Any]:
         """Create and load the TPC-C data (Clause 4.3) with `warehouses` warehouses, check every
@@ -606,9 +609,32 @@ class TpccSupport:
         """Flush the reloaded data to disk before the baseline; None, or why it could not run."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
-    async def tpcc_record_capacity(self, tps: float) -> None:
-        """Store the target's measured maximum TPS (the capacity test, build step 8) in the meta row."""
+    async def tpcc_record_capacity(self, tps: float, *, clerks: int | None = None,
+                                   active_warehouses: int | None = None) -> None:
+        """Store the target's measured maximum TPS (the capacity test, build step 8) in the meta row
+        and, with `clerks`, as a capacity record of that layout (clerks, the loaded warehouses,
+        `active_warehouses`; None: every warehouse), replacing an earlier record of the same layout."""
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+    async def tpcc_capacity_records(self) -> list[dict[str, Any]]:
+        """Every stored capacity record: {clerks, warehouses, active_warehouses, tps, measured_at};
+        empty when none was stored (or the data is not loaded)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
+
+    async def tpcc_cache_bytes(self) -> int | None:
+        """The engine's own memory cache in bytes (PostgreSQL: shared_buffers), or None when it
+        cannot be read; the TPC-C layout `by_cache` is calculated from it (tpcc/sizing.py)."""
+        return None
+
+    def set_tpcc_layout(self, layout: Mapping[str, Any] | None) -> None:
+        """The run's TPC-C layout (warehouses, active_warehouses, extra_warehouses), handed over by
+        the TPC-C profile in init, so a fault acting on the same data (NL-N-I01's reports) uses the
+        same warehouses as the workload."""
+        self._tpcc_layout = dict(layout) if layout is not None else None
+
+    def tpcc_layout(self) -> dict[str, Any] | None:
+        """The layout handed over by set_tpcc_layout, or None when there is none."""
+        return self._tpcc_layout
 
     async def tpcc_install_functions(self) -> None:
         """Create or replace the five TPC-C transaction functions (before every run, so a newer
@@ -628,7 +654,58 @@ class TpccSupport:
         raise NotImplementedError(f"{type(self).__name__} cannot run the TPC-C workload")
 
 
-class BaseDatabaseAdapter(CoreAdapter, SessionFaultSupport, OperationSupport, CorruptionSupport, TpccSupport):
+class AnalyticsSupport:
+    """NL-N-I01, noisy analytics (fault type analytics_load): report sessions of the environment's
+    analytics login (node.analytics) read the TPC-C tables back to back next to the workload. An
+    engine declares Capability.ANALYTICS_SESSIONS only when it implements all of it; the defaults
+    refuse, so a scenario can never run without its reports."""
+
+    async def observe_analytics_settings(self) -> dict[str, str | None]:
+        """Read only: the server settings and the report login's own limits that decide how the
+        reports play out -- shared_buffers, max_parallel_workers, max_worker_processes,
+        max_connections, cpu_cores, role_exists, role_can_login, role_connection_limit,
+        role_max_parallel_workers_per_gather, role_work_mem, role_temp_file_limit,
+        role_statement_timeout (None: not set for the role)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
+
+    async def start_analytics(self, *, full_table_sessions: int, index_sessions: int, limit_tests: bool,
+                              extra_warehouses: tuple[int, int] | None) -> dict[str, Any]:
+        """Open the report sessions and start their queries; return once every session is open and
+        running: {supported: True, t0_mono_ns, sessions, application_name} or {supported: False, error}."""
+        return {"supported": False, "error": f"{type(self).__name__} cannot run noisy-analytics reports"}
+
+    async def analytics_sample(self) -> dict[str, Any]:
+        """One read-only sample: report sessions open and active, helpers per report (by leader),
+        temporary files and bytes of the database."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
+
+    async def analytics_state(self) -> dict[str, Any]:
+        """The reports so far: per kind of query its counts, outcomes and plan figures; the limit
+        tests' outcomes in full."""
+        return {"started": False}
+
+    async def stop_analytics(self) -> dict[str, Any]:
+        """End the reports of this adapter: every running query cancelled, every session closed."""
+        return {"stopped": False}
+
+    async def revert_analytics(self) -> dict[str, Any]:
+        """Idempotent, also from a fresh adapter (the kill switch): stop this adapter's reports,
+        end every session carrying the reports' tag on the server, and report what is left."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
+
+    async def analytics_leftovers(self) -> dict[str, Any]:
+        """After the run: {sessions: tagged sessions left, temp_files: temporary files left (None:
+        unreadable)}."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
+
+    async def customer_cache_counters(self) -> dict[str, Any]:
+        """Cumulative cache counters of the TPC-C tables the reports never read (the customers'
+        own data) and of the tables they read: {customers: {hit, read}, reports: {hit, read}}."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
+
+
+class BaseDatabaseAdapter(CoreAdapter, SessionFaultSupport, OperationSupport, CorruptionSupport, TpccSupport,
+                          AnalyticsSupport):
     """Per-engine implementation: the core plus every fault-support interface, which is what
     the harness types against. Registered by engine name; selected by the env profile. An
     engine overrides what it supports; everything else keeps the interfaces' defaults, which

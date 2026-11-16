@@ -47,6 +47,8 @@ Capability = Literal[
     "contended_table",              # a share of marker transactions also reads and updates one
                                     # row of a shared harness table, so a lock held on that table
                                     # has users to block (workload.contended_share)
+    "analytics_sessions",           # report sessions of a separate, limited login run big reads
+                                    # on the TPC-C tables next to the workload (fault.analytics_load)
 ]
 
 # Infrastructure a scenario cannot be run to specification without (docs/infra-requirements.md).
@@ -54,6 +56,9 @@ Capability = Literal[
 # with the reason, never run against a weaker substitute.
 InfraFeature = Literal[
     "dedicated_wal_volume",         # pg_wal on its own volume, large enough for 16 GB of WAL
+    "analytics_login",              # a login for report sessions, created by the operator with its
+                                    # own limits (connection limit, helpers, work_mem,
+                                    # temp_file_limit, statement_timeout); the node names it
 ]
 
 # Framework §9 -- the 21 categories.
@@ -78,7 +83,7 @@ FaultType = Literal[
     "process_kill", "service_restart", "config_reload", "connection_exhaustion", "idle_in_transaction", "resource_limit", "resource_stress", "network_delay", "network_loss",
     "network_rate", "network_partition", "proxy_fault", "storage_write_loss", "storage_latency",
     "filesystem_full", "host_power_loss", "clock_skew", "data_corruption", "counter_preseed",
-    "lock_pileup",
+    "lock_pileup", "analytics_load",
 ]
 # Env-profile section that resolves each fault type to a driver (Arch §3.1: power_control,
 # noisy_neighbour, storage_fault; the OS/SSH driver serves the rest, Arch §5).
@@ -151,12 +156,47 @@ class WorkloadGroup(_Model):
     clerks: int = Field(gt=0)
 
 
+# A TPC-C size the harness calculates from the target at every run (the memory cache), instead of
+# a number written in the scenario file (tpcc/sizing.py).
+BY_CACHE = "by_cache"
+
+
 class TpccOptions(_Model):
     """Options of the `tpcc` profile (docs/tpcc-contract.md §1)."""
 
-    warehouses: int = Field(gt=0)
+    # A number, or `by_cache`: enough warehouses that order_line is at least
+    # `order_line_cache_multiple` times the target's memory cache (shared_buffers).
+    warehouses: Annotated[int, Field(gt=0)] | Literal["by_cache"]
     # group name -> the warehouse every clerk of that group works on
     home_warehouse: dict[str, int] = Field(default_factory=dict)
+    # The warehouses the clerks use (TPC-C Clause 4.2.2 allows loading more than are used): every
+    # clerk's home warehouse and its remote choices stay within warehouses 1 .. active_warehouses;
+    # the rest are only read by others (NL-N-I01's reports). A number, or `by_cache`: as many as
+    # fit in `active_cache_share` of the memory cache, at least 1. Absent: every warehouse is used.
+    active_warehouses: Annotated[int, Field(gt=0)] | Literal["by_cache"] | None = None
+    order_line_cache_multiple: Annotated[float, Field(gt=0)] | None = None
+    active_cache_share: Annotated[float, Field(gt=0, le=1)] | None = None
+
+    @model_validator(mode="after")
+    def _sizing(self) -> TpccOptions:
+        if (self.warehouses == BY_CACHE) != (self.order_line_cache_multiple is not None):
+            raise ValueError("workload.tpcc.order_line_cache_multiple is required for, and only defined for, "
+                             "warehouses: by_cache")
+        if (self.active_warehouses == BY_CACHE) != (self.active_cache_share is not None):
+            raise ValueError("workload.tpcc.active_cache_share is required for, and only defined for, "
+                             "active_warehouses: by_cache")
+        if (isinstance(self.warehouses, int) and isinstance(self.active_warehouses, int)
+                and self.active_warehouses > self.warehouses):
+            raise ValueError(f"workload.tpcc.active_warehouses ({self.active_warehouses}) is more than "
+                             f"warehouses ({self.warehouses})")
+        if self.active_warehouses is not None and self.home_warehouse:
+            raise ValueError("workload.tpcc.home_warehouse and active_warehouses are not combined")
+        return self
+
+    @property
+    def resolved(self) -> bool:
+        """Every size is a number (the TPC-C profile resolves `by_cache` at init)."""
+        return self.warehouses != BY_CACHE and self.active_warehouses != BY_CACHE
 
 
 class Workload(_Model):
@@ -164,6 +204,10 @@ class Workload(_Model):
     concurrency: int = Field(gt=0)
     transaction_markers: bool
     rate_tps: float | None = Field(default=None, gt=0)  # Framework §10.1 "at 1000 TPS"
+    # Instead of rate_tps (exactly one of them): this share of the maximum the capacity test
+    # stored for the same layout on the target (TPC-C profile only, tpcc/capacity.py). The run is
+    # refused when no maximum was measured for the layout. NEEDS SIGN-OFF (Framework §7.5).
+    rate_fraction_of_capacity: Annotated[float, Field(gt=0, le=1)] | None = None
     # `list_append`: every marker transaction also appends to and reads back Elle's lists, and
     # the operation history records what was actually read (Arch §10.3). `none`: no history.
     history: Literal["none", "list_append"] = "none"
@@ -188,7 +232,12 @@ class Workload(_Model):
     def _declared_rate(self) -> Workload:
         # Framework §7.5: the workload is a declared parameter of every scenario, never chosen at
         # execution time. Without a rate the load would be "as fast as this machine can go".
-        if self.rate_tps is None and self.profile != "idle":
+        if self.rate_tps is not None and self.rate_fraction_of_capacity is not None:
+            raise ValueError("workload.rate_tps and workload.rate_fraction_of_capacity are exclusive")
+        if self.rate_fraction_of_capacity is not None and self.profile != "tpcc":
+            raise ValueError("workload.rate_fraction_of_capacity is only defined for profile 'tpcc' "
+                             "(the capacity test measures the TPC-C workload)")
+        if self.rate_tps is None and self.rate_fraction_of_capacity is None and self.profile != "idle":
             raise ValueError(f"workload.rate_tps must be declared for profile {self.profile!r} (Framework §7.5)")
         return self
 
@@ -215,12 +264,11 @@ class Workload(_Model):
             for group, warehouse in self.tpcc.home_warehouse.items():
                 if group not in names:
                     raise ValueError(f"workload.tpcc.home_warehouse: group {group!r} is not declared in workload.groups")
-                if not 1 <= warehouse <= self.tpcc.warehouses:
+                if isinstance(self.tpcc.warehouses, int) and not 1 <= warehouse <= self.tpcc.warehouses:
                     raise ValueError(f"workload.tpcc.home_warehouse: warehouse {warehouse} of group {group!r} "
                                      f"is not between 1 and {self.tpcc.warehouses}")
         if self.contended_share is not None and (self.profile != "oltp_write_heavy" or self.history != "none"):
             raise ValueError("workload.contended_share is only defined for the plain oltp_write_heavy marker workload")
-        return self
         return self
 
 
@@ -265,6 +313,28 @@ class LockPileup(_Model):
         return self
 
 
+class AnalyticsLoad(_Model):
+    """Noisy analytics (fault type analytics_load, NL-N-I01): report sessions of the environment's
+    analytics login read the TPC-C tables back to back for fault.duration, next to the workload.
+
+    `full_table_sessions` read the whole of order_line with the parallel helpers the role allows
+    (totals, a join, a big sort); `by_cores`: ceil(cores / 3) of them -- one session and its two
+    helpers per three cores -- so the reports can occupy every core. `index_sessions` read old
+    orders of the warehouses the workload does not use through the index, pulling cold pages into
+    the memory cache. `limit_tests`: the first query of full-table sessions 1 and 2 needs more
+    temporary space than the role's temp_file_limit, and runs longer than its statement_timeout."""
+
+    full_table_sessions: Literal["by_cores"] | Annotated[int, Field(gt=0)] = "by_cores"
+    index_sessions: int = Field(default=1, ge=0)
+    limit_tests: bool = True
+
+    @model_validator(mode="after")
+    def _consistent(self) -> AnalyticsLoad:
+        if self.limit_tests and isinstance(self.full_table_sessions, int) and self.full_table_sessions < 2:
+            raise ValueError("analytics_load.limit_tests needs at least 2 full-table sessions (one per limit test)")
+        return self
+
+
 class Fault(_Model):
     type: FaultType
     # The env-profile section that serves this fault type (os_ssh, power_control, ...); the
@@ -276,6 +346,7 @@ class Fault(_Model):
     during: FaultDuring | None = None
     relation_kind: CorruptionRelationKind | None = None
     lock_pileup: LockPileup | None = None
+    analytics_load: AnalyticsLoad | None = None
 
     @model_validator(mode="after")
     def _driver_section(self) -> Fault:
@@ -293,6 +364,10 @@ class Fault(_Model):
                 raise ValueError("lock_pileup is held and released by the harness: fault.duration must be seconds")
             if self.lock_pileup.ddl_after_s >= self.duration:
                 raise ValueError("lock_pileup.ddl_after_s must fall inside fault.duration")
+        if (self.analytics_load is not None) != (self.type == "analytics_load"):
+            raise ValueError("fault.analytics_load is required for, and only defined for, analytics_load")
+        if self.analytics_load is not None and self.duration == "permanent":
+            raise ValueError("analytics_load is held and released by the harness: fault.duration must be seconds")
         return self
 
 
@@ -410,6 +485,18 @@ class Scenario(_Model):
             raise ValueError("lock_pileup needs workload.contended_share, so the table it locks has users")
         if pileup is not None and pileup.table == "tpcc_stock" and self.workload.profile != "tpcc":
             raise ValueError("lock_pileup.table tpcc_stock needs workload.profile tpcc, so the table it locks has users")
+        reports = self.fault.analytics_load
+        if reports is not None:
+            # the reports read the TPC-C tables, as a login of their own with its own limits
+            if self.workload.profile != "tpcc":
+                raise ValueError("analytics_load needs workload.profile tpcc: the reports read the TPC-C tables")
+            if "analytics_sessions" not in self.requires:
+                raise ValueError("analytics_load needs requires: [analytics_sessions]")
+            if "analytics_login" not in self.needs_infra:
+                raise ValueError("analytics_load needs needs_infra: [analytics_login] (the operator's report login)")
+            if reports.index_sessions and (self.workload.tpcc is None or self.workload.tpcc.active_warehouses is None):
+                raise ValueError("analytics_load.index_sessions read the warehouses the workload does not use, so "
+                                 "workload.tpcc.active_warehouses must be set")
         if self.internal and self.environment.env_sensitive:
             raise ValueError("an internal scenario is not a Framework §7.3 environment-sensitive row")
 

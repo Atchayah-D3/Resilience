@@ -7,6 +7,9 @@
 #   own cluster in /var/lib/resilience/pgdata, page checksums on, port 5434 (5433 is another cluster)
 #   service shaktidb-resilience.service, enabled, Restart=on-failure
 #   one disk (vda); pg_test_fsync fdatasync about 1,850 per second (0.53 ms) on 10 November
+#   15 GB memory; shared_buffers raised from the default 128MB to 1GB on 15 November 2026 by the
+#   operator (ALTER SYSTEM, restart) for noisy-neighbour scenario 1 (NL-N-I01), so the customers'
+#   active warehouses fit in the cache; applies to every scenario on this target
 # Driver host: BDB-QA-U22-2 (10.11.21.13).
 name: e2-u22-3
 class: E2
@@ -50,6 +53,10 @@ nodes:
     os_user: postgres
     service: shaktidb-resilience.service
     log_file: /var/lib/resilience/pgdata/logfile
+    # NL-N-I01's report login, created by the operator on 15 November 2026 with its own limits
+    # (CONNECTION LIMIT 4; max_parallel_workers_per_gather 2, work_mem 16MB, temp_file_limit 4GB,
+    # statement_timeout 2min) and read access to resilience_tpcc; password in ~/.pgpass
+    analytics: {host: 10.11.21.14, port: 5434, dbname: resilience, user: analytics_role}
 
 safety:                          # Arch §15: default deny, plus an operator-created sentinel
   allowlist:
@@ -58,14 +65,18 @@ safety:                          # Arch §15: default deny, plus an operator-cre
   sentinel_table: resilience.harness_target
   max_data_fs_used_pct: 90        # standing abort: stop before the data filesystem fills (operator-owned margin)
 
+# Infrastructure this environment provides (docs/infra-requirements.md)
+infra:
+  - analytics_login              # node.analytics: the operator's report login for NL-N-I01
+
 phase_timeouts_s:                # every phase is bounded; an unbounded wait is a defect (Arch §15)
   reset: 600
   init: 180
-  baseline: 300
+  baseline: 720                  # a 10-minute baseline (NL-N-I01) + 120 s; the scenario's warm-up is added on top
   pre_fault: 300
   fault_inject: 120
   recovery: 120
-  validate: 1800
+  validate: 3600                 # integrity check and TPC-C checks over large data (NL-N-I01: about 280 warehouses, ~31 GB)
   report: 120
   cleanup: 600
 

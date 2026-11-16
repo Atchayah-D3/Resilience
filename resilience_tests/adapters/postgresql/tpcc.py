@@ -49,6 +49,14 @@ else:
 SQL_DIR = Path(__file__).with_name("sql")
 SETUP_FILES = ("tpcc_schema.sql", "tpcc_load.sql", "tpcc_consistency.sql", "tpcc_functions.sql")
 INDEX_FILE = "tpcc_indexes.sql"
+# NL-N-I01: the maximum the capacity test measured, per layout (clerks, loaded warehouses, active
+# warehouses; 0 = every warehouse). Part of the TPC-C schema, so it goes with the data it was
+# measured on; a reload of the same size writes it back (tpcc/profile.py reset_data).
+TPCC_CAPACITY = f"{TPCC_SCHEMA}.capacity"
+CAPACITY_TABLE_SQL = (f"CREATE TABLE IF NOT EXISTS {TPCC_CAPACITY} (clerks int NOT NULL, warehouses int NOT NULL, "
+                      "active_warehouses int NOT NULL, tps numeric NOT NULL, "
+                      "measured_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
+                      "PRIMARY KEY (clerks, warehouses, active_warehouses))")
 DROP_LOCK_TIMEOUT = "30s"     # dropping the schema for a reload waits at most this long for locks
 FUNCTIONS_FILE = "tpcc_functions.sql"
 
@@ -317,12 +325,49 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
         finally:
             await conn.close()
 
-    async def tpcc_record_capacity(self, tps: float) -> None:
+    async def tpcc_record_capacity(self, tps: float, *, clerks: int | None = None,
+                                   active_warehouses: int | None = None) -> None:
         conn = await self._connect(timeout_s=10.0)
         try:
-            await conn.execute(f"UPDATE {TPCC_META} SET capacity_tps = $1", tps)
+            async with conn.transaction():
+                await conn.execute(f"UPDATE {TPCC_META} SET capacity_tps = $1", tps)
+                if clerks is not None:
+                    await conn.execute(CAPACITY_TABLE_SQL)
+                    warehouses = await conn.fetchval(f"SELECT warehouses FROM {TPCC_META}")
+                    # active 0 stands for "every warehouse" (a primary key column cannot be null)
+                    await conn.execute(
+                        f"INSERT INTO {TPCC_CAPACITY} (clerks, warehouses, active_warehouses, tps) "
+                        "VALUES ($1, $2, $3, $4) ON CONFLICT (clerks, warehouses, active_warehouses) "
+                        "DO UPDATE SET tps = EXCLUDED.tps, measured_at = clock_timestamp()",
+                        clerks, warehouses, active_warehouses or 0, tps)
         finally:
             await conn.close()
+
+    async def tpcc_capacity_records(self) -> list[dict[str, Any]]:
+        conn = await self._connect(timeout_s=10.0)
+        try:
+            if await conn.fetchval("SELECT to_regclass($1)", TPCC_CAPACITY) is None:
+                return []
+            rows = await conn.fetch(f"SELECT clerks, warehouses, active_warehouses, tps, measured_at "
+                                    f"FROM {TPCC_CAPACITY} ORDER BY measured_at")
+        finally:
+            await conn.close()
+        return [{"clerks": r["clerks"], "warehouses": r["warehouses"],
+                 "active_warehouses": r["active_warehouses"] or None, "tps": float(r["tps"]),
+                 "measured_at": r["measured_at"].isoformat()} for r in rows]
+
+    async def tpcc_cache_bytes(self) -> int | None:
+        try:
+            conn = await self._connect(timeout_s=10.0)
+        except Exception:  # noqa: BLE001 -- unreadable is None; the caller refuses to size by it
+            return None
+        try:
+            value = await conn.fetchval("SELECT pg_size_bytes(current_setting('shared_buffers'))")
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            await conn.close()
+        return int(value) if value else None
 
     async def tpcc_install_functions(self) -> None:
         conn = await self._connect(timeout_s=10.0)

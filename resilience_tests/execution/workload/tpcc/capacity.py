@@ -26,13 +26,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from catalog.schema import Workload
+from catalog.schema import BY_CACHE, Workload
 from resilience_tests.adapters import postgresql  # noqa: F401  (registers the adapter)
 from resilience_tests.adapters.base import adapter_for
 from resilience_tests.control.profile import load_profile
 from resilience_tests.execution.workload import contract
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.execution.workload.tpcc.load import Refused, check_target
+from resilience_tests.execution.workload.tpcc import sizing
 from resilience_tests.execution.workload.tpcc.profile import TpccProfile
 from resilience_tests.execution.workload.tpcc.samples import choose_processes
 from resilience_tests.observability.event_stream import EventStream
@@ -102,16 +103,21 @@ def _args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--step-seconds", type=float, default=30.0)
     ap.add_argument("--max-rate", type=float, default=100_000.0)
     ap.add_argument("--processes", type=int, help="fixed number of worker processes (default: by rate)")
+    ap.add_argument("--active-warehouses", help="the clerks use warehouses 1..N only (a number, or by_cache: as many as "
+                                                "fit in --active-cache-share of the memory cache, as a scenario with "
+                                                "active_warehouses: by_cache calculates it); default: every warehouse")
+    ap.add_argument("--active-cache-share", type=float, default=0.5,
+                    help="with --active-warehouses by_cache: the share of the memory cache (default 0.5)")
     ap.add_argument("--no-store", action="store_true", help="do not store the result in resilience_tpcc.meta")
     ap.add_argument("--out", help="evidence folder (default: <driver_host.run_dir>/tpcc-capacity-<time>)")
     return ap.parse_args(argv)
 
 
 async def _run_step(adapter: Any, profile: TpccProfile, warehouses: int, clerks: int, rate: float, seconds: float,
-                    processes: int, out: Path) -> Step:
+                    processes: int, out: Path, active: int | None = None) -> Step:
     out.mkdir(parents=True)
     w = Workload(profile="tpcc", concurrency=clerks, transaction_markers=True, rate_tps=rate,
-                 tpcc={"warehouses": warehouses})
+                 tpcc={"warehouses": warehouses, "active_warehouses": active})
     step_profile = TpccProfile(w, seed=profile.seed)
     step_profile.constants = profile.constants
     stream, journals = EventStream(out / "events.jsonl"), MarkerJournals(out)
@@ -151,18 +157,21 @@ async def _main(a: argparse.Namespace) -> int:
     if not status.get("loaded"):
         raise Refused(f"no TPC-C data: {status.get('reason')}")
     warehouses = status["warehouses"]
+    active = await _active_warehouses(adapter, a, warehouses)
     await adapter.prepare_harness_state()
     base = TpccProfile(Workload(profile="tpcc", concurrency=a.clerks, transaction_markers=True,
-                                rate_tps=a.start_rate, tpcc={"warehouses": warehouses}))
+                                rate_tps=a.start_rate, tpcc={"warehouses": warehouses, "active_warehouses": active}))
     await base.prepare(adapter)
-    print(f"target {hostname}: {warehouses} warehouses, {a.clerks} clerks; steps of {a.step_seconds:.0f} s from "
-          f"{a.start_rate:.0f} TPS x {a.factor}; evidence in {out}", flush=True)
+    used = f"the clerks on {active} of them" if active else "the clerks on all of them"
+    print(f"target {hostname}: {warehouses} warehouses, {used}, {a.clerks} clerks; steps of {a.step_seconds:.0f} s "
+          f"from {a.start_rate:.0f} TPS x {a.factor}; evidence in {out}", flush=True)
 
     steps: list[Step] = []
     rate, capacity, why = a.start_rate, None, ""
     while True:
         n = a.processes or choose_processes(rate, a.clerks, os.cpu_count() or 1)
-        step = await _run_step(adapter, base, warehouses, a.clerks, rate, a.step_seconds, n, out / f"step-{len(steps) + 1}")
+        step = await _run_step(adapter, base, warehouses, a.clerks, rate, a.step_seconds, n, out / f"step-{len(steps) + 1}",
+                               active=active)
         steps.append(step)
         worst = max((v for v in step.worst_p90_ms.values() if v is not None), default=None)
         print(f"  asked {rate:7.0f}  got {step.tps:7.0f} TPS  processes {n}  p99 {step.p99_ms or 0:7.1f} ms  "
@@ -179,12 +188,32 @@ async def _main(a: argparse.Namespace) -> int:
         # NOPM: New-Orders per minute; New-Order is 10 of the deck's 23 cards (about 1% of them roll back)
         print(f"CAPACITY: {capacity:.0f} TPS (about {capacity * 10 / 23 * 0.99 * 60:.0f} NOPM)")
         if not a.no_store:
-            await adapter.tpcc_record_capacity(round(capacity, 1))
-            print("stored in resilience_tpcc.meta (capacity_tps)")
+            await adapter.tpcc_record_capacity(round(capacity, 1), clerks=a.clerks, active_warehouses=active)
+            print(f"stored in resilience_tpcc.meta (capacity_tps) and as the capacity record of {a.clerks} clerks, "
+                  f"{warehouses} warehouses, {active or 'all'} active (resilience_tpcc.capacity)")
     print("consistency rules 1-3 after the test:", "hold" if not any(rules.values()) else f"FAIL {rules}")
     (out / "summary.json").write_text(json.dumps({"steps": [asdict(s) | {"kept_up": s.kept_up} for s in steps],
                                                   "capacity_tps": capacity, "why": why, "rules": rules}, indent=2) + "\n")
     return 0 if capacity is not None and not any(rules.values()) else 1
+
+
+async def _active_warehouses(adapter: Any, a: argparse.Namespace, warehouses: int) -> int | None:
+    """The warehouses the clerks use: --active-warehouses as given, or calculated from the memory
+    cache exactly as a scenario with `active_warehouses: by_cache` does (tpcc/sizing.py)."""
+    if a.active_warehouses is None:
+        return None
+    if a.active_warehouses == BY_CACHE:
+        cache = await adapter.tpcc_cache_bytes()
+        if not cache:
+            raise Refused("--active-warehouses by_cache: the target's memory cache could not be read")
+        return min(sizing.active_by_cache(cache, a.active_cache_share), warehouses)
+    try:
+        active = int(a.active_warehouses)
+    except ValueError:
+        raise Refused(f"--active-warehouses must be a number or {BY_CACHE}, not {a.active_warehouses!r}") from None
+    if not 1 <= active <= warehouses:
+        raise Refused(f"--active-warehouses {active}: the target has {warehouses} warehouses loaded")
+    return active
 
 
 def main(argv: list[str] | None = None) -> int:
