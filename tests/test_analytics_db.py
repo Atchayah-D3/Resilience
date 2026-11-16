@@ -147,3 +147,34 @@ def test_revert_ends_tagged_sessions_left_by_another_process(adapter):
             await asyncio.sleep(0.1)
         return await fresh.revert_analytics()
     assert asyncio.run(go())["sessions_remaining"] == 0
+
+
+def test_a_reload_gives_back_the_access_other_roles_had(adapter):
+    """Was (lab, 16 November): the run reloaded the TPC-C data at its calculated size, the reload
+    dropped and recreated the schema, and the report login's grants went with it -- every report
+    then failed with 'permission denied for schema resilience_tpcc'."""
+    out = asyncio.run(adapter.tpcc_load(3, jobs=3, replace=True, seed=7))
+    assert any(ROLE in g and "SCHEMA" in g for g in out["grants_restored"]), out["grants_restored"]
+    assert any(ROLE in g and "order_line" in g for g in out["grants_restored"])
+    assert out["grants_not_restored"] == []
+    access = asyncio.run(adapter.analytics_read_access())
+    assert access == {"login": ROLE, "schema": True, "tables": {"order_line": True, "orders": True}}
+
+
+def test_reports_that_may_not_read_stop_at_once_instead_of_retrying(adapter):
+    asyncio.run(_sql(f"REVOKE SELECT ON ALL TABLES IN SCHEMA resilience_tpcc FROM {ROLE}"))
+    try:
+        access = asyncio.run(adapter.analytics_read_access())
+        assert access["tables"] == {"order_line": False, "orders": False}
+
+        async def go():
+            return await adapter.start_analytics(full_table_sessions=2, index_sessions=1, limit_tests=True,
+                                                 extra_warehouses=(2, 3)), await adapter.analytics_state()
+        out, state = asyncio.run(go())
+        assert out["supported"] is False and "42501" in out["error"], out
+        # one failed query per session, not thousands: each session stopped at its first error
+        assert len(out["failed_sessions"]) == 3
+        assert sum(k["count"] for k in state["by_kind"].values()) == 3
+        assert asyncio.run(adapter.analytics_leftovers())["sessions"] == 0
+    finally:
+        asyncio.run(_sql(f"GRANT SELECT ON ALL TABLES IN SCHEMA resilience_tpcc TO {ROLE}"))

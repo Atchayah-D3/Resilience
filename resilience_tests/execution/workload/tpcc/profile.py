@@ -210,6 +210,12 @@ class TpccProfile(WorkloadProfile):
         disclosures = [f"The TPC-C data ({warehouses} warehouses) was {verb} by this run before the baseline "
                        f"({'; '.join(reasons)}); the load took {seconds:.0f} s and passed every row count and all "
                        f"12 consistency rules (loader version {data.LOADER_VERSION}, seed {load.get('load_seed')})."]
+        if load.get("grants_restored") or load.get("grants_not_restored"):
+            disclosures.append(
+                f"The reload kept the access other roles had to the TPC-C data: {len(load.get('grants_restored') or [])} "
+                f"grant(s) given back after the load"
+                + (f"; NOT given back: {'; '.join(load['grants_not_restored'])}" if load.get("grants_not_restored") else "")
+                + ".")
         if checkpoint_error:
             disclosures.append(f"After the load the harness could not run a CHECKPOINT ({checkpoint_error}): "
                                "the baseline may include the database writing the loaded data to disk.")
@@ -218,7 +224,9 @@ class TpccProfile(WorkloadProfile):
                                "before": before, "free_bytes_before": free,
                                "after": {"growth": data.growth(after), "size_bytes": after.get("size_bytes")},
                                "checkpoint": checkpoint_error or "done", "capacity_kept": capacity,
-                               "capacity_records_kept": len(records)},
+                               "capacity_records_kept": len(records),
+                               "grants_restored": load.get("grants_restored") or [],
+                               "grants_not_restored": load.get("grants_not_restored") or []},
                 **layout_fact, "_disclosures": disclosures}
 
     async def prepare(self, adapter: Any) -> dict[str, Any]:
@@ -318,7 +326,16 @@ class TpccProfile(WorkloadProfile):
         from resilience_tests.execution.workload.tpcc.engine import TpccWorkloadDriver
         if self.constants is None:
             raise RuntimeError("the run's NURand constants are not set: prepare() must run first")
-        n = processes or choose_processes(self.workload.rate_tps, self.workload.concurrency, os.cpu_count() or 1)
+        cores = os.cpu_count() or 1
+        n = processes or choose_processes(self.workload.rate_tps, self.workload.concurrency, cores)
+        wanted = self.workload.tpcc.worker_processes if self.workload.tpcc is not None else None
+        if not processes and wanted:
+            # the scenario asks the clerks to run apart from the harness's main program
+            if wanted > self.workload.concurrency or wanted > cores - 1:
+                raise TpccDataError(f"workload.tpcc.worker_processes {wanted}: this harness machine has {cores} CPU "
+                                    f"core(s) (one stays free for the main program) and the scenario "
+                                    f"{self.workload.concurrency} clerks")
+            n = max(n, wanted)
         if n <= 1:
             return TpccWorkloadDriver(adapter, self.workload, journals, stream, self)
         return TpccCoordinator(adapter, self.workload, journals, stream, self, n)

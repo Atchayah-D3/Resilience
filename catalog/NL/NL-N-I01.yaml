@@ -63,6 +63,8 @@ workload:
     order_line_cache_multiple: 8 # the document: order_line about 8 x the memory cache
     active_warehouses: by_cache
     active_cache_share: 0.5      # the document: the customers' warehouses about half the memory cache
+    worker_processes: 2          # the customers run apart from the harness program that sends the reports,
+                                 # so the reports' client work never shares their CPU core or timing
 
 fault:
   type: analytics_load

@@ -66,6 +66,10 @@ class FaultBehaviour:
         adapter -- never written. Recorded and disclosed with the result."""
         return {}
 
+    async def check_ready(self) -> None:
+        """Init, last: the workload's data is in place. Refuse the run (PhaseAbort) when this fault
+        could not run on it -- found in seconds, not after the warm-up and the baseline."""
+
     def phase_extension_s(self, phase: str) -> float:
         """Seconds this fault adds to `phase`'s profile bound -- the time it is held there, so a
         fault held longer than the bound is not cut off by it. The bound itself still comes

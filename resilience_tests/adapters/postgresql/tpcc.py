@@ -57,6 +57,23 @@ CAPACITY_TABLE_SQL = (f"CREATE TABLE IF NOT EXISTS {TPCC_CAPACITY} (clerks int N
                       "active_warehouses int NOT NULL, tps numeric NOT NULL, "
                       "measured_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
                       "PRIMARY KEY (clerks, warehouses, active_warehouses))")
+# The access other roles were given to the TPC-C data (e.g. the operator's report login, NL-N-I01)
+# belongs to the schema and tables a reload drops; it is read as GRANT statements before the drop
+# and given back after the load, so a reload leaves the data as readable by others as it found it.
+GRANTS_SQL = """
+SELECT format('GRANT %s ON SCHEMA %I TO %s%s', a.privilege_type, n.nspname,
+              CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END,
+              CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END)
+  FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a LEFT JOIN pg_roles r ON r.oid = a.grantee
+ WHERE n.nspname = $1 AND a.grantee <> n.nspowner
+UNION ALL
+SELECT format('GRANT %s ON TABLE %I.%I TO %s%s', a.privilege_type, n.nspname, c.relname,
+              CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END,
+              CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       CROSS JOIN LATERAL aclexplode(c.relacl) a LEFT JOIN pg_roles r ON r.oid = a.grantee
+ WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'S') AND a.grantee <> c.relowner
+"""
 DROP_LOCK_TIMEOUT = "30s"     # dropping the schema for a reload waits at most this long for locks
 FUNCTIONS_FILE = "tpcc_functions.sql"
 
@@ -157,13 +174,16 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
         load_seed = seed if seed is not None else random.SystemRandom().randrange(1, 2**31)
         c_last = data.choose_c_last_load(random.Random(load_seed))
 
+        grants: list[str] = []
         conn = await self._connect(timeout_s=10.0, command_timeout=None)
         try:
             if await self._tpcc_schema_exists(conn):
                 if not replace:
                     raise RuntimeError(f"schema {TPCC_SCHEMA} already exists; load with replace (--replace) "
                                        "to drop and load it again")
-                say(f"dropping the existing schema {TPCC_SCHEMA}")
+                grants = [r[0] for r in await conn.fetch(GRANTS_SQL, TPCC_SCHEMA)]
+                say(f"dropping the existing schema {TPCC_SCHEMA}"
+                    + (f" (keeping {len(grants)} grant(s) to other roles)" if grants else ""))
                 # a session left holding a lock on a TPC-C table (e.g. by a crashed run) makes the
                 # drop fail with a clear error instead of waiting until the phase bound
                 await conn.execute(f"SET lock_timeout = '{DROP_LOCK_TIMEOUT}'")
@@ -222,11 +242,26 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                 "VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 warehouses, data.ITEMS, data.LOADER_VERSION, c_last, data.loaded_orders(warehouses), seconds, load_seed)
             size = await self._tpcc_size(conn)
+            restored, not_restored = await self._restore_grants(conn, grants)
         finally:
             await conn.close()
         say(f"done in {seconds:.0f} s")
         return {"warehouses": warehouses, "seconds": seconds, "rows": counts, "rules": rules,
-                "c_last_load": c_last, "size_bytes": size, "load_seed": load_seed}
+                "c_last_load": c_last, "size_bytes": size, "load_seed": load_seed,
+                "grants_restored": restored, "grants_not_restored": not_restored}
+
+    @staticmethod
+    async def _restore_grants(conn: asyncpg.Connection, grants: Sequence[str]) -> tuple[list[str], list[str]]:
+        """Give back the access other roles had before the reload. A grant whose object no longer
+        exists (a table the load does not create) or whose role is gone is listed, never hidden."""
+        restored, not_restored = [], []
+        for grant in grants:
+            try:
+                await conn.execute(grant)
+                restored.append(grant)
+            except asyncpg.PostgresError as exc:
+                not_restored.append(f"{grant}: {exc.sqlstate} {exc}")
+        return restored, not_restored
 
     async def tpcc_drop(self) -> bool:
         conn = await self._connect(timeout_s=10.0, command_timeout=None)

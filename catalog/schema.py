@@ -176,6 +176,11 @@ class TpccOptions(_Model):
     active_warehouses: Annotated[int, Field(gt=0)] | Literal["by_cache"] | None = None
     order_line_cache_multiple: Annotated[float, Field(gt=0)] | None = None
     active_cache_share: Annotated[float, Field(gt=0, le=1)] | None = None
+    # At least this many worker processes for the clerks, each a program of its own, apart from the
+    # harness's main program -- even when the rate alone would fit in one. For a scenario whose fault
+    # sends its own load from the harness (NL-N-I01's reports): the clerks' sending and timing then
+    # never share a program, a CPU core or a pause with it. Absent: chosen by the rate.
+    worker_processes: Annotated[int, Field(ge=2)] | None = None
 
     @model_validator(mode="after")
     def _sizing(self) -> TpccOptions:

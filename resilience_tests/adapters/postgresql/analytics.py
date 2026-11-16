@@ -81,6 +81,12 @@ LIMIT_TIMEOUT_SQL = f"SELECT sum(ol_amount * g) FROM {S}.order_line, generate_se
 EXPLAIN = "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) "
 
 FULL_TABLE_CYCLE = ("q1", "q2", "q3")
+# The errors the role's own limits end a report with (temp_file_limit, statement_timeout): expected
+# -- the session goes on with its next report. Any other error (no permission, a missing table, a
+# broken connection) means the reports are not running as planned: that session stops, rather than
+# retrying a query that fails at once in a tight loop.
+LIMIT_SQLSTATES = ("53400", "57014")
+START_CHECK_S = 2.0              # a report that fails at once (no permission) fails within this
 CONNECT_TIMEOUT_S = 10.0
 STOP_TIMEOUT_S = 15.0            # a cancelled query and the session's close
 SERVER_GONE_POLLS = 50           # terminated backends take a moment to leave pg_stat_activity
@@ -231,6 +237,23 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
             except Exception:  # noqa: BLE001
                 conn.terminate()
 
+    async def analytics_read_access(self) -> dict[str, Any]:
+        login = self.node.analytics
+        if login is None:
+            return {"login": None, "schema": False, "tables": {}}
+        conn = await self._connect(timeout_s=CONNECT_TIMEOUT_S)
+        try:
+            schema = bool(await conn.fetchval(
+                "SELECT to_regnamespace($2) IS NOT NULL AND has_schema_privilege($1, $2, 'USAGE')", login.user, S))
+            tables = {}
+            for name in REPORT_TABLES:
+                relation = f"{S}.{name}"
+                tables[name] = bool(await conn.fetchval(
+                    "SELECT to_regclass($2) IS NOT NULL AND has_table_privilege($1, $2, 'SELECT')", login.user, relation))
+        finally:
+            await conn.close()
+        return {"login": login.user, "schema": schema, "tables": tables}
+
     async def customer_cache_counters(self) -> dict[str, Any]:
         conn = await self._connect(timeout_s=CONNECT_TIMEOUT_S)
         try:
@@ -262,7 +285,8 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
             return {"supported": False, "error": f"{S}.order_line has no rows (or no statistics)"}
         plan = (["full"] * full_table_sessions) + (["index"] * index_sessions)
         self._reports = {"started_mono_ns": time.monotonic_ns(), "stopped": False, "rows": rows,
-                         "kinds": {}, "records": [], "failed": [], "limit_tests": {}, "sessions": [], "samples": []}
+                         "kinds": {}, "records": [], "failed": [], "limit_tests": {}, "sessions": [], "samples": [],
+                         "failed_sessions": []}
         self._report_stop = asyncio.Event()
         conns: list[asyncpg.Connection] = []
         try:
@@ -289,7 +313,18 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
                 name=f"report-{i + 1}"))
         self._report_tasks = tuple(tasks)
         self._reports["sessions"] = sessions
-        return {"supported": True, "t0_mono_ns": time.monotonic_ns(), "sessions": sessions,
+        t0 = time.monotonic_ns()
+        # a report that fails at once (no permission to read, a missing table) stops its session:
+        # the fault did not land, with the server's own error, never a run of failing queries
+        await asyncio.sleep(START_CHECK_S)
+        failed = list(self._reports["failed_sessions"])
+        if failed:
+            await self.stop_analytics()
+            first = failed[0]
+            return {"supported": False, "failed_sessions": failed,
+                    "error": f"{len(failed)} of {len(sessions)} report sessions stopped at once; session "
+                             f"{first['session']} ({first['query']}): {first.get('sqlstate')} {first.get('error')}"}
+        return {"supported": True, "t0_mono_ns": t0, "sessions": sessions,
                 "application_name": ANALYTICS_APPLICATION_NAME, "login": login.user,
                 "full_table_sessions": full_table_sessions, "index_sessions": index_sessions,
                 "limit_tests": limit_tests, "extra_warehouses": list(extra_warehouses) if extra_warehouses else None}
@@ -301,10 +336,13 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
         for query in queries:
             if self._report_stop.is_set():
                 return
-            await self._one_report(session, query, conn, extra, rng)
+            record = await self._one_report(session, query, conn, extra, rng)
+            if record["outcome"] == "error" and record.get("sqlstate") not in LIMIT_SQLSTATES:
+                self._reports["failed_sessions"].append(record)
+                return
 
     async def _one_report(self, session: int, query: str, conn: asyncpg.Connection,
-                          extra: tuple[int, int] | None, rng: random.Random) -> None:
+                          extra: tuple[int, int] | None, rng: random.Random) -> dict[str, Any]:
         reports = self._reports
         assert reports is not None
         rows = reports["rows"]
@@ -337,9 +375,8 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
             record.update(outcome="error", sqlstate=exc.sqlstate, error=str(exc)[:300])
         except Exception as exc:  # noqa: BLE001 -- the connection broke: recorded, the session ends
             record.update(outcome="error", sqlstate=None, error=f"{type(exc).__name__}: {exc}"[:300])
-            self._record(record)
-            raise
         self._record(record)
+        return record
 
     def _record(self, record: dict[str, Any]) -> None:
         reports = self._reports
@@ -377,7 +414,7 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
                 "stopped_mono_ns": reports.get("stopped_mono_ns"), "order_line_rows": reports["rows"],
                 "sessions": reports["sessions"], "by_kind": {k: v.as_dict() for k, v in reports["kinds"].items()},
                 "limit_tests": reports["limit_tests"], "records": reports["records"], "failed": reports["failed"],
-                "samples": reports["samples"]}
+                "failed_sessions": reports["failed_sessions"], "samples": reports["samples"]}
 
     async def stop_analytics(self) -> dict[str, Any]:
         """Each running query cancelled (asyncpg sends the server a cancel request when its task is

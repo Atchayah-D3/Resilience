@@ -35,3 +35,11 @@
 - [X] T014 Unit tests: tests/test_tpcc_sizing.py, tests/test_analytics_fault.py, tests/test_analytics_run.py (orchestrator, fake engine), tests/test_analytics_db.py (real database)
 - [X] T015 Full unit suite and catalog checks
 - [ ] T016 Live pilot on e2-u22-3 (user): capacity per layout, then NL-N-I01
+
+## Phase 7: Fixes from the first lab run (research R12)
+
+- [X] T017 Grants of other roles kept across a TPC-C reload in resilience_tests/adapters/postgresql/tpcc.py; disclosed in tpcc/profile.py
+- [X] T018 FaultBehaviour.check_ready (control/faults/base.py, called in orchestrator init); report login read access (adapters/postgresql/analytics.py, control/faults/analytics.py)
+- [X] T019 A report session stops on an unexpected error; immediate failures make the fault not landed (adapters/postgresql/analytics.py)
+- [X] T020 workload.tpcc.worker_processes (catalog/schema.py, tpcc/profile.py); NL-N-I01 sets 2
+- [X] T021 Tests: tests/test_analytics_db.py (reload keeps grants, reports without permission stop), tests/test_analytics_fault.py, tests/test_analytics_run.py

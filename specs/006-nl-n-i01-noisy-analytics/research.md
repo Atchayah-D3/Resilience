@@ -77,3 +77,24 @@ document (`docs/Noisy Neighbour/Resilience Scenario 1 Noisy analytics vs priorit
 - The first run loads the data at the calculated size in init, then refuses because no maximum is
   stored for the layout, naming the capacity command. After the capacity test, the next run reuses
   the data (no reload) and runs to a verdict.
+
+## R12 Fixes from the first lab run (16 November 2026, run NL-N-I01-20261116T061502Z-40ef88)
+The run was stopped by the driver-limited guard 5 s into the reports (harness process at 1.07 of a
+core, 0.55-0.60 for the 15 minutes before). The database log showed the cause: 13,509 errors
+"permission denied for schema resilience_tpcc" in 5.5 s. The run had reloaded the TPC-C data at its
+calculated size; the reload drops and recreates the schema, and the report login's grants went with
+it. Every report failed in about 1 ms and its session sent the next one at once, a tight loop on
+the harness side (the database was 65% idle). Fixes:
+- A reload gives back the access other roles had to the TPC-C schema and tables (read as GRANT
+  statements before the drop, given back after the load; disclosed; anything not given back listed).
+- check_ready (a new FaultBehaviour hook, called last in init): the report login must be able to read
+  order_line and orders, or the run is refused in seconds instead of after warm-up and baseline.
+- A report session that ends with an error other than the role's limits (53400, 57014) stops; a
+  session that fails within the first 2 s makes the fault "not landed" with the server's error.
+- workload.tpcc.worker_processes: 2: the customers run in worker processes of their own. The same run
+  showed the harness's main program pausing for about 1 s at the end of the baseline (reading the
+  events file): with the clerks in it, the customers' last baseline second fell to 28 TPS and the
+  first second of the fault showed 3,920 missed starts. With the clerks apart, such a pause cannot
+  reach their sending or timing.
+- EXPLAIN is kept: measured on the lab, the index report takes 5-20 ms and decoding its plan costs
+  the harness about 5-10% of a core.

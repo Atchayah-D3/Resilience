@@ -171,6 +171,19 @@ class AnalyticsLoadFault(HeldFault):
                 raise PhaseAbort("invalid run: the analytics login has no temp_file_limit, so limit test 1 "
                                  "cannot be judged (the operator sets the role's limits)")
 
+    async def check_ready(self) -> None:
+        """After the data step: the report login can read what the reports read. A reload drops
+        and recreates the TPC-C schema; the load gives back the access others had, and a login
+        that still cannot read is refused here rather than failing every report later."""
+        access = await self.ctx.adapter.analytics_read_access()
+        self.ctx.facts["analytics_read_access"] = access
+        missing = ([f"USAGE on schema resilience_tpcc"] if not access.get("schema") else []) + [
+            f"SELECT on {name}" for name, ok in (access.get("tables") or {}).items() if not ok]
+        if missing or not access.get("tables"):
+            raise PhaseAbort(f"invalid run: the analytics login {access.get('login')!r} lacks {', '.join(missing) or 'access'} "
+                             "on the TPC-C data, so every report would fail; the operator grants it, e.g. GRANT USAGE ON "
+                             "SCHEMA resilience_tpcc / GRANT SELECT ON ALL TABLES IN SCHEMA resilience_tpcc")
+
     def helpers_per_report(self) -> int | None:
         """Helpers one report may have: the login's max_parallel_workers_per_gather (the server's
         when the login sets none)."""
