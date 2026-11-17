@@ -45,6 +45,10 @@ workload:
   rate_tps: 60                  # NEEDS SIGN-OFF: the document asks ~60% of the target's measured
                                  # maximum (tpcc.capacity); set it from that result
   latency_from: intended_start   # the document: latency from when the transaction should have started
+  session:                       # Scenario 3 document, settings A: on every workload connection, so a
+    lock_timeout: "0"            #   queued query waits in the lock queue instead of giving up on its own,
+    statement_timeout: "0"       #   and the freeze is measured the same way whatever the server's
+    transaction_timeout: "0"     #   defaults are (session settings only; nothing on the server changes)
   tpcc:
     warehouses: 64              # must equal the loaded data (standard size: 5 per clerk)
 
@@ -72,6 +76,10 @@ requires:
   - transactional_markers
   - structural_integrity_check
   - tpcc_workload
+
+server_settings:                 # Scenario 3 document, settings B: cluster level, written to the node's
+  log_lock_waits: "on"           #   config file (env profile config_file), applied by a restart before the
+  deadlock_timeout: 1s           #   baseline, restored after the run; a value already in effect is left alone
 
 measure:
   - rpo_txn

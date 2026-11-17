@@ -167,6 +167,7 @@ SESSION_SETTINGS: frozenset[str] = frozenset({
     "lock_timeout",
     "statement_timeout",
     "idle_in_transaction_session_timeout",
+    "transaction_timeout",          # PostgreSQL 17+: a server value would end a long transaction
 })
 
 # --- 5. transaction types, outcomes and measures -----------------------------------------

@@ -119,9 +119,11 @@ class LockPileupFault(HeldFault):
         await self.on_hold_start()
         deadline = time.monotonic() + hold_s
         state = await ctx.adapter.lock_pileup_state()
+        self._mark_issued(state)
         while state.get("ddl_outcome") is None and time.monotonic() < deadline:
             await asyncio.sleep(min(STATE_POLL_S, max(0.0, deadline - time.monotonic())))
             state = await ctx.adapter.lock_pileup_state()
+            self._mark_issued(state)
         await self.on_hold_end()
 
         # Released from the pile-up's own sessions: the read is committed, so a waiting schema
@@ -138,6 +140,9 @@ class LockPileupFault(HeldFault):
 
         state = await ctx.adapter.lock_pileup_state()
         ctx.facts["lock_pileup_state"] = state
+        self._mark_issued(state)        # a schema change issued only as the hold ended
+        if isinstance(state.get("ddl_ended_mono_ns"), int):
+            ctx.milestone(f"schema change ended: {state.get('ddl_outcome')}", at_mono_ns=state["ddl_ended_mono_ns"])
         ended = state.get("ddl_ended_mono_ns")
         t1 = ended if isinstance(ended, int) else time.monotonic_ns()
         ctx.set_t1(t1)
@@ -145,6 +150,19 @@ class LockPileupFault(HeldFault):
         self._released = {"held_s": round((window["end_mono_ns"] - window["start_mono_ns"]) / 1e9, 3),
                           "released": released, "ddl_outcome": state.get("ddl_outcome")}
         return self._released
+
+    _issued_marked = False
+
+    def _mark_issued(self, state: dict[str, Any]) -> None:
+        """The timeline's milestone for the moment the schema change was issued -- where the
+        queue starts forming (with a blocker, that is ddl_after_s after T0)."""
+        issued = state.get("ddl_issued_mono_ns")
+        if self._issued_marked or not isinstance(issued, int):
+            return
+        self._issued_marked = True
+        what = ("it waits for the table's lock, and new queries queue behind it" if state.get("blocker") == "long_read"
+                else "it holds the table's lock while it rewrites the table")
+        self.ctx.milestone(f"schema change issued: {what}", at_mono_ns=issued)
 
     async def measure(self, events: list[Any]) -> dict[str, Any]:
         ctx = self.ctx

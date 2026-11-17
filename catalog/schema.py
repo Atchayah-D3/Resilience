@@ -146,6 +146,8 @@ class SteadyState(_Model):
 
 
 # A PostgreSQL duration or plain number, as a session setting takes it: 5s, 500ms, 2min, 30000.
+# A server setting's name (catalog server_settings): the engine's own lower-case identifiers.
+SETTING_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 SESSION_VALUE_RE = re.compile(r"^\d+(us|ms|s|min|h|d)?$")
 
 
@@ -419,6 +421,13 @@ class Scenario(_Model):
     repeat: Repeat | None = None
     requires: list[Capability] = Field(default_factory=list)
     needs_infra: list[InfraFeature] = Field(default_factory=list)
+    # Cluster-level settings this scenario runs under (e.g. NL-N-I03: log_lock_waits, so the
+    # server logs who waited for whom). The harness records the current values, writes these
+    # to the server's configuration file (the env profile names it), restarts the service,
+    # verifies them, and restores the original file and values after the run. The change is
+    # journalled in the ledger first, so the kill switch restores it after a crash. A value
+    # already in effect is left alone. Values are given as the engine's own settings syntax.
+    server_settings: dict[str, str | int | float | bool] = Field(default_factory=dict)
     measure: list[str] = Field(min_length=1)
     accept: list[str] = Field(min_length=1)
     priority: Priority
@@ -434,6 +443,21 @@ class Scenario(_Model):
         if len(set(v)) != len(v):
             raise ValueError("duplicate measure name")
         return v
+
+    @field_validator("server_settings")
+    @classmethod
+    def _server_settings(cls, v: dict[str, Any]) -> dict[str, str]:
+        bad = sorted(k for k in v if not SETTING_NAME_RE.match(k))
+        if bad:
+            raise ValueError(f"server_settings: {', '.join(bad)} are not setting names (lower-case letters, digits, _)")
+        out: dict[str, str] = {}
+        for name, value in v.items():
+            # YAML reads on/off as booleans; the server's syntax for them is on/off
+            text = ("on" if value else "off") if isinstance(value, bool) else str(value)
+            if not text or any(c in text for c in "\n\r\x00"):
+                raise ValueError(f"server_settings.{name}: the value must be one non-empty line")
+            out[name] = text
+        return out
 
     @field_validator("accept", "abort_if")
     @classmethod

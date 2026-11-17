@@ -27,7 +27,7 @@ from typing import Any
 
 from catalog.schema import DEFAULT_DRIVER_SECTION, FAULT_DRIVER_SECTION
 from resilience_tests.adapters import postgresql  # noqa: F401  (registers the adapter)
-from resilience_tests.adapters.base import Capability, adapter_for
+from resilience_tests.adapters.base import Capability, ServerSettingsRefused, adapter_for
 from resilience_tests.analysis import report as report_mod
 from resilience_tests.analysis import threshold_eval
 from resilience_tests.analysis.elle_checker import ElleChecker
@@ -44,6 +44,7 @@ from resilience_tests.analysis.rto_decomposer import (
 from resilience_tests.control.faults import PhaseAbort, during_behaviour, fault_behaviour, summary_sections
 from resilience_tests.control.faults.base import Sampler
 from resilience_tests.control.killswitch import ledger_for, revert_outstanding
+from resilience_tests.control.target_lock import TargetBusy, TargetLock  # noqa: F401  (TargetBusy re-exported)
 from resilience_tests.control.ledger import InjectionLedger, LedgerEntry
 from resilience_tests.control.matrix import RunPlanItem, missing_infra, not_built_reason
 from resilience_tests.control.profile import EnvProfile
@@ -51,6 +52,7 @@ from resilience_tests.control.reset import resolve_reset
 from resilience_tests.control.safety import SafetyController, SafetyViolation
 from resilience_tests.execution import injectors  # noqa: F401  (registers drivers)
 from resilience_tests.execution.injectors.base import FaultInjector, FaultNotLanded, resolve
+from resilience_tests.execution.injectors.server_settings import SERVER_SETTINGS, OsSshServerSettingsDriver
 from resilience_tests.analysis import activity as activity_mod
 from resilience_tests.execution.probes.activity import DbActivitySampler, HostStatsSampler
 from resilience_tests.execution.probes.probers import (
@@ -74,6 +76,7 @@ from resilience_tests.execution.workload.hooks import (
 )
 from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals, write_db_markers
 from resilience_tests.observability.event_stream import EventStream
+from resilience_tests.observability.observer import NoObserver, RunObserver, observer_for
 
 EVENTS_FILE = "events.jsonl"
 INTEGRITY_FILE = "integrity.txt"
@@ -81,6 +84,9 @@ HISTORY_FILE = "history.edn"
 ELLE_DIR = "elle"
 WORKLOAD_RAMP_S = 1.0  # one sample period after every worker has connected (see _p_baseline)
 RECOVERY_POLL_S = 1.0
+# init's extra time when a scenario's server_settings need a restart (the adapter's own restart
+# and readiness bounds, configuration.py RESTART_TIMEOUT_S + READY_TIMEOUT_S, plus margin)
+SERVER_SETTINGS_EXTENSION_S = 400.0
 ABORT_POLL_S = 1.0
 RECOVERY_EXIT_MARGIN_S = 5.0  # leave the recovery loop before its phase timeout fires
 # A kill attempt that changed nothing (the targeted process ended first) is retried this many
@@ -88,10 +94,10 @@ RECOVERY_EXIT_MARGIN_S = 5.0  # leave the recovery loop before its phase timeout
 MAX_LANDING_ATTEMPTS = 3
 
 
-class TargetBusy(RuntimeError):
-    """Another run holds this target. Two runs against one node corrupt each other's
-    measurements (the second run's init truncates the first run's marker table), so the
-    harness refuses rather than producing numbers nobody can trust."""
+# TargetBusy: another run holds this target. Two runs against one node corrupt each other's
+# measurements (the second run's init truncates the first run's marker table), so the harness
+# refuses rather than producing numbers nobody can trust. Raised by the driver host's own lock
+# and by the lock on the target host (target_lock.py), which also sees other harness hosts.
 
 
 @dataclass(frozen=True)
@@ -162,6 +168,11 @@ class TestOrchestrator:
         self._phase_bound: asyncio.Timeout | None = None     # the running phase's bound (extendable)
         self._phase_extra_s = 0.0
         self._lock_fh: Any = None
+        self._remote_lock: TargetLock | None = None   # the lock on the target host, while held
+        self._target_lock_info: dict[str, Any] = {}    # what taking it found (e.g. a stale lock taken over)
+        # L4 (Arch §9): the environment's metrics stack -- context only, never a pass/fail source
+        self.observer: RunObserver = NoObserver()
+        self._run_start_wall = 0.0
         self._workload_failure: str | None = None
         self.cycle_t0s: list[int] = []          # one T0 per crash cycle (Framework NL-C-05)
         self.cycle_details: list[dict[str, Any]] = []
@@ -210,14 +221,55 @@ class TestOrchestrator:
             self._lock_fh.close()
             self._lock_fh = None
 
+    async def _finish_observation(self, status: str) -> None:
+        """The run as one region on the dashboards, its metrics copied into the run folder and the
+        dashboard link for the report (observer.py). Context only: recorded as facts, and what
+        could not be done is disclosed -- the status is never touched."""
+        facts = await self.observer.finish(self.run_dir, self._run_start_wall, time.time(), status)
+        if facts:
+            self.facts["observability"] = facts
+            if facts.get("disclosure"):
+                self.disclosures.append(facts["disclosure"])
+
+    async def _acquire_remote_lock(self) -> None:
+        """The lock on the target host (safety.target_lock), seen by every harness host. Taken
+        after the driver host's own lock and before anything is written; held until cleanup is
+        over. Raises TargetBusy, naming the holder."""
+        spec = self.profile.safety.target_lock
+        if spec is None:
+            return
+        lock = TargetLock(self.node, spec, run_id=self.run_id, scenario=self.scenario.id, profile=self.profile.name)
+        self._target_lock_info = await lock.acquire()
+        self._remote_lock = lock
+        lock.start_heartbeat()
+
+    async def _release_remote_lock(self) -> None:
+        lock, self._remote_lock = self._remote_lock, None
+        if lock is None:
+            return
+        try:
+            self.facts["target_lock"] = {**self._target_lock_info, **await lock.release(),
+                                         **({"lost": lock.lost} if lock.lost else {})}
+        except Exception as exc:  # noqa: BLE001 -- a lock left behind is taken over once its heartbeat is stale
+            self.facts["target_lock"] = {"release_error": f"{type(exc).__name__}: {exc}"}
+
     async def run(self) -> dict[str, Any]:
         self._assert_on_driver_host()
         # before the lock: this refuses outright, and a held lock would then make every later
         # scenario on this node report the target as busy
         self._refuse_if_already_faulted()
         self._acquire_target_lock()
+        try:
+            await self._acquire_remote_lock()
+        except BaseException:
+            self._release_target_lock()
+            raise
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.stream = EventStream(self.run_dir / EVENTS_FILE)
+        # attached before run_start, so the dashboards mark the run from its first event
+        self.observer = observer_for(self.profile, self.node, run_id=self.run_id, scenario=self.scenario.id)
+        self.disclosures.extend(await self.observer.start(self.stream))
+        self._run_start_wall = time.time()
         self.stream.emit("orchestrator", "run_start", run_id=self.run_id, scenario=self.scenario.id,
                          profile=self.profile.name, node=self.node.name, options=asdict(self.options))
         status, error = "error", None
@@ -237,6 +289,8 @@ class TestOrchestrator:
         except BaseException:
             # Interrupted (Ctrl-C / cancellation): still never strand a node in a faulted state.
             await asyncio.shield(self._emergency_cleanup())
+            await asyncio.shield(self.observer.close())
+            await asyncio.shield(self._release_remote_lock())
             self._release_target_lock()
             raise
         if self._abort_reason and status in ("error", "aborted"):
@@ -246,6 +300,8 @@ class TestOrchestrator:
         await self._phase("report", results=results, swallow=True)
         await self._phase("cleanup", swallow=True)
         status, error = self._after_cleanup(status, error)
+        await self._release_remote_lock()       # after cleanup: the target is ours until it is clean
+        await self._finish_observation(status)
         results = self._results(status, error)  # final: includes the cleanup record
         self._write_results(results)
         self._close_stream()
@@ -429,6 +485,9 @@ class TestOrchestrator:
                 f"Configuration deviation in postgresql.auto.conf: "
                 f"{', '.join(f'{k}={v}' for k, v in sorted(deviations.items()))}"
             )
+        # after the deployment's settings were recorded above, before the workload's data and the
+        # baseline: the run is measured under the settings it declares
+        await self._apply_server_settings()
         # Profile hooks (docs/tpcc-contract.md §6): the custom workload's do nothing.
         self.workload_hooks = hooks_for(self.scenario.workload)
         # after the target checks above: a reset writes to the target
@@ -959,13 +1018,57 @@ class TestOrchestrator:
         self.verdict = threshold_eval.evaluate(self.scenario.accept, m, self.not_measured)
         return {"verdict": "pass" if self.verdict.passed else "fail"}
 
+    async def _apply_server_settings(self) -> None:
+        """The cluster-level settings the scenario declares (catalog server_settings): planned
+        read-only, journalled in the ledger BEFORE anything changes, then written to the
+        server's configuration file and applied by a restart (OsSshServerSettingsDriver).
+        Restored by cleanup's revert -- or by the kill switch after a crash -- like an injection.
+        A value already in effect is left alone; nothing is changed at all if none differs."""
+        wanted = self.scenario.server_settings
+        if not wanted:
+            return
+        driver = OsSshServerSettingsDriver(self.profile)
+        driver.use_adapter(self.adapter)
+        try:
+            plan = await driver.plan(self.node, wanted)
+        except (ServerSettingsRefused, NotImplementedError) as exc:
+            raise PhaseAbort(f"server_settings cannot be applied: {exc}") from None
+        self.facts["server_settings"] = {"plan": plan}
+        if plan["unchanged"]:
+            self.disclosures.append(
+                "Server settings already in effect, left unchanged: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(plan["unchanged"].items())))
+        if not plan["changes"]:
+            return
+        # a restart, and the wait until the server accepts connections again
+        self._extend_phase(SERVER_SETTINGS_EXTENSION_S, "server settings: restart to apply them")
+        entry = self.ledger.intent(run_id=self.run_id, env_profile=self.profile.name, fault_type=SERVER_SETTINGS,
+                                   driver=driver.driver_name, node=self.node.name,
+                                   detail={"section": DEFAULT_DRIVER_SECTION, **driver.prepare(plan, self.run_id)})
+        # a failure here leaves the entry outstanding: cleanup's revert removes what was written
+        detail = await driver.inject(self.node)
+        self.ledger.transition(entry, "applied", **{"apply": detail})
+        self.facts["server_settings"]["applied"] = detail
+        self.disclosures.append(
+            f"Server settings changed for this run in {plan['config_file']} (the service was restarted "
+            "before the baseline; the file and values are restored after the run): "
+            + ", ".join(f"{k} {c['from']} -> {c['to']}" for k, c in sorted(plan["changes"].items())))
+
+    def _settings_set_by_harness(self) -> dict[str, str]:
+        """The values the harness itself set for this run (server_settings), as the server
+        reports them -- expected in `_settings_unchanged`, not a change by someone else."""
+        applied = (self.facts.get("server_settings") or {}).get("applied") or {}
+        return {k: v for k, v in (applied.get("after") or {}).items() if v is not None}
+
     async def _settings_unchanged(self) -> dict[str, Any]:
         """Resilience Testing document, section 2.3, cleanup check: the settings that matter,
-        read again after the fault, equal what was recorded at init. The harness never writes
-        them, so a difference is a change made by someone or something else during the run."""
+        read again after the fault, equal what was recorded at init -- or, for one the scenario's
+        server_settings changed, what the harness set. Any other difference is a change made by
+        someone or something else during the run."""
         before = self.facts.get("scenario_observed")
         if not before:
             return {}       # this fault records no settings: nothing to compare
+        before = {**before, **{k: v for k, v in self._settings_set_by_harness().items() if k in before}}
         try:
             after = await self.fault_behaviour.observe_settings()
             if self.during_behaviour is not None:

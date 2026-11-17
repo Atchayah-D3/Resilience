@@ -52,6 +52,7 @@ from resilience_tests.adapters.postgresql.sessions import (  # noqa: F401  (re-e
 )
 from resilience_tests.adapters.postgresql.tpcc import TpccMixin, call_tpcc  # TPC-C SQL (build steps 4, 6)
 from resilience_tests.adapters.postgresql.analytics import AnalyticsMixin  # NL-N-I01 report sessions
+from resilience_tests.adapters.postgresql.configuration import ConfigurationMixin  # catalog server_settings
 from resilience_tests.control.profile import DbEndpoint, Node
 from resilience_tests.execution.remote import RemoteHost, privileged
 
@@ -388,7 +389,8 @@ class PostgreSQLSession(DatabaseSession):
 
 
 @register_adapter
-class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMixin, AnalyticsMixin, BaseDatabaseAdapter):
+class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMixin, AnalyticsMixin, ConfigurationMixin,
+                        BaseDatabaseAdapter):
     engine = "postgresql"
     capabilities = frozenset({
         Capability.TPCC_WORKLOAD,          # tables, loader, the five functions, consistency (TPC-C steps 4, 6)

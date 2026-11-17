@@ -41,6 +41,13 @@ nodes:
     os_user: postgres
     service: shaktidb-resilience.service
     log_file: /var/lib/resilience/pgdata/logfile
+    config_file: /var/lib/resilience/pgdata/postgresql.conf   # edited for a scenario's server_settings, restored after
+
+observability:                   # L4 (Arch §9): context only, never pass/fail -- infra/monitoring/README.md
+  prometheus_url: http://localhost:9090
+  grafana_url: http://10.11.21.13:3000             # the report links here: reachable from a browser
+  grafana_token_file: ~/.config/resilience/grafana-token
+  exporters: {node: 9100, postgres: 9187}
 
 safety:                          # Arch §15: default deny, plus an operator-created sentinel
   allowlist:
@@ -48,6 +55,7 @@ safety:                          # Arch §15: default deny, plus an operator-cre
     inventory_tag: resilience-lab-e2
   sentinel_table: resilience.harness_target
   max_data_fs_used_pct: 90        # standing abort: stop before the data filesystem fills (operator-owned margin)
+  target_lock: {}                  # one run at a time on this target, whichever harness host starts it
 
 phase_timeouts_s:                # every phase is bounded; an unbounded wait is a defect (Arch §15)
   reset: 600

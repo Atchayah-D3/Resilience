@@ -1,0 +1,10 @@
+# Grafana data source: the harness host's Prometheus. Installed by setup-harness-host.sh.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus                  # the dashboard refers to this uid
+    type: prometheus
+    url: http://localhost:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 1s               # Arch §9: 1 s scrape during test windows

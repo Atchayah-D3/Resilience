@@ -48,6 +48,7 @@ safety:                          # Arch §15: default deny, plus an operator-cre
     inventory_tag: resilience-lab-e2
   sentinel_table: resilience.harness_target
   max_data_fs_used_pct: 90        # standing abort: stop before the data filesystem fills (operator-owned margin)
+  target_lock: {}                  # one run at a time on this target, whichever harness host starts it
 
 phase_timeouts_s:                # every phase is bounded; an unbounded wait is a defect (Arch §15)
   reset: 600

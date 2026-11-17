@@ -13,6 +13,12 @@
   <div><b>Target</b> {{ v.target.get("node", "?") }} ({{ v.target.get("role", "?") }})</div>
   <div><b>Duration</b> {{ v.duration or "?" }} s</div>
 </div>
+{% if v.grafana_link or v.metrics_file %}
+<div class="banner note"><b>Metrics</b> (context only, never part of the verdict):
+  {% if v.grafana_link %}<a href="{{ v.grafana_link }}">open this run in Grafana</a>{% endif %}
+  {% if v.grafana_link and v.metrics_file %} &middot; {% endif %}
+  {% if v.metrics_file %}<a href="{{ v.metrics_file }}">{{ v.metrics_file }}</a> (copied from Prometheus){% endif %}</div>
+{% endif %}
 
 {% for n in v.notes %}<div class="banner note">{{ n }}</div>{% endfor %}
 {% if not v.has_verdict and v.status != "stopped_before_fault" %}

@@ -147,6 +147,9 @@ def build_run_view(ev: RunEvidence, now: dt.datetime | None = None) -> dict[str,
         "during": facts.get("during"), "during_verification": facts.get("during_verification"),
         "disclosures": list(r.get("disclosures") or []),
         "files": files, "notes": notes,
+        # L4 context (observer.py): the run on the environment's dashboards -- never part of the verdict
+        "grafana_link": (facts.get("observability") or {}).get("grafana_link"),
+        "metrics_file": (facts.get("observability") or {}).get("metrics_file"),
         "generated_at": (now or dt.datetime.now(dt.UTC)).strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
 

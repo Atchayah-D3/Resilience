@@ -704,8 +704,37 @@ class AnalyticsSupport:
         raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
 
 
+class ConfigurationSupport:
+    """Cluster-level settings a scenario runs under (catalog server_settings): recorded,
+    written to the server's configuration file, applied by a restart, verified -- and restored
+    after the run by the same route. Never through the engine's own ALTER-style commands: the
+    change is one block in one file, so removing that block restores exactly what was there."""
+
+    async def plan_server_settings(self, wanted: Mapping[str, str]) -> dict[str, Any]:
+        """Read only: compare `wanted` with what the server runs now. Returns {"config_file",
+        "changes": {name: {"from", "to"}}, "unchanged": {name: value}}. Raises
+        ServerSettingsRefused for anything it cannot honestly change (an unknown setting, one
+        the file cannot override, a configuration file other than the profile's)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot change server settings")
+
+    async def apply_server_settings(self, plan: Mapping[str, Any], tag: str) -> dict[str, Any]:
+        """Write the plan's changes to the configuration file as one block marked with `tag`,
+        restart, and verify every change is in effect. Restores and raises if one is not."""
+        raise NotImplementedError(f"{type(self).__name__} cannot change server settings")
+
+    async def restore_server_settings(self, detail: Mapping[str, Any]) -> dict[str, Any]:
+        """Remove the block `apply_server_settings` wrote (from its ledger detail; idempotent),
+        restart if it was there, and verify every setting is back to its recorded value. Raises
+        if one is not, so the ledger keeps the change outstanding for the kill switch."""
+        raise NotImplementedError(f"{type(self).__name__} cannot restore server settings")
+
+
+class ServerSettingsRefused(RuntimeError):
+    """A scenario's server_settings cannot be applied as declared; nothing was changed."""
+
+
 class BaseDatabaseAdapter(CoreAdapter, SessionFaultSupport, OperationSupport, CorruptionSupport, TpccSupport,
-                          AnalyticsSupport):
+                          AnalyticsSupport, ConfigurationSupport):
     """Per-engine implementation: the core plus every fault-support interface, which is what
     the harness types against. Registered by engine name; selected by the env profile. An
     engine overrides what it supports; everything else keeps the interfaces' defaults, which

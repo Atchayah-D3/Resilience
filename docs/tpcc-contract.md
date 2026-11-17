@@ -45,7 +45,7 @@ workload:
 
 | Field | Meaning | Rules |
 |---|---|---|
-| `session` | settings each clerk sets on its own connection when it connects | only `lock_timeout`, `statement_timeout`, `idle_in_transaction_session_timeout`. Never `ALTER ROLE`, never a server setting, so nothing leaks into the next scenario |
+| `session` | settings each clerk sets on its own connection when it connects | only `lock_timeout`, `statement_timeout`, `idle_in_transaction_session_timeout`, `transaction_timeout` (PostgreSQL 17+). Never `ALTER ROLE`, never a server setting, so nothing leaks into the next scenario |
 | `groups` | names for groups of clerks; every sample reports each group separately | names: small letters, digits, `_`; unique; the name `all` is reserved. **The clerks of all groups must add up to `concurrency`**, so every clerk is in exactly one named group. Without `groups`, all clerks are in the group `all` |
 | `tpcc.warehouses` | the TPC-C data size the scenario expects | init refuses the run if the loaded data has a different size |
 | `tpcc.home_warehouse` | which warehouse the clerks of a group work on | clerks not named here are spread over all warehouses, 5 warehouses per clerk (TPC-C standard size) |

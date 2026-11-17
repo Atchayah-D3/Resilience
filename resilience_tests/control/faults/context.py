@@ -127,6 +127,13 @@ class RunContext:
         assert self._run.stream is not None
         self._run.stream.emit("orchestrator", kind, **data)
 
+    def milestone(self, text: str, at_mono_ns: int | None = None) -> None:
+        """A moment inside the fault worth seeing on the timeline (e.g. NL-N-I03: the schema
+        change issued, then ended) -- an event any fault behaviour can mark, shown on the
+        dashboards at `at_mono_ns` (when it happened, not when it was noticed). Evidence of
+        what happened when; no measure is computed from it."""
+        self.emit("fault_milestone", text=text, **({"at_mono_ns": int(at_mono_ns)} if at_mono_ns else {}))
+
     # ------------------------------------------------------------------ the fault itself
 
     async def arm_fault(self) -> None:

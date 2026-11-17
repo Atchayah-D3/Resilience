@@ -74,6 +74,9 @@ class Node(_Model):
     os_user: str  # OS account owning the database (adapters run local tools as this user)
     service: str
     log_file: str
+    # The server's main configuration file, which the harness edits for a scenario's
+    # server_settings (and restores after the run). None: the engine's default inside pgdata.
+    config_file: str | None = None
     power_domain: str | None = None  # the node's identity at the power-control layer
     # The address range the driver host appears to come from, as seen by this node. Usually
     # the driver host itself, but not when traffic is translated on the way (NAT, a bastion).
@@ -140,6 +143,21 @@ class Allowlist(_Model):
     inventory_tag: str
 
 
+class TargetLockSpec(_Model):
+    """The lock held on the target host while a run uses it (control/target_lock.py), so runs
+    from different harness hosts cannot overlap on one target."""
+
+    path: str | None = None            # default /var/tmp/resilience-harness-<db port>.lock
+    stale_after_s: float = Field(default=900.0, gt=0)   # a lock not refreshed this long is a dead run's
+    heartbeat_s: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode="after")
+    def _beats_inside_stale(self) -> TargetLockSpec:
+        if self.heartbeat_s * 3 > self.stale_after_s:
+            raise ValueError("target_lock: stale_after_s must allow at least three missed heartbeats")
+        return self
+
+
 class Safety(_Model):
     """Arch §15: environment allowlist (default deny) and the destructive-scenario gate.
 
@@ -156,6 +174,27 @@ class Safety(_Model):
     # than this. A crash loop or blocked vacuum can fill it, and where PGDATA shares the root
     # filesystem a full disk takes the host down with it. Operator-owned; None = no such abort.
     max_data_fs_used_pct: float | None = Field(default=None, gt=0, le=100)
+    # Arch §15 "one target, one run": a lock on the target host itself, seen by every harness
+    # host. None: only the driver host's own lock (runs from other harness hosts are not seen).
+    target_lock: TargetLockSpec | None = None
+
+
+class Observability(_Model):
+    """L4 Observability (Arch §9): where this environment's metrics and dashboards live.
+    Context and trend only -- never a pass/fail source (Arch §7.1). The harness marks each
+    run's events on the dashboards and copies the run window's metrics into the run folder;
+    a stack that does not answer is disclosed, and the run is judged exactly as without it.
+    Set up with infra/monitoring/ (README.md there)."""
+
+    prometheus_url: str = Field(pattern=r"^https?://\S+$")
+    # also the address the run report links to, so it must be reachable from a browser
+    grafana_url: str = Field(pattern=r"^https?://\S+$")
+    # a file on the driver host holding a Grafana service-account token (Editor); never the token
+    grafana_token_file: str
+    grafana_dashboard_uid: str = Field(default="resilience-run", pattern=r"^[A-Za-z0-9_-]{1,40}$")
+    # exporter ports on every node, by Prometheus job name (scrape_config.py builds the targets)
+    exporters: dict[str, int] = Field(default_factory=lambda: {"node": 9100, "postgres": 9187})
+    scrape_interval_s: float = Field(default=1.0, gt=0)   # Arch §9: 1 s during test windows
 
 
 class EnvProfile(_Model):
@@ -169,6 +208,7 @@ class EnvProfile(_Model):
     os_ssh: OsSsh | None = None
     storage_fault: StorageFault
     alerting: Alerting = Alerting()
+    observability: Observability | None = None   # None: no metrics stack for this environment
     # Infrastructure this environment provides (docs/infra-requirements.md). A scenario that
     # needs something not listed is skipped with the reason -- never run on a substitute.
     infra: list[InfraFeature] = Field(default_factory=list)

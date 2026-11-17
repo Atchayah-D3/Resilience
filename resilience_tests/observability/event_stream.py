@@ -14,7 +14,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -68,12 +68,24 @@ class EventStream:
         self._fh = path.open("a", buffering=1)
         self._lock = threading.Lock()
         self._events: list[Event] = []
+        self._subscribers: list[Callable[[Event], None]] = []
+
+    def subscribe(self, callback: Callable[[Event], None]) -> None:
+        """Be told of every event after it is on disk (L4 observers: dashboards, Arch §9). A
+        subscriber is context only: it must return at once, and one that raises is ignored --
+        it can never stop an event from being recorded or a run from being measured."""
+        self._subscribers.append(callback)
 
     def emit(self, source: str, kind: str, **data: Any) -> Event:
         event = Event(self.clock.mono_ns(), self.clock.wall(), source, kind, data)
         with self._lock:
             self._fh.write(event.to_json() + "\n")
             self._events.append(event)
+        for callback in self._subscribers:
+            try:
+                callback(event)
+            except Exception:  # noqa: BLE001 -- see subscribe(): never at the cost of the record
+                pass
         return event
 
     def sync(self) -> None:

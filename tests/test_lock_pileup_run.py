@@ -200,6 +200,8 @@ def short(sid: str, **plan):
                   "requires": ["contended_table" if r == "tpcc_workload" else r for r in sc.requires]}
     pileup = sc.fault.lock_pileup.model_copy(update=plan)
     accept = [SHORT_OTHERS_BUDGET if a == OTHERS_BUDGET else a for a in sc.accept if a not in TPCC_ONLY]
+    # the scenario's server settings are tested with an engine that has them (test_server_settings_run)
+    update.setdefault("server_settings", {})
     return sc.model_copy(update={"fault": sc.fault.model_copy(update={"duration": HOLD_S, "lock_pileup": pileup}),
                                  "steady_state": sc.steady_state.model_copy(update={"duration_s": BASELINE_S,
                                                                                     "warmup_s": 0.0}),
@@ -217,6 +219,13 @@ def run_3a(profile):
 
 def test_run_3a_passes_when_the_lock_timeout_clears_the_queue(lock_env):
     results = run_3a(lock_env)
+    # the timeline marks when the schema change was issued and when it ended (RunContext.milestone)
+    import json as _json
+    events = [_json.loads(line) for line in open(f"{results['evidence_dir']}/events.jsonl")]
+    milestones = [e["data"] for e in events if e["kind"] == "fault_milestone"]
+    assert [m["text"].split(":")[0] for m in milestones] == ["schema change issued", "schema change ended"]
+    assert all(isinstance(m.get("at_mono_ns"), int) for m in milestones)
+    assert milestones[1]["text"] == "schema change ended: lock_timeout"
     assert results["status"] == "passed", why(results)
     m = results["measured"]
     assert m["fault_confirmed"] is True and m["ddl_lock_timeout_fired"] is True and m["ddl_completed"] is False

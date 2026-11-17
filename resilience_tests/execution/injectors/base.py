@@ -39,6 +39,9 @@ class FaultInjector(ABC):
 
     fault_types: ClassVar[frozenset[str]]
     driver_name: ClassVar[str]
+    # True for a change the harness makes for a run that is not a fault (a scenario's server
+    # settings): journalled and reverted like an injection, but it has no fault behaviour.
+    harness_setup: ClassVar[bool] = False
 
     def __init__(self, profile: EnvProfile, fault_type: str) -> None:
         self.profile = profile

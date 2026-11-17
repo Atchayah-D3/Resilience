@@ -1,0 +1,10 @@
+# Grafana loads the framework's dashboards from the repository checkout (dashboards as code).
+# setup-harness-host.sh replaces @DASHBOARDS_DIR@ with this checkout's infra/monitoring/grafana/dashboards.
+apiVersion: 1
+providers:
+  - name: resilience
+    folder: Resilience
+    type: file
+    allowUiUpdates: false
+    options:
+      path: "@DASHBOARDS_DIR@"

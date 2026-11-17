@@ -240,7 +240,9 @@ def test_every_fault_type_a_driver_serves_has_a_behaviour():
     without a behaviour would inject a fault whose recovery nobody defined."""
     from resilience_tests.execution.injectors import base as injectors
 
-    served = {t for classes in injectors._REGISTRY.values() for cls in classes for t in cls.fault_types}
+    # a harness-setup driver (a scenario's server settings) applies a change for the run, not a fault
+    served = {t for classes in injectors._REGISTRY.values() for cls in classes for t in cls.fault_types
+              if not cls.harness_setup}
     assert served <= set(_FAULTS), f"served by a driver but no behaviour: {sorted(served - set(_FAULTS))}"
 
 

@@ -109,8 +109,10 @@ def test_invalid_groups_are_refused_with_the_reason(groups, problem):
 # --- 4. session settings -------------------------------------------------------------------
 
 
-def test_session_settings_are_the_three_timeouts_only():
-    assert c.SESSION_SETTINGS == {"lock_timeout", "statement_timeout", "idle_in_transaction_session_timeout"}
+def test_session_settings_are_the_timeouts_only():
+    # transaction_timeout (PostgreSQL 17+): NL-N-I03's queued queries must not be ended by a server value
+    assert c.SESSION_SETTINGS == {"lock_timeout", "statement_timeout", "idle_in_transaction_session_timeout",
+                                  "transaction_timeout"}
 
 
 # --- 5. outcomes, types and measures -------------------------------------------------------

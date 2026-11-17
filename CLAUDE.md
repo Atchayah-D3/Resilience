@@ -29,6 +29,7 @@ measures what the failure cost: transactions lost (RPO), time to recover (RTO), 
 | `resilience_tests/adapters/postgresql/` | All database-session knowledge of PostgreSQL (the OS/SSH drivers also run PostgreSQL tools; see the review note in `docs/code-improvement/`) (`adapter.py` core + corruption/operations/sessions mixins, one per interface group in `adapters/base.py`; `host.py` declares what the mixins use from the core) |
 | `resilience_tests/execution/injectors/process.py` | os_ssh driver: kill, restart, reload, idle txn, connection flood (one class per fault; shared helpers in `os_ssh.py`) |
 | `resilience_tests/execution/workload/driver.py` | asyncpg marker workload (+ Elle list-append mode) |
+| `resilience_tests/observability/` + `infra/monitoring/` | L4 context, never pass/fail: event stream; Prometheus + Grafana on the harness host (env profile `observability:`), run markers, `metrics.json`, report link; setup in `infra/monitoring/README.md` |
 | `resilience_tests/analysis/` | RTO decomposer, repeated-fault cycles, hold-window load ratios, predicates/verdict, report, Elle checker |
 | `tests/` | Unit tests with fake engines -- plumbing, not scenarios |
 | `vendor/elle/` | `setup_elle.sh` installs the pinned elle-cli jar (Java 21+) |
