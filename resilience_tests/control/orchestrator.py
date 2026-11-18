@@ -75,6 +75,8 @@ from resilience_tests.execution.workload.hooks import (
     split_checks,
 )
 from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals, write_db_markers
+from resilience_tests.execution.workload.service.state import WorkloadRunning
+from resilience_tests.execution.workload.service.state import refuse_if_running as refuse_if_workload_running
 from resilience_tests.observability.event_stream import EventStream
 from resilience_tests.observability.observer import NoObserver, RunObserver, observer_for
 
@@ -431,6 +433,13 @@ class TestOrchestrator:
             raise PhaseAbort(f"blocked by infrastructure: profile {self.profile.name!r} does not provide "
                              f"{', '.join(lacking)} (docs/infra-requirements.md)")
         self.safety.check_static([self.node])
+        # The common long-running workload (specs/007) owns the marker table, the TPC-C data and the
+        # clerks while it runs; this run would empty the first, may reload the second and starts its
+        # own clerks. Scenarios attach to that workload in the next story; until then, refused.
+        try:
+            await refuse_if_workload_running(self.profile, self.node, f"scenario {self.scenario.id}")
+        except WorkloadRunning as exc:
+            raise PhaseAbort(str(exc)) from None
         hostname = (await run_once(self.node.ssh, "hostname", timeout_s=15)).stdout.strip()
         sentinel = await self.adapter.sentinel(self.profile.safety.sentinel_table, hostname)
         self.facts["fingerprint"] = self.safety.check_fingerprint(self.node, hostname, sentinel)

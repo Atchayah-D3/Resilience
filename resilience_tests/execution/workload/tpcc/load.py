@@ -51,8 +51,17 @@ def _args(argv: list[str]) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
-async def check_target(profile: EnvProfile, node: Node, adapter: BaseDatabaseAdapter) -> str:
-    """The harness's fingerprint check (control/safety.py), for a command that is not a scenario."""
+async def check_target(profile: EnvProfile, node: Node, adapter: BaseDatabaseAdapter, *, writes: bool = True) -> str:
+    """The harness's fingerprint check (control/safety.py), for a command that is not a scenario.
+    `writes`: the command empties the marker table, loads, drops or runs clerks -- refused while the
+    common long-running workload runs on the target (service/state.py), whose evidence and
+    customers it would disturb. Read-only commands (load --status, --check) pass writes=False."""
+    if writes:
+        from resilience_tests.execution.workload.service.state import WorkloadRunning, refuse_if_running
+        try:
+            await refuse_if_running(profile, node, "this command")
+        except WorkloadRunning as exc:
+            raise Refused(str(exc).removeprefix("this command refused: ")) from None
     if profile.environment == "production":
         raise Refused(f"profile {profile.name} is a production environment (Framework §7.1)")
     hostname = (await run_once(node.ssh, "hostname", timeout_s=15)).stdout.strip()
@@ -75,7 +84,7 @@ async def _main(a: argparse.Namespace) -> int:
     profile = load_profile(a.env)
     node = profile.node(a.node) if a.node else profile.nodes[0]
     adapter = adapter_for(profile.database.engine, node)
-    hostname = await check_target(profile, node, adapter)
+    hostname = await check_target(profile, node, adapter, writes=not (a.status or a.check))
     print(f"target {hostname} ({profile.name}, {node.db.host}:{node.db.port}/{node.db.dbname})")
 
     if a.status:

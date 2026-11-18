@@ -94,6 +94,10 @@ def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None) -> 
     corrected = [v for r in raws for v in r.get("corrected", r["latencies"])]
     missed = sum(r.get("missed", 0) for r in raws)
     capped = any(r.get("corrected_capped") for r in raws)
+    error_kinds: dict[str, int] = {}
+    for r in raws:
+        for kind, n in r.get("error_kinds", {}).items():
+            error_kinds[kind] = error_kinds.get(kind, 0) + n
 
     by_type: dict[str, Any] = {}
     for t in contract.TPCC_TYPES:
@@ -121,6 +125,7 @@ def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None) -> 
             "p50_ms": percentile(lat, 0.50), "p90_ms": percentile(lat, 0.90), "p95_ms": percentile(lat, 0.95),
             "max_ms": max(lat) if lat else None,
             "p99_corrected_ms": p99(corrected), "missed": missed, "corrected_capped": capped,
+            "error_kinds": dict(sorted(error_kinds.items())),
             contract.BY_TYPE: by_type, contract.BY_GROUP: by_group}
 
 

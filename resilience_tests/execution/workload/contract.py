@@ -80,7 +80,20 @@ SAMPLE_FIELDS: tuple[str, ...] = (
 #   p99_corrected_ms   p99 corrected for stalls and outages (coordinated omission), next to p99_ms
 #   missed             planned transaction starts that were never made (the database stuck or down)
 #   corrected_capped   true when p99_corrected_ms is a lower bound (too many late starts to keep)
-TPCC_EXTRA_SAMPLE_FIELDS: tuple[str, ...] = ("p99_corrected_ms", "missed", "corrected_capped")
+TPCC_EXTRA_SAMPLE_FIELDS: tuple[str, ...] = ("p99_corrected_ms", "missed", "corrected_capped", "error_kinds")
+
+# `error_kinds` in a TPC-C sample: the interval's errors by kind, {kind: count}. Business rollbacks
+# (TPC-C's expected 1%) are not errors and are not here; failed connection attempts are counted in
+# `connect_failures`. Added for the common long-running workload (specs/007).
+ERROR_KIND_TIMEOUT = "timeout"                  # no answer within the transaction timeout: outcome unknown
+ERROR_KIND_CONNECTION_LOST = "connection_lost"  # the connection broke during the transaction: outcome unknown
+ERROR_KIND_CLIENT = "client_error"              # an error on the harness side, not classified: outcome unknown
+ERROR_KIND_SERVER_PREFIX = "server_"            # the server rolled the transaction back, with its SQLSTATE
+
+
+def error_kind_server(sqlstate: str | None) -> str:
+    """The kind of a sure rollback the server answered, e.g. server_40P01 (deadlock)."""
+    return f"{ERROR_KIND_SERVER_PREFIX}{sqlstate or 'unknown'}"
 
 # New, extra fields: one entry per transaction type and per clerk group.
 BY_TYPE = "by_type"

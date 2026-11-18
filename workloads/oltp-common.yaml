@@ -1,0 +1,42 @@
+# The common long-running TPC-C workload (specs/007-common-oltp-workload).
+# Started and stopped only by its own commands; no scenario starts, stops or changes it:
+#   python -m resilience_tests.execution.workload.service.cli start  --env e2-u22-3 --config workloads/oltp-common.yaml
+#   python -m resilience_tests.execution.workload.service.cli status --env e2-u22-3
+#   python -m resilience_tests.execution.workload.service.cli stop   --env e2-u22-3
+# Hosts come from the environment file. The settings actually used (sizes and rate as numbers)
+# are written into the run's summary.json.
+id: oltp-common
+description: >-
+  One TPC-C workload for the whole resilience run, like a production OLTP system's traffic;
+  scenarios inject their faults into it (attach: next story).
+
+duration_s: 7200            # 2 hours in total, the warm-up included
+warmup_s: 300               # not measured: caches fill, the workload settles
+metrics_interval_s: 10      # one summary line per 10 s (intervals-10s.jsonl), next to the 1-second lines
+status_interval_s: 5        # status.json rewritten this often
+worker_processes: 2         # the clerks in 2 processes of their own, apart from the main program
+no_commit_alert_s: 600      # no commit for 10 min: alert in status and events; the workload keeps trying
+fresh_load: false           # true: reload the data at the start even when it could be used as it is
+
+workload:
+  profile: tpcc
+  concurrency: 64                     # clerks (connections), 64 as in the scenarios
+  transaction_markers: true           # journals before and after every writing transaction (RPO)
+  # 60% of the maximum the capacity test stored for this layout (64 clerks, all warehouses).
+  # Without that record the start is refused with the command to measure it. NEEDS SIGN-OFF:
+  # replace with a fixed rate_tps once the first baseline shows the right level.
+  rate_fraction_of_capacity: 0.6
+  latency_from: intended_start        # latency counted from when a transaction was due (stalls show)
+  tpcc:
+    warehouses: by_cache              # calculated from the target's memory cache at the start
+    order_line_cache_multiple: 8      # order_line about 8 x shared_buffers: data larger than memory
+
+# When the measured part (after the warm-up) is a valid baseline. NEEDS SIGN-OFF by the lead.
+baseline:
+  tps_window_s: 60
+  tps_share_min: 0.95                 # every 60 s window keeps 95% of the rate
+  p99_window_s: 10
+  p99_limit_ms: 3000                  # median of the 1-second p99 values in every 10 s window
+  error_share_max: 0.0001             # 0.01% of all transactions (business rollbacks excluded)
+  memory_growth_max: 0.10             # harness memory from minute 10 to the end
+  memory_from_s: 600

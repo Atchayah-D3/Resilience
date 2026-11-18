@@ -28,3 +28,16 @@ class InMemoryTargetLock:
 def _no_target_host_lock(monkeypatch):
     from resilience_tests.control import orchestrator
     monkeypatch.setattr(orchestrator, "TargetLock", InMemoryTargetLock)
+
+
+@pytest.fixture(autouse=True)
+def _no_target_host_workload_lock(monkeypatch):
+    """The common workload's lock on the target host (service/state.py) is read over SSH; a unit
+    test never reaches a target, so it is "free" unless a test says otherwise.
+    tests/test_workload_service.py tests the guards themselves."""
+    from resilience_tests.execution.workload.service import state
+
+    async def free(node: Any, path: str, stale_after_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(state, "remote_lock_holder", free)

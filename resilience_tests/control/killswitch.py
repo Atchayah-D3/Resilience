@@ -58,8 +58,14 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--env", required=True, help="environment profile name or path")
     ap.add_argument("--run-id", help="only this run's injections")
+    ap.add_argument("--stop-workload", action="store_true",
+                    help="also stop the common long-running workload started from this harness host "
+                         "(it is never stopped otherwise: a scenario's faults are reverted without it)")
     args = ap.parse_args(argv)
     profile = load_profile(args.env)
+    workload_ok = True
+    if args.stop_workload:
+        workload_ok = _stop_workloads(profile)
     ledger = ledger_for(profile)
     if not ledger.path.exists():
         # "no ledger" is not "nothing to revert": the run may have journalled somewhere else.
@@ -75,7 +81,33 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no outstanding injections in {ledger.path}")
     for entry, outcome in results:
         print(f"{entry.injection_id} {entry.fault_type} {entry.node}: {outcome}")
-    return 0 if all(o == "reverted" for _, o in results) else 1
+    return 0 if all(o == "reverted" for _, o in results) and workload_ok else 1
+
+
+WORKLOAD_STOP_WAIT_S = 600.0
+
+
+def _stop_workloads(profile: EnvProfile) -> bool:
+    """Ask every common workload started from this harness host on the profile's nodes to stop
+    (the same request as its `stop` command), and wait for its end checks."""
+    from resilience_tests.execution.workload.service.cli import _current, stop_running
+    from resilience_tests.execution.workload.service.state import FINAL_STATES
+
+    ok = True
+    for node in profile.nodes:
+        folder, status, alive = _current(profile, node)
+        if folder is None or not alive:
+            print(f"no common workload running on {node.name} from this harness host")
+            continue
+        folder, status = stop_running(profile, node, by="kill switch", wait_s=WORKLOAD_STOP_WAIT_S)
+        if folder is None:
+            print(f"no common workload running on {node.name} from this harness host")
+        elif status and status.get("state") in FINAL_STATES:
+            print(f"common workload on {node.name} stopped: {status.get('state')} ({folder})")
+        else:
+            ok = False
+            print(f"common workload on {node.name} has not stopped within {WORKLOAD_STOP_WAIT_S:.0f} s ({folder})")
+    return ok
 
 
 if __name__ == "__main__":

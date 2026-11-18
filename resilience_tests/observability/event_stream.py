@@ -61,9 +61,13 @@ class EventStream:
     """Append-only JSONL file. Each record is flushed as it is written, so a crashed harness
     still leaves the stream up to the last event on disk (it is part of the evidence)."""
 
-    def __init__(self, path: Path, clock: HarnessClock | None = None) -> None:
+    def __init__(self, path: Path, clock: HarnessClock | None = None, *, keep_in_memory: bool = True) -> None:
+        """`keep_in_memory=False`: the events go to the file only, and events() reads them back
+        from it -- for a stream that runs for hours (the common workload, specs/007), whose
+        memory would otherwise grow with every sample."""
         self.path = path
         self.clock = clock or HarnessClock()
+        self._keep = keep_in_memory
         path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = path.open("a", buffering=1)
         self._lock = threading.Lock()
@@ -80,7 +84,8 @@ class EventStream:
         event = Event(self.clock.mono_ns(), self.clock.wall(), source, kind, data)
         with self._lock:
             self._fh.write(event.to_json() + "\n")
-            self._events.append(event)
+            if self._keep:
+                self._events.append(event)
         for callback in self._subscribers:
             try:
                 callback(event)
@@ -102,7 +107,11 @@ class EventStream:
 
     def events(self) -> list[Event]:
         with self._lock:
-            return list(self._events)
+            if self._keep:
+                return list(self._events)
+            if not self._fh.closed:
+                self._fh.flush()
+        return read_stream(self.path)
 
     def __iter__(self) -> Iterator[Event]:
         return iter(self.events())

@@ -133,6 +133,8 @@ class TpccWorkloadDriver:
         self._window = _Window()
         self._types = {t: _Window() for t in contract.TPCC_TYPES}
         self._business = Counter()
+        # errors of the interval by kind (contract.ERROR_KIND_*): what went wrong, not only how often
+        self._error_kinds: Counter = Counter()
         self._groups = {g: _Window() for g in dict.fromkeys(t.group for t in self.terminals.values())}
         self._measure: _Window | None = None
         self._measure_t0 = 0.0
@@ -259,14 +261,17 @@ class TpccWorkloadDriver:
             marker = (seq, uid)
 
         t0 = time.monotonic()
+        unknown_kind = contract.ERROR_KIND_CONNECTION_LOST     # an unknown outcome the profile reported
         try:
             async with asyncio.timeout(TXN_TIMEOUT_S):
                 result = await self.profile.execute(session, req, marker)
             outcome, journal, sqlstate = result.outcome, dict(result.journal), result.sqlstate
         except TimeoutError:
             outcome, journal, sqlstate = contract.OUTCOME_UNKNOWN, {}, None
+            unknown_kind = contract.ERROR_KIND_TIMEOUT
         except Exception:  # noqa: BLE001 -- anything not classified is unknown, never guessed
             outcome, journal, sqlstate = contract.OUTCOME_UNKNOWN, {}, None
+            unknown_kind = contract.ERROR_KIND_CLIENT
         latency_ms = (time.monotonic() - t0) * 1000           # from the send
         from_planned_ms = latency_ms + late_ms
         planned_values = self._record_planned(from_planned_ms, missed)
@@ -296,9 +301,11 @@ class TpccWorkloadDriver:
                 self._business[req.txn_type] += 1
                 self._count(terminal, req.txn_type, latency_ms=latency_ms)
             else:
+                self._error_kinds[contract.error_kind_server(sqlstate)] += 1
                 self._count(terminal, req.txn_type, errors=1, latency_ms=latency_ms)
             return session
         # unknown: no journal line; the connection is no longer trustworthy
+        self._error_kinds[unknown_kind] += 1
         self._count(terminal, req.txn_type, indeterminate=1, drops=1, latency_ms=latency_ms)
         try:
             await session.close()
@@ -408,6 +415,7 @@ class TpccWorkloadDriver:
         w, self._window = self._window, _Window()
         types, self._types = self._types, {t: _Window() for t in contract.TPCC_TYPES}
         business, self._business = self._business, Counter()
+        error_kinds, self._error_kinds = self._error_kinds, Counter()
         groups, self._groups = self._groups, {g: _Window() for g in self._groups}
         corrected, self._corrected = self._corrected, []
         missed, self._missed = self._missed, 0
@@ -421,6 +429,7 @@ class TpccWorkloadDriver:
                        "reconnects": w.reconnects, "connect_failures": w.connect_failures},
             "latencies": list(w.latencies_ms or []), "journal_ms": list(w.journal_ms or []),
             "corrected": corrected, "missed": missed, "corrected_capped": capped,
+            "error_kinds": dict(error_kinds),
             "types": {t: {"commits": tw.commits, "errors": tw.errors, "business_rollbacks": business[t],
                           "latencies": list(tw.latencies_ms or [])} for t, tw in types.items()},
             "groups": {g: {"commits": gw.commits, "errors": gw.errors, "indeterminate": gw.indeterminate,

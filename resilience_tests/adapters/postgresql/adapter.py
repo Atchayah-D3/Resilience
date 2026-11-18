@@ -131,6 +131,10 @@ SELECT_MARKERS = "SELECT uuid::text FROM resilience.markers"
 PROBE_WRITE = "INSERT INTO resilience.probe_writes DEFAULT VALUES"
 TRUNCATE = ("TRUNCATE resilience.markers, resilience.probe_writes, resilience.churn, "
             "resilience.elle_lists, resilience.bulk_child, resilience.bulk_parent")
+# The two parts of TRUNCATE (specs/007): the tables the workload writes, emptied only by the common
+# workload at its start; and the scenario's own, emptied by a scenario that attaches to it.
+WORKLOAD_TRUNCATE = "TRUNCATE resilience.markers, resilience.churn, resilience.elle_lists"
+SCENARIO_TRUNCATE = "TRUNCATE resilience.probe_writes, resilience.bulk_child, resilience.bulk_parent"
 
 # Elle list-append micro-operations (Arch §10.3). Run at SERIALIZABLE, the level Elle is told
 # to check: PostgreSQL's REPEATABLE READ permits G2 (write skew) by design, so checking a
@@ -463,6 +467,42 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
         return int(fields[3]) if len(fields) >= 4 and fields[3].isdigit() else None
 
     async def prepare_harness_state(self) -> None:
+        """Today's scenario init: the scenario's part and the workload's part together."""
+        await self._grant_harness_roles()
+        await self._harness_steps(scenario=True, workload=True)
+
+    async def prepare_workload_state(self) -> None:
+        """The common workload's start (specs/007): the tables the workload writes."""
+        await self._harness_steps(scenario=False, workload=True)
+
+    async def prepare_scenario_state(self) -> None:
+        """A scenario attached to the running common workload (specs/007): never the workload's tables."""
+        await self._grant_harness_roles()
+        await self._harness_steps(scenario=True, workload=False)
+
+    async def _harness_steps(self, *, scenario: bool, workload: bool) -> None:
+        conn = await self._connect(timeout_s=120.0)   # the churn seed is 20k rows
+        try:
+            await conn.execute(HARNESS_DDL)
+            if scenario:
+                # Schema-qualified: unqualified, the drop resolves through search_path, misses the
+                # resilience schema, and silently leaves the index behind.
+                await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {LEGACY_CIC_INDEX}")
+                await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
+                # a corrupted relation left by an earlier run would fail every later integrity check;
+                # DROP never reads its pages, so it is safe even when they are damaged
+                await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
+            await conn.execute(TRUNCATE if scenario and workload else WORKLOAD_TRUNCATE if workload else SCENARIO_TRUNCATE)
+            if workload:
+                # Seeded every run, after the truncate: the churn table starts from a freshly
+                # written, unfragmented state, so the first footprint sample is a real floor and
+                # not whatever the previous run left behind.
+                await conn.execute(SEED_CHURN, CHURN_ROWS)
+                await conn.execute("VACUUM (ANALYZE) resilience.churn")
+        finally:
+            await conn.close()
+
+    async def _grant_harness_roles(self) -> None:
         # Pre-grant required roles to harness user if running against a cluster with SSH access.
         # PostgreSQL 15+ restricts CHECKPOINT to superusers and members of 'pg_checkpoint',
         # and pg_stat_activity detailed monitoring to 'pg_read_all_stats'. The grant persists
@@ -478,25 +518,6 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
                     self.harness_grants = ["pg_checkpoint", "pg_read_all_stats"]
         except Exception:
             pass  # Best effort: fake adapters, unit tests, or environments without SSH
-
-        conn = await self._connect(timeout_s=120.0)   # the churn seed is 20k rows
-        try:
-            await conn.execute(HARNESS_DDL)
-            # Schema-qualified: unqualified, the drop resolves through search_path, misses the
-            # resilience schema, and silently leaves the index behind.
-            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {LEGACY_CIC_INDEX}")
-            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CIC_INDEX_QUALIFIED}")
-            # a corrupted relation left by an earlier run would fail every later integrity check;
-            # DROP never reads its pages, so it is safe even when they are damaged
-            await conn.execute(f"DROP TABLE IF EXISTS {CORRUPTION_TARGET}")
-            await conn.execute(TRUNCATE)
-            # Seeded every run, after the truncate: the churn table starts from a freshly
-            # written, unfragmented state, so the first footprint sample is a real floor and
-            # not whatever the previous run left behind.
-            await conn.execute(SEED_CHURN, CHURN_ROWS)
-            await conn.execute("VACUUM (ANALYZE) resilience.churn")
-        finally:
-            await conn.close()
 
     async def amcheck_relation(self, relation: str, timeout_s: float, *,
                                heapallindexed: bool = False) -> dict[str, Any]:

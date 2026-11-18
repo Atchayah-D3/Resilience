@@ -169,7 +169,21 @@ class CoreAdapter(ABC):
 
     @abstractmethod
     async def prepare_harness_state(self) -> None:
-        """Create whatever the marker protocol needs, and clear state from previous runs."""
+        """Create whatever the marker protocol needs, and clear state from previous runs. Today's
+        scenario init: the workload's part and the scenario's part below, together."""
+
+    async def prepare_workload_state(self) -> None:
+        """The workload's part (specs/007): the tables the workload writes -- the marker table, the
+        churn table, the Elle lists -- created if missing, emptied and seeded. Done once, by the
+        common workload at its start; never by a scenario while that workload runs. Default: the
+        whole of prepare_harness_state (at the workload's start nothing else may run)."""
+        await self.prepare_harness_state()
+
+    async def prepare_scenario_state(self) -> None:
+        """The scenario's part (specs/007): the harness's own needs (grants, objects) and what an
+        earlier scenario's fault left behind -- never a table the workload writes. For a scenario
+        that attaches to the running common workload instead of prepare_harness_state."""
+        raise NotImplementedError(f"engine {self.engine!r}: prepare_scenario_state is not built")
 
     @abstractmethod
     async def marker_ids(self) -> set[str]:

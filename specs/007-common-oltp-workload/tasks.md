@@ -1,0 +1,21 @@
+# Tasks: 007 Common long-running TPC-C workload
+
+- [X] T001 Errors by kind in every TPC-C sample (`contract.ERROR_KIND_*`, `tpcc/engine.py`, merged across processes in `tpcc/samples.py`)
+- [X] T002 Event stream that writes to file only for long runs (`observability/event_stream.py`, `keep_in_memory=False`)
+- [X] T003 Settings file and its checks (`workloads/oltp-common.yaml`, `service/config.py`)
+- [X] T004 Workload lock on the target, pointer on the harness host, status file, stop request (`service/state.py`)
+- [X] T005 Guards: scenario runs refused in init (`control/orchestrator.py`); writing TPC-C commands refused (`tpcc/load.py` check_target); the service refused under a running scenario
+- [X] T006 Metrics: interval sums, outage tracker, period summary (`service/metrics.py`)
+- [X] T007 Baseline rules (`service/baseline.py`)
+- [X] T008 The run: start once, run, stop, end checks, summary (`service/runner.py`)
+- [X] T009 Commands start / status / stop, background run (`service/cli.py`); kill switch `--stop-workload` (`control/killswitch.py`)
+- [X] T010 Unit tests (`tests/test_workload_service.py`; stand-in for the target-host lock in `tests/conftest.py`)
+- [X] T011 README (`resilience_tests/execution/workload/service/README.md`)
+- [X] T015 The service runs any workload profile a scenario uses (oltp_write_heavy, mixed, tpcc; not Elle history yet) (`service/config.py`, `service/runner.py`)
+- [X] T016 Harness step split: `prepare_workload_state` (service start) and `prepare_scenario_state` (attach); `prepare_harness_state` unchanged for the 9 phases (`adapters/base.py`, `adapters/postgresql/adapter.py`)
+- [X] T017 `service.json`: settings used, times, TPC-C facts, files (`service/runner.py`)
+- [X] T018 Python functions for the runner (`service/client.py`); the command line uses them
+- [X] T019 Hand-over list for the attach story (`specs/007-common-oltp-workload/handover-attach.md`)
+- [ ] T012 Lab: capacity record for 64 clerks on all warehouses (`tpcc/capacity.py --clerks 64`), then a 15-minute service run
+- [ ] T013 Lab: fault survival during a 30-minute run (database restart, kill -9, 5 minutes down)
+- [ ] T014 Lab: 3 x 2-hour baselines; the lead signs off the thresholds and the rate
