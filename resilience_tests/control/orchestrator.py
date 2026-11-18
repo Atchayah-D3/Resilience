@@ -514,6 +514,8 @@ class TestOrchestrator:
                 "Each workload connection set its own session settings: "
                 + ", ".join(f"{k}={v}" for k, v in sorted(self.scenario.workload.session.items()))
                 + " (on the client connections only; no role or server setting was changed)")
+        # the fault's own readiness, now that the workload's data is in place (FaultBehaviour.check_ready)
+        await self.fault_behaviour.check_ready()
         self.journals = MarkerJournals(self.run_dir)
         if self.scenario.workload.history == "list_append":
             self.history = HistoryWriter(self.run_dir / HISTORY_FILE)

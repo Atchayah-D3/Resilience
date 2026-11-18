@@ -207,3 +207,35 @@ def test_without_a_maximum_of_the_same_layout_the_run_is_refused_with_the_comman
     records = [{"clerks": 64, "warehouses": 283, "active_warehouses": None, "tps": 3000.0, "measured_at": "x"}]
     with pytest.raises(TpccDataError, match="--clerks 64 --active-warehouses 4"):
         asyncio.run(resolved_profile().resolve_rate(CapacityAdapter(records)))
+
+
+# --- the customers apart from the harness's main program (workload.tpcc.worker_processes) --------
+
+def test_worker_processes_put_the_clerks_in_programs_of_their_own_even_at_a_low_rate(monkeypatch):
+    from resilience_tests.execution.workload.tpcc import profile as profile_mod
+    from resilience_tests.execution.workload.tpcc.coordinator import TpccCoordinator
+    monkeypatch.setattr(profile_mod.os, "cpu_count", lambda: 4)
+    w = Workload(profile="tpcc", concurrency=8, transaction_markers=True, rate_tps=100,
+                 tpcc={"warehouses": 4, "worker_processes": 2})
+    p = TpccProfile(w)
+    p.set_run_constants(100)
+    adapter = SimpleNamespace(engine="postgresql", node=SimpleNamespace(model_dump=lambda mode=None: {}))
+    driver = p.make_driver(adapter, SimpleNamespace(run_dir="/tmp"), None)
+    assert isinstance(driver, TpccCoordinator) and driver.processes == 2       # 100 TPS alone would be 1
+
+
+def test_more_worker_processes_than_the_harness_machine_can_give_are_refused(monkeypatch):
+    from resilience_tests.execution.workload.tpcc import profile as profile_mod
+    monkeypatch.setattr(profile_mod.os, "cpu_count", lambda: 2)                # one core stays free
+    w = Workload(profile="tpcc", concurrency=8, transaction_markers=True, rate_tps=100,
+                 tpcc={"warehouses": 4, "worker_processes": 2})
+    p = TpccProfile(w)
+    p.set_run_constants(100)
+    with pytest.raises(TpccDataError, match="worker_processes 2: this harness machine has 2 CPU core"):
+        p.make_driver(SimpleNamespace(), SimpleNamespace(run_dir="/tmp"), None)
+
+
+def test_worker_processes_below_two_are_not_a_setting():
+    with pytest.raises(ValueError):
+        Workload(profile="tpcc", concurrency=8, transaction_markers=True, rate_tps=100,
+                 tpcc={"warehouses": 4, "worker_processes": 1})

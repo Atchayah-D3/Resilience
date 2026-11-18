@@ -60,13 +60,14 @@ class Reports:
     hit_ratios = {"baseline": 0.995, "hold": 0.96}
     counters = {"customers": {"hit": 0, "read": 0}, "reports": {"hit": 0, "read": 0}}
     calls: list[str] = []
+    readable = True
 
 
 def reset_reports() -> None:
     Reports.settings, Reports.running, Reports.started_ns = dict(SETTINGS), False, 0
     Reports.sessions, Reports.samples, Reports.limit_tests, Reports.calls = [], [], {}, []
     Reports.temp_outcome, Reports.timeout_outcome = ("error", "53400"), ("error", "57014")
-    Reports.helpers_max, Reports.active, Reports.cache_calls = 2, True, 0
+    Reports.helpers_max, Reports.active, Reports.cache_calls, Reports.readable = 2, True, 0, True
     Reports.hit_ratios = {"baseline": 0.995, "hold": 0.96}
     Reports.counters = {"customers": {"hit": 0, "read": 0}, "reports": {"hit": 0, "read": 0}}
 
@@ -81,6 +82,10 @@ class AnalyticsEngine(OutageAdapter):
 
     async def observe_analytics_settings(self) -> dict[str, Any]:
         return dict(Reports.settings)
+
+    async def analytics_read_access(self) -> dict[str, Any]:
+        ok = Reports.readable
+        return {"login": "analytics_role", "schema": ok, "tables": {"order_line": ok, "orders": ok}}
 
     async def start_analytics(self, *, full_table_sessions, index_sessions, limit_tests, extra_warehouses):
         Reports.calls.append("start")
@@ -256,3 +261,14 @@ def test_a_role_setting_changed_during_the_run_fails_the_cleanup_check(reports_e
     assert results["status"] == "failed", why(results)
     assert outcomes(results)["settings_unchanged == true"] == "fail"
     assert results["facts"]["settings_changed"] == {"role_work_mem": {"before": "16MB", "after": "64MB"}}
+
+
+def test_a_login_that_may_not_read_the_data_makes_the_run_invalid_at_init(reports_env):
+    """Was (lab, 16 November): the report login had lost its grants in a reload; the run found out
+    only when every report failed, after the warm-up and the baseline."""
+    Reports.readable = False
+    results = run(reports_env)
+    assert results["status"] == "aborted", why(results)
+    assert "lacks USAGE on schema resilience_tpcc, SELECT on order_line, SELECT on orders" in str(results["error"])
+    phases = {p["phase"]: p["outcome"] for p in results["phases"]}
+    assert phases["init"] == "aborted" and "baseline" not in phases     # before the warm-up and the baseline

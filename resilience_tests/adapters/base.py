@@ -712,6 +712,11 @@ class AnalyticsSupport:
         unreadable)}."""
         raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
 
+    async def analytics_read_access(self) -> dict[str, Any]:
+        """Whether the report login may read what the reports read: {schema: bool, tables:
+        {name: bool}}; read with the harness's own connection, never as the login."""
+        raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
+
     async def customer_cache_counters(self) -> dict[str, Any]:
         """Cumulative cache counters of the TPC-C tables the reports never read (the customers'
         own data) and of the tables they read: {customers: {hit, read}, reports: {hit, read}}."""
