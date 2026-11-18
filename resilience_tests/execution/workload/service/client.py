@@ -7,6 +7,11 @@ runs scenarios against it and stops it. The command line (cli.py) uses the same 
     status(folder)                                                # status.json: live state
     summary = stop(folder)                                        # stop, wait for the end checks
 
+For a scenario attached to the running workload:
+
+    mark(folder, "run_start", run_id=..., scenario="NL-N-I03a")  # also "t0", "t1", "run_end"
+    window(folder, from_wall, to_wall)                            # a window's figures (MeasuredWindow fields)
+
 Every function works from the run folder, so a runner keeps only that path.
 """
 
@@ -131,3 +136,17 @@ def summary(folder: str | Path) -> dict[str, Any] | None:
         return json.loads((Path(folder) / st.SUMMARY_FILE).read_text())
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def mark(folder: str | Path, kind: str, *, run_id: str, scenario: str, t_wall: float | None = None,
+         **extra: Any) -> dict[str, Any]:
+    """A scenario mark in the running workload's folder (run_start, t0, t1, run_end): the workload
+    judges its own baseline outside the scenarios' windows and reports each window separately."""
+    return st.write_mark(Path(folder), kind, run_id=run_id, scenario=scenario, t_wall=t_wall, **extra)
+
+
+def window(folder: str | Path, from_wall: float, to_wall: float) -> dict[str, Any]:
+    """The figures of the window (from_wall, to_wall] from the running workload's 1-second samples:
+    the fields of driver.MeasuredWindow plus how they were computed (windows.py)."""
+    from resilience_tests.execution.workload.service.windows import window_from_file
+    return window_from_file(Path(folder), from_wall, to_wall)

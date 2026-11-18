@@ -55,8 +55,11 @@ def _print_status(folder: Path, status: dict[str, Any] | None, alive: bool) -> N
     print(f"common workload {status.get('id')}: {state}  ({status.get('step')})")
     print(f"  folder   {folder}")
     if status.get("elapsed_s") is not None:
-        print(f"  time     {status['elapsed_s']:.0f} s of {status['duration_s']:.0f} s "
-              f"(warm-up {status['warmup_s']:.0f} s), {status.get('remaining_s', 0):.0f} s left")
+        if status.get("duration_s") is None:
+            print(f"  time     {status['elapsed_s']:.0f} s (warm-up {status['warmup_s']:.0f} s); runs until stopped")
+        else:
+            print(f"  time     {status['elapsed_s']:.0f} s of {status['duration_s']:.0f} s "
+                  f"(warm-up {status['warmup_s']:.0f} s), {status.get('remaining_s') or 0:.0f} s left")
     li = status.get("last_interval")
     if li:
         print(f"  last {li.get('duration_s', 0):.0f} s: {li.get('tps', 0):.1f} TPS (rate {status.get('rate_tps')}), "

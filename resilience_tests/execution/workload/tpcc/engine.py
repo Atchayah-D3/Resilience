@@ -116,6 +116,9 @@ class TpccWorkloadDriver:
         rate = workload.rate_tps if rate_tps is None else rate_tps
         self.pacer = PlannedPacer(rate)
         self.session_settings = dict(workload.session)
+        # the common workload (specs/007) turns these on; a scenario's own workload leaves them off
+        self.histograms = False                  # latency histograms in every sample
+        self.application_name: str | None = None  # the clerks' application_name
         ids = list(range(workload.concurrency)) if worker_ids is None else list(worker_ids)
         self.terminals: dict[int, Terminal] = {i: profile.terminal(i) for i in ids}
         # response times corrected for stalls and outages, and the planned starts never made
@@ -212,8 +215,11 @@ class TpccWorkloadDriver:
         self._stop.set()
 
     async def _connect(self) -> DatabaseSession:
-        if self.session_settings:
-            return await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S, settings=self.session_settings)
+        settings = dict(self.session_settings)
+        if self.application_name:
+            settings["application_name"] = self.application_name
+        if settings:
+            return await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S, settings=settings)
         return await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S)
 
     async def _work(self, worker_id: int) -> None:
@@ -396,7 +402,7 @@ class TpccWorkloadDriver:
         if self.raw_sink is not None:
             self.raw_sink(raw)
         if self.stream is not None:
-            self.stream.emit("workload", "sample", **merge_raws([raw]))
+            self.stream.emit("workload", "sample", **merge_raws([raw], histograms=self.histograms))
 
     def _publish_last_interval(self) -> None:
         """At stop: the part-second since the last sample, so every acknowledged transaction is

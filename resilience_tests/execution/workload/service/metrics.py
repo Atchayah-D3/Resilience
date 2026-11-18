@@ -35,11 +35,12 @@ class Second:
     reconnects: int
     connect_failures: int
     business_rollbacks: int
+    t_wall: float = 0.0         # when the sample was written (end of its second), harness wall clock
 
     @classmethod
-    def from_sample(cls, sample: Mapping[str, Any], elapsed_s: float) -> Second:
+    def from_sample(cls, sample: Mapping[str, Any], elapsed_s: float, t_wall: float = 0.0) -> Second:
         business = sum(t.get("business_rollbacks", 0) for t in sample.get(contract.BY_TYPE, {}).values())
-        return cls(elapsed_s=elapsed_s, interval_s=float(sample.get("interval_s") or 0.0),
+        return cls(elapsed_s=elapsed_s, t_wall=t_wall, interval_s=float(sample.get("interval_s") or 0.0),
                    commits=int(sample.get("commits", 0)), p99_ms=sample.get("p99_ms"),
                    errors=int(sample.get("errors", 0)), indeterminate=int(sample.get("indeterminate", 0)),
                    drops=int(sample.get("drops", 0)), reconnects=int(sample.get("reconnects", 0)),

@@ -43,14 +43,18 @@ class BaselineRules(_Model):
 class ServiceConfig(_Model):
     id: str = Field(pattern=r"^[A-Za-z0-9_.-]+$")
     description: str = ""
-    # how long the customers run in total, the warm-up included
-    duration_s: float = Field(gt=0)
+    # how long the customers run in total, the warm-up included; null: until the stop command (a
+    # suite of scenarios that takes as long as it takes; the runner stops the workload at its end)
+    duration_s: float | None = Field(gt=0)
     # the first part of the run, not measured (caches fill, the workload settles)
     warmup_s: float = Field(default=300.0, ge=0)
     # one summary line per this many seconds (intervals-<n>s.jsonl), next to the 1-second lines
     metrics_interval_s: int = Field(default=10, ge=1)
     # status.json is rewritten this often
     status_interval_s: float = Field(default=5.0, gt=0)
+    # after a scenario's run_end mark, this long is still counted as the scenario's (its effects
+    # settling) and not judged as the workload's baseline
+    scenario_settle_s: float = Field(default=0.0, ge=0)
     # no transaction committed for this long while running: an alert in the status and events;
     # the workload keeps trying (a fault may keep the database down that long)
     no_commit_alert_s: float = Field(default=600.0, gt=0)
@@ -71,9 +75,13 @@ class ServiceConfig(_Model):
         if w.history != "none":
             raise ValueError("workload.history list_append: the common workload does not record Elle history yet "
                              "(NL-C-03 keeps its own workload until it does)")
-        if self.warmup_s >= self.duration_s:
+        if self.duration_s is not None and self.warmup_s >= self.duration_s:
             raise ValueError(f"warmup_s ({self.warmup_s:g}) must be shorter than duration_s ({self.duration_s:g})")
         return self
+
+    @property
+    def until_stopped(self) -> bool:
+        return self.duration_s is None
 
     def as_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json")

@@ -16,6 +16,7 @@ from typing import Any
 
 from resilience_tests.execution.workload import contract
 from resilience_tests.execution.workload.driver import p99, percentile
+from resilience_tests.execution.workload.histogram import latency_histogram
 
 # Planned transactions per second per worker process, with a safety margin: the speed test
 # measured about 4,800 per process at full use of one core (proposal 6.3, step 0).
@@ -80,10 +81,12 @@ def _rate(raws: Sequence[dict[str, Any]], commits_of: Any) -> float:
     return sum(commits / secs for commits, secs in per.values() if secs > 0)
 
 
-def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None) -> dict[str, Any]:
+def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None, *,
+               histograms: bool = False) -> dict[str, Any]:
     """One sample (contract.SAMPLE_FIELDS + by_type + by_group) from the raw numbers of one
     interval of one or more processes. tps = the sum of each process's commits over its own
-    measured interval; `elapsed` defaults to the longest interval."""
+    measured interval; `elapsed` defaults to the longest interval. `histograms` (the common
+    workload): also the interval's latency histograms (contract.HISTOGRAM_FIELDS)."""
     if not raws:
         raise ValueError("no raw numbers to merge")
     interval = elapsed if elapsed is not None else max(r["elapsed"] for r in raws)
@@ -126,6 +129,8 @@ def merge_raws(raws: Sequence[dict[str, Any]], elapsed: float | None = None) -> 
             "max_ms": max(lat) if lat else None,
             "p99_corrected_ms": p99(corrected), "missed": missed, "corrected_capped": capped,
             "error_kinds": dict(sorted(error_kinds.items())),
+            **({"latency_hist": latency_histogram(lat), "corrected_hist": latency_histogram(corrected),
+                "journal_hist": latency_histogram(journal)} if histograms else {}),
             contract.BY_TYPE: by_type, contract.BY_GROUP: by_group}
 
 

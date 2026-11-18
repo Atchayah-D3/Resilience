@@ -38,12 +38,21 @@ from typing import Any
 
 from resilience_tests.adapters.base import adapter_for
 from resilience_tests.control.profile import EnvProfile, Node
+from resilience_tests.execution.workload import contract
 from resilience_tests.execution.workload.hooks import hooks_for
-from resilience_tests.execution.workload.markers import MarkerJournals, diff_from_journals, write_db_markers
+from resilience_tests.execution.workload.markers import (
+    ACKED_JOURNAL,
+    MarkerJournals,
+    diff_from_journals,
+    journal_paths,
+    read_journal,
+    write_db_markers,
+)
 from resilience_tests.execution.workload.profiles.base import WorkloadProfile
 from resilience_tests.execution.workload.service import baseline as baseline_mod
 from resilience_tests.execution.workload.service import state as st
 from resilience_tests.execution.workload.service.config import ServiceConfig
+from resilience_tests.execution.workload.service import windows as windows_mod
 from resilience_tests.execution.workload.service.metrics import (
     IntervalSums,
     OutageTracker,
@@ -103,6 +112,7 @@ class ServiceRunner:
         self.outages = OutageTracker(config.workload.rate_tps, config.no_commit_alert_s)
         self.last_interval: dict[str, Any] | None = None
         self.alerts: list[str] = []
+        self._lost_t_ack: dict[str, float] = {}
 
     # --- control from outside ----------------------------------------------------------------
 
@@ -185,6 +195,10 @@ class ServiceRunner:
         self._set_step("starting the clerks")
         self.journals = MarkerJournals(self.folder)
         self.driver = self._make_driver()
+        # for the harness attached to this workload: any window's percentiles from the samples, and
+        # the clerks' sessions told apart from the harness's own
+        self.driver.histograms = True
+        self.driver.application_name = contract.WORKLOAD_APPLICATION_NAME
         self.stream.subscribe(self._on_event)
         self.t0 = self.clock()
         self.clerks_started_wall = time.time()
@@ -215,7 +229,7 @@ class ServiceRunner:
         assert self.stream is not None and self.t0 is not None
         self.state, self.step = st.WARMING_UP, "warm-up (not measured)"
         warm_end = self.t0 + self.cfg.warmup_s
-        end = self.t0 + self.cfg.duration_s
+        end = self.t0 + self.cfg.duration_s if self.cfg.duration_s is not None else None    # None: until stopped
         next_interval = self.clock() + self.cfg.metrics_interval_s
         next_status = 0.0
         next_memory = 0.0
@@ -244,12 +258,12 @@ class ServiceRunner:
                 self.request_stop(str(request.get("by", "stop command")))
             if self._stop_flag:
                 return st.STOPPED
-            if now >= end:
+            if end is not None and now >= end:
                 return st.FINISHED
             if now >= next_status:
                 self._write_status()
                 next_status = now + self.cfg.status_interval_s
-            await asyncio.sleep(max(0.0, min(LOOP_S, end - now)))
+            await asyncio.sleep(max(0.0, min(LOOP_S, end - now)) if end is not None else LOOP_S)
 
     async def _stop_clerks(self) -> None:
         if self.driver is None or self.t0 is None:
@@ -283,6 +297,11 @@ class ServiceRunner:
             self.facts["markers_db_file"] = write_db_markers(self.folder, db)
             diff, torn = diff_from_journals(self.folder, db)
             trusted = not torn and not diff.unjournalled_ack
+            if diff.lost:
+                # when each lost commit was acknowledged: placed in a scenario's window or outside them
+                lost = set(diff.lost)
+                self._lost_t_ack = {r["uuid"]: float(r.get("t_ack", 0.0)) for p in journal_paths(self.folder, ACKED_JOURNAL)
+                                    for r in read_journal(p).records if r.get("uuid") in lost}
             end.update({"rpo_txn": diff.rpo_txn if trusted else None, "phantom": len(diff.phantom),
                         "markers": {"written": diff.written, "acked": diff.acked, "in_db": diff.in_db,
                                     "lost": sorted(diff.lost)[:LOST_LIST_MAX], "lost_count": len(diff.lost),
@@ -325,7 +344,7 @@ class ServiceRunner:
             part = "measured" if self.measure_start_s is not None and elapsed > self.measure_start_s else "warmup"
             self._m1.write(json.dumps({"t_wall": round(event.t_wall, 3), "elapsed_s": round(elapsed, 3),
                                        "part": part, **d}, separators=(",", ":"), default=str) + "\n")
-            second = Second.from_sample(d, elapsed)
+            second = Second.from_sample(d, elapsed, event.t_wall)
             self.seconds.append(second)
             self.interval.add(d)
             for kind, n in (d.get("error_kinds") or {}).items():
@@ -371,7 +390,10 @@ class ServiceRunner:
             "env": self.env.name, "node": self.node.name,
             "started_wall": round(self.started_wall, 3), "clerks_started_wall": round(started, 3),
             "warmup_s": self.cfg.warmup_s, "measure_start_planned_wall": round(started + self.cfg.warmup_s, 3),
-            "duration_s": self.cfg.duration_s, "planned_end_wall": round(started + self.cfg.duration_s, 3),
+            "duration_s": self.cfg.duration_s, "until_stopped": self.cfg.until_stopped,
+            "planned_end_wall": (round(started + self.cfg.duration_s, 3) if self.cfg.duration_s is not None else None),
+            "application_name": contract.WORKLOAD_APPLICATION_NAME,
+            "marks_file": st.MARKS_FILE,
             "settings": {"config": self.cfg.as_dict(), "workload_used": self.profile_workload.model_dump(mode="json"),
                          "layout": (p.layout.as_dict() if getattr(p, "layout", None) else None),
                          "rate": getattr(p, "rate", None),
@@ -405,7 +427,9 @@ class ServiceRunner:
             "started_wall": round(self.started_wall, 3), "updated_wall": round(time.time(), 3),
             "elapsed_s": round(elapsed, 1) if elapsed is not None else None,
             "duration_s": self.cfg.duration_s, "warmup_s": self.cfg.warmup_s,
-            "remaining_s": round(max(0.0, self.cfg.duration_s - elapsed), 1) if elapsed is not None else None,
+            "remaining_s": (round(max(0.0, self.cfg.duration_s - elapsed), 1)
+                            if elapsed is not None and self.cfg.duration_s is not None else None),
+            "until_stopped": self.cfg.until_stopped,
             "rate_tps": self.profile_workload.rate_tps,
             "clerks": self.cfg.workload.concurrency,
             "last_interval": self.last_interval,
@@ -419,10 +443,33 @@ class ServiceRunner:
 
     # --- the end ----------------------------------------------------------------------------------
 
+    def _scenario_report(self, w: dict[str, Any]) -> dict[str, Any]:
+        """One scenario's window on this workload: what the clerks saw while it ran."""
+        inside = [x for x in self.seconds if w["start_wall"] < x.t_wall <= w["end_wall"]]
+        outs = [o for o in self.outages.outages + ([self.outages.open_outage()] if self.outages.open_outage() else [])
+                if w["start_wall"] <= o["started_wall"] <= w["end_wall"]]
+        lost = sum(1 for t in self._lost_t_ack.values() if w["start_wall"] <= t <= w["end_wall"])
+        return {**w, **self._totals(inside), "outages": len(outs),
+                "outage_seconds": round(sum(o.get("seconds", 0.0) for o in outs), 1),
+                "lost_commits_acked_inside": lost}
+
     def _summary(self, final: str, end: dict[str, Any]) -> dict[str, Any]:
         ran_s = self.ended_s or 0.0
         measure_start = self.measure_start_s if self.measure_start_s is not None else self.cfg.warmup_s
-        full = final == st.FINISHED and ran_s >= self.cfg.duration_s - 2 * LOOP_S
+        if self.cfg.until_stopped:
+            # the normal end of a run "until stopped" is the stop command, not a failure
+            full = final == st.STOPPED and self.failure is None
+        else:
+            full = final == st.FINISHED and ran_s >= self.cfg.duration_s - 2 * LOOP_S
+        # the scenarios that ran on this workload (their marks): not judged as the workload's baseline
+        scen = windows_mod.scenario_windows(st.read_marks(self.folder) if self.t0 is not None else [],
+                                            end_wall=self.clerks_started_wall + ran_s,
+                                            settle_s=self.cfg.scenario_settle_s)
+        excluded = [(w["start_wall"] - self.clerks_started_wall, w["end_wall"] - self.clerks_started_wall)
+                    for w in scen]
+        if end.get("rpo_txn") is not None and scen:
+            outside = [u for u, t in self._lost_t_ack.items() if windows_mod.in_any(t, scen) is None]
+            end["rpo_outside_scenarios"] = len(outside) + (end["rpo_txn"] - len(self._lost_t_ack))
         # judged up to the moment the stop began: the engine's last, part-second sample covers the
         # clerks finishing their transactions, not the workload's normal running
         judged = [x for x in self.seconds if x.elapsed_s <= ran_s + 1e-6] if ran_s else self.seconds
@@ -430,8 +477,8 @@ class ServiceRunner:
             seconds=judged, measure_start_s=measure_start, rate_tps=self.profile_workload.rate_tps,
             rules=self.cfg.baseline, memory=self.memory, end=end, driver_limited=self.driver_limited,
             full_duration=full, ran_s=ran_s, duration_s=self.cfg.duration_s,
-            tpcc=self.cfg.workload.profile == "tpcc")
-        valid = baseline_mod.passed(checks) and final == st.FINISHED
+            tpcc=self.cfg.workload.profile == "tpcc", excluded=excluded)
+        valid = baseline_mod.passed(checks) and full
         measured = [s for s in self.seconds if s.elapsed_s > measure_start]
         workload_used = self.profile_workload.model_dump(mode="json")
         summary = {
@@ -452,6 +499,7 @@ class ServiceRunner:
             "periods": period_summary(self.seconds, 600.0, 0.0),
             "outages": self.outages.outages + ([{**self.outages.open_outage(), "open_at_end": True}]
                                                if self.outages.open_outage() else []),
+            "scenarios": [self._scenario_report(w) for w in scen],
             "harness": {"max_cpu_share": round(self.max_cpu_share, 3), "driver_limited": self.driver_limited,
                         "memory_readings": len(self.memory),
                         "memory_first_mb": round(self.memory[0][1] / 1e6) if self.memory else None,
@@ -471,10 +519,15 @@ def summary_text(s: dict[str, Any]) -> str:
         f"common workload {s['id']}  ({s['run_id']})",
         f"state: {s['state'].upper()}" + (f"  -- {s['failure']}" if s.get("failure") else "")
         + (f"  (stopped by {s['stop_requested_by']})" if s.get("stop_requested_by") else ""),
-        f"ran {t['ran_s']:.0f} s of {t['duration_s']:.0f} s (warm-up {t['warmup_s']:.0f} s, not measured)",
+        (f"ran {t['ran_s']:.0f} s of {t['duration_s']:.0f} s" if t["duration_s"] is not None
+         else f"ran {t['ran_s']:.0f} s (until stopped)") + f" (warm-up {t['warmup_s']:.0f} s, not measured)",
         f"rate {rate} TPS; measured: {m['tps']} TPS, {m['commits']} commits, errors {m['errors']}, "
         f"unknown {m['unknown']}, dropped connections {m['drops']}, reconnects {m['reconnects']}",
         f"outages (seconds without a commit): {len(s['outages'])}",
+        f"scenarios on this workload: {len(s['scenarios'])} (not judged as the workload's baseline)",
+        *[f"  {w['scenario']} {w['run_id']}: {w['seconds']:.0f} s, {w['tps']} TPS, errors {w['errors']}, unknown "
+          f"{w['unknown']}, drops {w['drops']}, outages {w['outages']}, lost commits acked inside "
+          f"{w['lost_commits_acked_inside']}" for w in s["scenarios"]],
         "",
         f"baseline {'VALID' if s['baseline_valid'] else 'NOT VALID'} ({s['baseline_note']}):",
     ]

@@ -38,6 +38,19 @@ First time on a target with `rate_fraction_of_capacity`: measure the maximum for
 | end | at `duration_s`, on `stop`, or when the workload itself fails (a journal line cannot be saved, a worker process dies, the harness is the limit, the lock is taken over) |
 | after the stop | lost commits and phantoms (journals against the marker table), TPC-C checks, baseline rules, `summary.json` and `summary.txt` |
 
+## For a harness attached to the running workload
+
+- `client.window(folder, from_wall, to_wall)`: any window's figures (the fields of a scenario's
+  measurement window) from the 1-second samples' latency histograms; percentiles are the upper
+  bound of a 2% bucket, never below the exact value.
+- `client.mark(folder, "run_start" | "t0" | "t1" | "run_end", run_id=..., scenario=...)`: the
+  workload judges its baseline outside the scenarios' windows and reports each window separately.
+- `duration_s: null`: run until the stop command (a suite of any length).
+- Clerks connect with `application_name = 'resilience-workload'` and the settings file's
+  `session:` settings (`lock_timeout`, `statement_timeout`, `transaction_timeout` 0 in oltp-common).
+- Read files that are still being written with `state.read_complete_lines(path)` (a last line
+  without its newline is not finished). Details: `specs/007-common-oltp-workload/handover-attach.md`.
+
 ## Files in the run folder (`<driver_host.run_dir>/workload-<id>-<time>/`)
 
 | File | Contents |
@@ -46,6 +59,7 @@ First time on a target with `rate_fraction_of_capacity`: measure the maximum for
 | `status.json` | live state: state, step, time left, last interval's figures, errors so far, outage now, alerts |
 | `metrics-1s.jsonl` | every 1-second sample (same fields as a scenario's `sample` events) + `t_wall`, `elapsed_s`, `part` (warmup/measured) |
 | `intervals-<n>s.jsonl` | one line per interval: exact TPS, p50/p95/p99, errors, unknown, drops, reconnects, plus errors by kind, business rollbacks, commits per type |
+| `scenario-marks.jsonl` | written by the harness: one line per scenario event (run_start, t0, t1, run_end) |
 | `events.jsonl` | start, warm-up end, outages (start/long/end), failures, stop; also the engine's samples |
 | `marker.N.jrnl`, `acked.N.jrnl`, `aborted.N.jrnl` | the journals, one set per worker process |
 | `markers_db.txt.gz` | the markers the database held at the end (the lost-commit check can be redone) |

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from catalog.schema import Workload
 from resilience_tests.adapters.base import BaseDatabaseAdapter, Capability, DatabaseSession, TransactionOutcome
 from resilience_tests.execution.workload import contract
+from resilience_tests.execution.workload.histogram import latency_histogram
 from resilience_tests.execution.workload.history_writer import HistoryWriter
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.observability.event_stream import EventStream
@@ -260,6 +261,9 @@ class WorkloadDriver:
         self._group_of = group_of_workers(workload)
         self._group_windows = {g: _Window() for g in dict.fromkeys(self._group_of)}
         self.session_settings = dict(workload.session)
+        # the common workload (specs/007) turns these on; a scenario's own workload leaves them off
+        self.histograms = False                  # latency histograms in every sample
+        self.application_name: str | None = None  # the clerks' application_name
 
     async def wait_until_ready(self, poll_s: float = 0.1) -> None:
         """Return once every worker has opened its session -- the load the scenario declares
@@ -329,6 +333,10 @@ class WorkloadDriver:
                 # per clerk group; the fields above stay the totals the analysis reads
                 **{contract.BY_TYPE: {contract.MARKER_TYPE: _type_stats(w, elapsed)},
                    contract.BY_GROUP: {g: _group_stats(gw, elapsed) for g, gw in groups.items()}},
+                # the common workload only (specs/007): any window's percentiles from the samples
+                # (no corrected_hist: this driver does not correct for stalls, as its windows say)
+                **({"latency_hist": latency_histogram(w.latencies_ms or []),
+                    "journal_hist": latency_histogram(w.journal_ms or [])} if self.histograms else {}),
             )
             # NL-N-I03 (workload.contended_share): the table users and the others, each second
             if self._groups:
@@ -367,9 +375,11 @@ class WorkloadDriver:
                     session = None
                 if session is None:
                     try:
-                        if self.session_settings:
-                            session = await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S,
-                                                                 settings=self.session_settings)
+                        settings = dict(self.session_settings)
+                        if self.application_name:
+                            settings["application_name"] = self.application_name
+                        if settings:
+                            session = await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S, settings=settings)
                         else:
                             session = await self.adapter.session(timeout_s=CONNECT_TIMEOUT_S)
                     except Exception:  # noqa: BLE001 -- engine-specific; the adapter owns the taxonomy

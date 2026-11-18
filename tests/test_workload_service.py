@@ -329,8 +329,10 @@ class ShopSession(DatabaseSession):
 
 class ShopAdapter(FakeAdapter):
     lose_one = False
+    settings_seen: list = []
 
     async def session(self, endpoint=None, timeout_s=5.0, **kwargs):
+        ShopAdapter.settings_seen.append(kwargs.get("settings"))
         if Shop.down:
             raise ConnectionRefusedError("down")
         return ShopSession()
@@ -395,6 +397,7 @@ def _config(**kw):
 
 def service(tmp_path, monkeypatch, cfg=None, adapter=None, scenario_holder=None):
     Shop.committed, Shop.down = set(), False
+    ShopAdapter.settings_seen = []
     ShopProfile.calls = []
     monkeypatch.setattr(runner_mod, "LOOP_S", 0.05)
     monkeypatch.setattr(runner_mod, "MEMORY_EVERY_S", 0.3)
@@ -440,6 +443,17 @@ def test_the_service_runs_its_duration_and_judges_a_valid_baseline(tmp_path, mon
     assert sum(len(read_journal(p).records) for p in folder.glob("acked*.jrnl")) == len(Shop.committed)
     info = st.read_info(folder)
     assert info["settings"]["workload_used"]["rate_tps"] == 200 and info["tpcc"]["run_constants"] is not None
+    assert info["application_name"] == c.WORKLOAD_APPLICATION_NAME and info["pid"] == os.getpid()
+    assert ShopAdapter.settings_seen and all(x == {"application_name": c.WORKLOAD_APPLICATION_NAME}
+                                             for x in ShopAdapter.settings_seen)
+    # any window from the 1-second samples, with the fields of a scenario's measurement window
+    from resilience_tests.execution.workload.driver import MeasuredWindow
+    from resilience_tests.execution.workload.service import windows as wm
+    measured = [x for x in seconds if x["part"] == "measured"]
+    w = wm.window_from_file(folder, measured[0]["t_wall"] - 1.5, measured[-1]["t_wall"])
+    MeasuredWindow(**{k: w[k] for k in wm.MEASURED_WINDOW_FIELDS})
+    assert w["samples"] == len(measured) + 1 and w["commits"] > 0 and w["p99_ms"] >= w["p50_ms"] > 0
+    assert w["p99_corrected_ms"] is not None and w["missed"] is not None    # the TPC-C engine reports both
     assert info["measure_start_planned_wall"] - info["clerks_started_wall"] == pytest.approx(1.0)
     assert info["files"]["intervals"] == st.metrics_interval_file(1)
 
@@ -531,7 +545,7 @@ def test_the_service_runs_the_custom_marker_workload_of_most_scenarios(tmp_path,
     w = Workload(profile="oltp_write_heavy", concurrency=4, transaction_markers=True, rate_tps=200)
     # 5 s: the custom driver writes no part-second sample at its stop, so a 3 s run would leave a
     # single measured second
-    r, lock, _ = service(tmp_path, monkeypatch, cfg=_config(workload=w, duration_s=5.0), adapter=FakeAdapter(NODE))
+    r, lock, _ = service(tmp_path, monkeypatch, cfg=_config(workload=w, duration_s=5.0), adapter=SettingsFakeAdapter(NODE))
     from resilience_tests.execution.workload.hooks import hooks_for
     r.profile = hooks_for(w)                                  # the custom workload's (empty) hooks
     summary = asyncio.run(r.run())
@@ -540,6 +554,21 @@ def test_the_service_runs_the_custom_marker_workload_of_most_scenarios(tmp_path,
     assert not any("TPC-C" in n for n in names)              # TPC-C checks only for the TPC-C workload
     assert summary["baseline_valid"], json.dumps(summary["baseline_checks"], indent=1)
     assert st.read_info(tmp_path / "workload-test")["tpcc"] is None
+    assert all(k.get("settings", {}).get("application_name") == c.WORKLOAD_APPLICATION_NAME for k in r.adapter.calls)
+    lines = st.read_complete_lines(tmp_path / "workload-test" / st.METRICS_1S_FILE)
+    assert all("latency_hist" in x and "journal_hist" in x and "corrected_hist" not in x for x in lines)
+
+
+class SettingsFakeAdapter(FakeAdapter):
+    """The marker-store fake, accepting (and recording) connection settings."""
+
+    def __init__(self, node, fail_with=None):
+        super().__init__(node, fail_with)
+        self.calls: list = []
+
+    async def session(self, endpoint=None, timeout_s: float = 5.0, **kwargs):
+        self.calls.append(kwargs)
+        return await super().session(endpoint, timeout_s)
 
 
 class RecordingConn:
@@ -634,3 +663,139 @@ def test_client_stop_asks_once_and_returns_the_summary(tmp_path):
     st.write_status(folder, {"state": st.RUNNING, "pid": os.getpid()})
     assert client.stop(folder, wait_s=0.3, poll_s=0.1) is None   # still running after the wait
     assert st.stop_requested(folder)["by"] == "runner"
+
+
+# --- latency histograms and windows (the harness reads any window from the samples) -----------------
+
+
+def test_a_histogram_percentile_is_never_below_the_exact_value_and_at_most_2_percent_above():
+    import random
+    from resilience_tests.execution.workload.driver import percentile
+    from resilience_tests.execution.workload.histogram import hist_percentile, latency_histogram, merge_histograms
+
+    rng = random.Random(7)
+    seconds = [[rng.lognormvariate(1.5, 1.0) for _ in range(rng.randint(50, 400))] for _ in range(30)]
+    merged = merge_histograms(latency_histogram(v) for v in seconds)
+    every = [x for v in seconds for x in v]
+    assert merged == latency_histogram(every)                 # summing histograms loses nothing
+    for q in (0.5, 0.9, 0.95, 0.99):
+        exact = percentile(every, q)
+        got = hist_percentile(merged, q)
+        assert exact <= got <= exact * 1.02 + 1e-12, (q, exact, got)
+    assert hist_percentile({}, 0.99) is None
+
+
+def _line(t_wall, commits, latencies, corrected=True):
+    from resilience_tests.execution.workload.histogram import latency_histogram
+    line = {"t_wall": t_wall, "interval_s": 1.0, "commits": commits, "errors": 1, "indeterminate": 0, "drops": 0,
+            "reconnects": 0, "connect_failures": 0, "missed": 2, "max_ms": max(latencies),
+            "latency_hist": latency_histogram(latencies), "journal_hist": latency_histogram([0.5])}
+    if corrected:
+        line["corrected_hist"] = latency_histogram(latencies)
+    return line
+
+
+def test_a_window_moves_in_whole_samples_and_has_the_measured_window_fields():
+    from resilience_tests.execution.workload.service import windows as wm
+
+    lines = [_line(100.0 + i, 10, [1.0] * 9 + [50.0]) for i in range(10)]
+    w = wm.window(lines, 102.0, 105.0)                       # the samples ending at 103, 104, 105
+    assert w["samples"] == 3 and w["commits"] == 30 and w["tps"] == 10.0 and w["errors"] == 3
+    assert w["missed"] == 6 and w["max_ms"] == 50.0 and w["first_sample_start_wall"] == 102.0
+    assert 50.0 <= w["p99_ms"] <= 51.0 and 1.0 <= w["p50_ms"] <= 1.02
+    no_corr = [_line(200.0, 5, [1.0], corrected=False)]
+    assert wm.window(no_corr, 199.0, 200.0)["p99_corrected_ms"] is None     # the custom workload's samples
+    with pytest.raises(wm.NoHistograms):
+        wm.window([{"t_wall": 1.0, "interval_s": 1.0, "commits": 1}], 0.0, 1.0)
+
+
+def test_scenario_windows_from_marks_an_unfinished_scenario_lasts_to_the_end():
+    from resilience_tests.execution.workload.service import windows as wm
+
+    marks = [{"kind": "run_start", "run_id": "a", "scenario": "NL-N-I03a", "t_wall": 10.0},
+             {"kind": "t0", "run_id": "a", "scenario": "NL-N-I03a", "t_wall": 20.0},
+             {"kind": "t1", "run_id": "a", "scenario": "NL-N-I03a", "t_wall": 30.0},
+             {"kind": "run_end", "run_id": "a", "scenario": "NL-N-I03a", "t_wall": 40.0},
+             {"kind": "run_start", "run_id": "b", "scenario": "NL-N-I03b", "t_wall": 50.0}]
+    a, b = wm.scenario_windows(marks, end_wall=100.0, settle_s=5.0)
+    assert (a["start_wall"], a["end_wall"], a["t0_wall"], a["t1_wall"], a["ended"]) == (10.0, 45.0, 20.0, 30.0, True)
+    assert (b["start_wall"], b["end_wall"], b["ended"]) == (50.0, 100.0, False)
+    assert wm.in_any(44.0, [a, b]) is a and wm.in_any(47.0, [a, b]) is None
+
+
+def test_marks_are_whole_lines_and_a_half_written_last_line_is_not_read(tmp_path):
+    st.write_mark(tmp_path, "run_start", run_id="r1", scenario="NL-C-01", t_wall=5.0)
+    with pytest.raises(ValueError, match="mark kind"):
+        st.write_mark(tmp_path, "fault", run_id="r1", scenario="NL-C-01")
+    with (tmp_path / st.MARKS_FILE).open("a") as fh:
+        fh.write('{"kind": "t0", "run_id": "r1"')              # still being written
+    marks = st.read_marks(tmp_path)
+    assert [m["kind"] for m in marks] == ["run_start"] and marks[0]["t_wall"] == 5.0
+
+
+def test_a_scenarios_fault_is_reported_with_the_scenario_not_judged_as_the_workloads_baseline(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine_mod, "RECONNECT_PAUSE_S", 0.05)
+    r, _, _ = service(tmp_path, monkeypatch, cfg=_config(duration_s=9.0))
+    folder = tmp_path / "workload-test"
+    import time as _t
+
+    async def go():
+        task = asyncio.create_task(r.run())
+        await asyncio.sleep(2.0)
+        st.write_mark(folder, "run_start", run_id="nl-c-01-x", scenario="NL-C-01")
+        await asyncio.sleep(0.5)
+        st.write_mark(folder, "t0", run_id="nl-c-01-x", scenario="NL-C-01")
+        Shop.down = True                                       # the scenario's fault: the database is down
+        await asyncio.sleep(2.0)
+        Shop.down = False
+        await asyncio.sleep(1.5)
+        st.write_mark(folder, "t1", run_id="nl-c-01-x", scenario="NL-C-01")
+        st.write_mark(folder, "run_end", run_id="nl-c-01-x", scenario="NL-C-01", t_wall=_t.time())
+        return await task
+
+    summary = asyncio.run(go())
+    assert summary["baseline_valid"], json.dumps(summary["baseline_checks"], indent=1)
+    (scen,) = summary["scenarios"]
+    assert scen["scenario"] == "NL-C-01" and scen["outages"] == 1 and scen["connect_failures"] > 0
+    assert scen["t0_wall"] is not None and scen["ended"]
+    assert summary["totals"]["whole_run"]["connect_failures"] > 0         # the whole run still shows it
+    assert "NL-C-01" in (folder / st.SUMMARY_TEXT_FILE).read_text()
+
+
+def test_a_workload_run_until_stopped_ends_normally_on_the_stop_command(tmp_path, monkeypatch):
+    r, _, _ = service(tmp_path, monkeypatch, cfg=_config(duration_s=None))
+    folder = tmp_path / "workload-test"
+
+    async def go():
+        task = asyncio.create_task(r.run())
+        await asyncio.sleep(4.5)
+        s = st.read_status(folder)
+        assert s["until_stopped"] and s["remaining_s"] is None and st.read_info(folder)["planned_end_wall"] is None
+        st.request_stop(folder, "runner")
+        return await task
+
+    summary = asyncio.run(go())
+    assert summary["state"] == st.STOPPED and summary["baseline_valid"], json.dumps(summary["baseline_checks"], indent=1)
+    assert summary["baseline_checks"][0]["name"] == "ran until it was stopped"
+    assert "until stopped" in (folder / st.SUMMARY_TEXT_FILE).read_text()
+
+
+def test_the_workload_lock_is_not_the_scenarios_lock_so_a_scenario_can_never_take_it_over():
+    from resilience_tests.control.profile import TargetLockSpec
+    from resilience_tests.control.target_lock import lock_path
+
+    assert st.workload_lock_path(NODE) != lock_path(NODE, TargetLockSpec())
+    assert st.workload_lock_path(NODE).startswith("/var/tmp/resilience-workload-")
+
+
+def test_the_kill_switch_stops_the_workload_only_when_asked(tmp_path, monkeypatch):
+    from resilience_tests.control import killswitch
+
+    env = _env(tmp_path)
+    called = []
+    monkeypatch.setattr(killswitch, "load_profile", lambda name: env)
+    monkeypatch.setattr(killswitch, "_stop_workloads", lambda profile: called.append(profile) or True)
+    killswitch.main(["--env", "e2-dedicated-vm"])              # no ledger here: returns early, workload untouched
+    assert called == []
+    killswitch.main(["--env", "e2-dedicated-vm", "--stop-workload"])
+    assert called == [env]

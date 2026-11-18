@@ -16,6 +16,11 @@
 - [X] T017 `service.json`: settings used, times, TPC-C facts, files (`service/runner.py`)
 - [X] T018 Python functions for the runner (`service/client.py`); the command line uses them
 - [X] T019 Hand-over list for the attach story (`specs/007-common-oltp-workload/handover-attach.md`)
+- [X] T020 Latency histograms in the common workload's samples; any window from the samples (`histogram.py`, `service/windows.py`, `client.window`)
+- [X] T021 Scenario marks; the baseline judged outside the scenarios' windows; each scenario's window reported (`state.write_mark`, `client.mark`, `service/baseline.py`, `service/runner.py`)
+- [X] T022 Run until stopped (`duration_s: null`)
+- [X] T023 Clerks' application_name `resilience-workload`; session settings in `workloads/oltp-common.yaml`
+- [X] T024 Rules for reading live files; lock and kill-switch confirmations (`handover-attach.md`, tests)
 - [ ] T012 Lab: capacity record for 64 clerks on all warehouses (`tpcc/capacity.py --clerks 64`), then a 15-minute service run
 - [ ] T013 Lab: fault survival during a 30-minute run (database restart, kill -9, 5 minutes down)
 - [ ] T014 Lab: 3 x 2-hour baselines; the lead signs off the thresholds and the rate

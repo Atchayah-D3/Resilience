@@ -44,6 +44,10 @@ SUMMARY_FILE = "summary.json"
 SUMMARY_TEXT_FILE = "summary.txt"
 EVENTS_FILE = "events.jsonl"            # the name the TPC-C checks read (profile._driver_load)
 METRICS_1S_FILE = "metrics-1s.jsonl"
+# Written by the harness (scenario runs), read by the service: one line per scenario event, so the
+# service judges its baseline outside the scenarios and reports each scenario's window separately.
+MARKS_FILE = "scenario-marks.jsonl"
+MARK_KINDS = ("run_start", "t0", "t1", "run_end")
 LOG_FILE = "service.log"
 
 # the states written in status.json; the last three are final
@@ -163,6 +167,43 @@ def stop_requested(folder: Path) -> dict[str, Any] | None:
         return None
     except (OSError, json.JSONDecodeError):
         return {"by": "unreadable stop request"}
+
+
+# --- scenario marks (written by the harness) --------------------------------------------------
+
+
+def write_mark(folder: Path, kind: str, *, run_id: str, scenario: str, t_wall: float | None = None,
+               **extra: Any) -> dict[str, Any]:
+    """Append one scenario mark to the running workload's folder: run_start (the scenario's run
+    begins), t0 (its fault), t1 (its recovery ends), run_end (its cleanup is over). One whole line,
+    written in a single append and saved to disk."""
+    if kind not in MARK_KINDS:
+        raise ValueError(f"mark kind {kind!r}: one of {', '.join(MARK_KINDS)}")
+    rec = {"kind": kind, "run_id": run_id, "scenario": scenario,
+           "t_wall": round(time.time() if t_wall is None else t_wall, 3), **extra}
+    line = (json.dumps(rec, separators=(",", ":"), default=str) + "\n").encode()
+    fd = os.open(folder / MARKS_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+    try:
+        os.write(fd, line)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return rec
+
+
+def read_complete_lines(path: Path) -> list[dict[str, Any]]:
+    """Every whole line of a JSON-lines file that may still be being written: a last line without
+    its newline is left out (it is not finished yet); a whole line that is not JSON raises."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    lines = data.split(b"\n")
+    return [json.loads(x) for x in lines[:-1] if x.strip()]
+
+
+def read_marks(folder: Path) -> list[dict[str, Any]]:
+    return read_complete_lines(folder / MARKS_FILE)
 
 
 # --- locks seen from outside -----------------------------------------------------------------

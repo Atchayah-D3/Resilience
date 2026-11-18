@@ -91,6 +91,17 @@ ERROR_KIND_CLIENT = "client_error"              # an error on the harness side, 
 ERROR_KIND_SERVER_PREFIX = "server_"            # the server rolled the transaction back, with its SQLSTATE
 
 
+# Only in the common workload's samples (specs/007): each interval's latency histograms, so any
+# window's percentiles can be computed from the 1-second samples (tpcc/samples.py, HIST_*):
+# latency_hist (every attempt, as p99_ms), corrected_hist (as p99_corrected_ms; TPC-C engine only),
+# journal_hist.
+HISTOGRAM_FIELDS: tuple[str, ...] = ("latency_hist", "corrected_hist", "journal_hist")
+
+# application_name of the common workload's clerks (specs/007), so the harness can tell the
+# workload's sessions from its own. Scenario runs that own their workload leave it unset.
+WORKLOAD_APPLICATION_NAME = "resilience-workload"
+
+
 def error_kind_server(sqlstate: str | None) -> str:
     """The kind of a sure rollback the server answered, e.g. server_40P01 (deadlock)."""
     return f"{ERROR_KIND_SERVER_PREFIX}{sqlstate or 'unknown'}"

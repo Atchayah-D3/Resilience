@@ -62,6 +62,7 @@ async def _child(cfg: dict[str, Any], cmd_q: Any, out_q: Any) -> None:
         journals = MarkerJournals(Path(cfg["run_dir"]), index=idx, processes=cfg["processes"])
         drv = TpccWorkloadDriver(adapter, workload, journals, None, profile, worker_ids=cfg["worker_ids"],
                                  rate_tps=cfg["rate_tps"], raw_sink=lambda raw: out_q.put(("raw", idx, raw)))
+        drv.application_name = cfg.get("application_name")
         await drv.start()
         loop = asyncio.get_running_loop()
 
@@ -128,6 +129,9 @@ class TpccCoordinator:
         self.load_watch = DriverLoadWatch()
         self.window_t0_ns = 0
         self.failure: str | None = None
+        # the common workload (specs/007) turns these on; a scenario's own workload leaves them off
+        self.histograms = False
+        self.application_name: str | None = None
 
     @property
     def connected_workers(self) -> int:
@@ -141,6 +145,7 @@ class TpccCoordinator:
                          processes=self.processes,
                          clerks_per_process=[len(c["worker_ids"]) for c in self._configs])
         for cfg, cmd_q in zip(self._configs, self._cmd_qs):
+            cfg["application_name"] = self.application_name
             p = self._ctx.Process(target=_child_main, args=(cfg, cmd_q, self._out_q),
                                   name=f"tpcc-worker-{cfg['index']}", daemon=True)
             p.start()
@@ -246,7 +251,7 @@ class TpccCoordinator:
                 break
             del self._pending[second]
             self._first_seen.pop(second, None)
-            self.stream.emit("workload", "sample", **merge_raws(parts))
+            self.stream.emit("workload", "sample", **merge_raws(parts, histograms=self.histograms))
             cpu = [round(r["cpu_share"], 3) for r in parts]
             lag = [round(r["loop_lag_s"], 3) for r in parts]
             self.stream.emit("workload", "driver_load", cpu_share=cpu, loop_lag_s=lag,

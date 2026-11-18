@@ -56,6 +56,14 @@ holds the target, because its start empties the marker table.
 - FR-8 The baseline is valid only when every rule passes and the run finished its duration;
   missing evidence is NOT_MEASURED and fails (never a pass without evidence).
 
+## Added after the attach team's review (2026-11-18)
+- FR-9 Any window's figures from the 1-second samples (summed latency histograms; percentiles
+  never below the exact value).
+- FR-10 Scenario marks (run_start, t0, t1, run_end) written by the harness; the workload's
+  baseline is judged outside the scenarios' windows, and each window is reported.
+- FR-11 `duration_s: null`: run until the stop command.
+- FR-12 Clerks connect with `application_name = 'resilience-workload'` and the file's session settings.
+
 ## Out of scope (next story)
 Attaching a scenario to the running workload (its init/baseline/validate reading the workload's
 outputs instead of owning a workload), the harness-workload channel, the sequential orchestrator

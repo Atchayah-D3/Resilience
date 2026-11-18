@@ -22,25 +22,28 @@ def _check(name: str, ok: bool | None, detail: str) -> dict[str, Any]:
     return {"name": name, "status": NOT_MEASURED if ok is None else (PASS if ok else FAIL), "detail": detail}
 
 
-def windows(seconds: Sequence[Second], start_s: float, length_s: float) -> list[list[Second]]:
-    """Full, back-to-back windows of `length_s` from `start_s` (a last partial window is left out)."""
+def windows(seconds: Sequence[Second], start_s: float, length_s: float,
+            excluded: Sequence[tuple[float, float]] = ()) -> list[list[Second]]:
+    """Full, back-to-back windows of `length_s` from `start_s` (a last partial window is left out);
+    a window that overlaps an excluded span (a scenario's) is left out too."""
     if not seconds:
         return []
     end = max(s.elapsed_s for s in seconds)
     out: list[list[Second]] = []
     t = start_s
     while t + length_s <= end + 1e-6:
-        out.append([s for s in seconds if t < s.elapsed_s <= t + length_s])
+        if not any(a < t + length_s and t < b for a, b in excluded):
+            out.append([s for s in seconds if t < s.elapsed_s <= t + length_s])
         t += length_s
     return out
 
 
 def throughput_check(seconds: Sequence[Second], start_s: float, rate_tps: float | None,
-                     rules: BaselineRules) -> dict[str, Any]:
+                     rules: BaselineRules, excluded: Sequence[tuple[float, float]] = ()) -> dict[str, Any]:
     name = f"throughput: every {rules.tps_window_s} s window at or above {rules.tps_share_min:.0%} of the rate"
     if not rate_tps:
         return _check(name, None, "the run's rate is not known")
-    ws = [w for w in windows(seconds, start_s, rules.tps_window_s)]
+    ws = windows(seconds, start_s, rules.tps_window_s, excluded)
     if not ws:
         return _check(name, None, f"no full {rules.tps_window_s} s window was measured")
     tps = []
@@ -57,10 +60,11 @@ def throughput_check(seconds: Sequence[Second], start_s: float, rate_tps: float 
     return _check(name, not low, detail)
 
 
-def latency_check(seconds: Sequence[Second], start_s: float, rules: BaselineRules) -> dict[str, Any]:
+def latency_check(seconds: Sequence[Second], start_s: float, rules: BaselineRules,
+                  excluded: Sequence[tuple[float, float]] = ()) -> dict[str, Any]:
     name = (f"latency: median of the 1-second p99 values in every {rules.p99_window_s} s window at or under "
             f"{rules.p99_limit_ms:g} ms")
-    ws = windows(seconds, start_s, rules.p99_window_s)
+    ws = windows(seconds, start_s, rules.p99_window_s, excluded)
     if not ws:
         return _check(name, None, f"no full {rules.p99_window_s} s window was measured")
     medians = []
@@ -120,10 +124,15 @@ def end_checks(end: Mapping[str, Any], tpcc: bool = True) -> list[dict[str, Any]
         v = end.get(key)
         return v if isinstance(v, int) else None
 
-    lost, phantom = known("rpo_txn"), known("phantom")
+    # with scenarios in the run: the commits acknowledged outside their windows (a scenario's own
+    # losses are reported with that scenario); without: every lost commit
+    outside = "rpo_outside_scenarios" in end
+    lost, phantom = known("rpo_outside_scenarios" if outside else "rpo_txn"), known("phantom")
+    detail = (f"lost {lost if lost is not None else 'not measured'}"
+              + (f" outside the scenarios (all lost: {end.get('rpo_txn')})" if outside else "")
+              + f", phantom {phantom if phantom is not None else 'not measured'}")
     out = [_check("no lost commit, no phantom", None if lost is None or phantom is None else lost == 0 and phantom == 0,
-                  f"lost {lost if lost is not None else 'not measured'}, phantom "
-                  f"{phantom if phantom is not None else 'not measured'}")]
+                  detail)]
     tpcc_checks = (("partial_commits", "no half-saved transaction"),
                    ("aborted_markers_present", "no rolled-back transaction kept"),
                    ("tpcc_consistency_violations", "TPC-C consistency rules hold"))
@@ -137,12 +146,19 @@ def end_checks(end: Mapping[str, Any], tpcc: bool = True) -> list[dict[str, Any]
 
 def evaluate(*, seconds: Sequence[Second], measure_start_s: float, rate_tps: float | None, rules: BaselineRules,
              memory: Sequence[tuple[float, int]], end: Mapping[str, Any], driver_limited: bool,
-             full_duration: bool, ran_s: float, duration_s: float, tpcc: bool = True) -> list[dict[str, Any]]:
-    measured = [s for s in seconds if s.elapsed_s > measure_start_s]
+             full_duration: bool, ran_s: float, duration_s: float | None, tpcc: bool = True,
+             excluded: Sequence[tuple[float, float]] = ()) -> list[dict[str, Any]]:
+    """`excluded`: the scenarios' spans (seconds since the clerks started): not judged as the
+    workload's baseline (a scenario's fault breaks these rules by design)."""
+    measured = [s for s in seconds if s.elapsed_s > measure_start_s
+                and not any(a < s.elapsed_s <= b for a, b in excluded)]
+    duration = (_check("ran the full duration", full_duration, f"{ran_s:.0f} s of {duration_s:.0f} s")
+                if duration_s is not None else
+                _check("ran until it was stopped", full_duration, f"{ran_s:.0f} s, until the stop command"))
     return [
-        _check("ran the full duration", full_duration, f"{ran_s:.0f} s of {duration_s:.0f} s"),
-        throughput_check(measured, measure_start_s, rate_tps, rules),
-        latency_check(measured, measure_start_s, rules),
+        duration,
+        throughput_check(measured, measure_start_s, rate_tps, rules, excluded),
+        latency_check(measured, measure_start_s, rules, excluded),
         error_check(measured, rules),
         connection_check(measured),
         _check("the harness was not the limit", not driver_limited,
