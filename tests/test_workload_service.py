@@ -67,7 +67,7 @@ def test_any_scenario_workload_profile_can_be_the_common_workload():
     ({"workload": {"profile": "tpcc", "concurrency": 4, "transaction_markers": False, "rate_tps": 10,
                    "tpcc": {"warehouses": 8}}}, "transaction_markers"),
     ({"warmup_s": 100}, "shorter than duration_s"),
-    ({"worker_processes": 5}, "more than the clerks"),
+    ({"worker_processes": 2}, "worker_processes"),        # in workload.tpcc, as in a scenario
     ({"unknown_field": 1}, "unknown_field"),
 ])
 def test_a_bad_settings_file_is_refused_before_anything_starts(change, message):
@@ -385,7 +385,9 @@ class FakeLock:
 def _config(**kw):
     rules = BaselineRules(tps_window_s=1, tps_share_min=0.5, p99_window_s=1, p99_limit_ms=1000,
                           error_share_max=0.0, memory_growth_max=10.0, memory_from_s=0)
-    args = dict(id="test", duration_s=3.0, warmup_s=1.0, metrics_interval_s=1, status_interval_s=0.2,
+    # 5 s: samples arrive at whole seconds after the clerks start and the last, part-second one (the
+    # stop) is not judged, so a shorter run leaves no full measured window
+    args = dict(id="test", duration_s=5.0, warmup_s=1.0, metrics_interval_s=1, status_interval_s=0.2,
                 no_commit_alert_s=1.0, workload=_workload(), baseline=rules)
     args.update(kw)
     return ServiceConfig(**args)

@@ -51,8 +51,6 @@ class ServiceConfig(_Model):
     metrics_interval_s: int = Field(default=10, ge=1)
     # status.json is rewritten this often
     status_interval_s: float = Field(default=5.0, gt=0)
-    # worker processes for the clerks (absent: chosen by rate, as in a scenario run)
-    worker_processes: int | None = Field(default=None, ge=1)
     # no transaction committed for this long while running: an alert in the status and events;
     # the workload keeps trying (a fault may keep the database down that long)
     no_commit_alert_s: float = Field(default=600.0, gt=0)
@@ -75,8 +73,6 @@ class ServiceConfig(_Model):
                              "(NL-C-03 keeps its own workload until it does)")
         if self.warmup_s >= self.duration_s:
             raise ValueError(f"warmup_s ({self.warmup_s:g}) must be shorter than duration_s ({self.duration_s:g})")
-        if self.worker_processes is not None and self.worker_processes > w.concurrency:
-            raise ValueError(f"worker_processes ({self.worker_processes}) is more than the clerks ({w.concurrency})")
         return self
 
     def as_dict(self) -> dict[str, Any]:

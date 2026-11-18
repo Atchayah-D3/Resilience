@@ -199,12 +199,9 @@ class ServiceRunner:
         self._write_info()
 
     def _make_driver(self) -> Any:
-        """The same engine a scenario run makes for this workload (hooks.make_workload_driver),
-        with the settings file's worker processes for the TPC-C engine."""
+        """The same engine a scenario run makes for this workload (hooks.make_workload_driver); the
+        TPC-C engine's worker processes come from workload.tpcc.worker_processes, as in a scenario."""
         if isinstance(self.profile, WorkloadProfile):
-            if self.cfg.worker_processes is not None:
-                return self.profile.make_driver(self.adapter, self.journals, self.stream,
-                                                processes=self.cfg.worker_processes)
             return self.profile.make_driver(self.adapter, self.journals, self.stream)
         from resilience_tests.execution.workload.driver import WorkloadDriver
         return WorkloadDriver(self.adapter, self.profile_workload, self.journals, self.stream, history=None)
@@ -426,8 +423,11 @@ class ServiceRunner:
         ran_s = self.ended_s or 0.0
         measure_start = self.measure_start_s if self.measure_start_s is not None else self.cfg.warmup_s
         full = final == st.FINISHED and ran_s >= self.cfg.duration_s - 2 * LOOP_S
+        # judged up to the moment the stop began: the engine's last, part-second sample covers the
+        # clerks finishing their transactions, not the workload's normal running
+        judged = [x for x in self.seconds if x.elapsed_s <= ran_s + 1e-6] if ran_s else self.seconds
         checks = baseline_mod.evaluate(
-            seconds=self.seconds, measure_start_s=measure_start, rate_tps=self.profile_workload.rate_tps,
+            seconds=judged, measure_start_s=measure_start, rate_tps=self.profile_workload.rate_tps,
             rules=self.cfg.baseline, memory=self.memory, end=end, driver_limited=self.driver_limited,
             full_duration=full, ran_s=ran_s, duration_s=self.cfg.duration_s,
             tpcc=self.cfg.workload.profile == "tpcc")
