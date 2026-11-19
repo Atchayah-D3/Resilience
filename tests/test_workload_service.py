@@ -665,6 +665,27 @@ def test_client_stop_asks_once_and_returns_the_summary(tmp_path):
     assert st.stop_requested(folder)["by"] == "runner"
 
 
+def test_client_mark_only_while_the_workload_runs(tmp_path):
+    from resilience_tests.execution.workload.service import client
+
+    folder = tmp_path / "w"
+    with pytest.raises(client.ServiceFailed, match="no workload status"):
+        client.mark(tmp_path / "none", "run_start", run_id="r1", scenario="NL-C-01")
+    folder.mkdir()
+    for state in (st.STARTING, st.STOPPING, st.CHECKING, st.FINISHED, st.STOPPED, st.FAILED):
+        st.write_status(folder, {"state": state, "pid": os.getpid()})
+        with pytest.raises(client.ServiceFailed, match=f"the workload is '{state}'"):
+            client.mark(folder, "run_start", run_id="r1", scenario="NL-C-01")
+    st.write_status(folder, {"state": st.RUNNING, "pid": 2**22 + 12345})
+    with pytest.raises(client.ServiceFailed, match="process is gone"):
+        client.mark(folder, "run_start", run_id="r1", scenario="NL-C-01")
+    assert st.read_marks(folder) == []                                  # nothing written by a refused mark
+    for state in (st.WARMING_UP, st.RUNNING):
+        st.write_status(folder, {"state": state, "pid": os.getpid()})
+        client.mark(folder, "run_start", run_id=f"r-{state}", scenario="NL-C-01")
+    assert [m["run_id"] for m in st.read_marks(folder)] == ["r-warming_up", "r-running"]
+
+
 # --- latency histograms and windows (the harness reads any window from the samples) -----------------
 
 
@@ -707,6 +728,21 @@ def test_a_window_moves_in_whole_samples_and_has_the_measured_window_fields():
     assert wm.window(no_corr, 199.0, 200.0)["p99_corrected_ms"] is None     # the custom workload's samples
     with pytest.raises(wm.NoHistograms):
         wm.window([{"t_wall": 1.0, "interval_s": 1.0, "commits": 1}], 0.0, 1.0)
+
+
+def test_a_window_without_a_sample_is_refused_never_tps_0(tmp_path):
+    from resilience_tests.execution.workload.service import client
+    from resilience_tests.execution.workload.service import windows as wm
+
+    lines = [_line(100.0 + i, 10, [1.0]) for i in range(10)]          # samples ending at 100 .. 109
+    with pytest.raises(wm.NoSamples, match="from 100.000 to 109.000"):
+        wm.window(lines, 150.0, 210.0)                                  # after the workload's end
+    with pytest.raises(wm.NoSamples):
+        wm.window(lines, 103.2, 103.8)                                  # shorter than a second
+    with pytest.raises(wm.NoSamples, match="no samples"):
+        wm.window([], 0.0, 10.0)
+    with pytest.raises(wm.NoSamples):                                   # the folder: no metrics file yet
+        client.window(tmp_path, 0.0, 10.0)
 
 
 def test_scenario_windows_from_marks_an_unfinished_scenario_lasts_to_the_end():

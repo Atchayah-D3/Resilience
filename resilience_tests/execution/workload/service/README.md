@@ -42,9 +42,11 @@ First time on a target with `rate_fraction_of_capacity`: measure the maximum for
 
 - `client.window(folder, from_wall, to_wall)`: any window's figures (the fields of a scenario's
   measurement window) from the 1-second samples' latency histograms; percentiles are the upper
-  bound of a 2% bucket, never below the exact value.
+  bound of a 2% bucket, never below the exact value. A window in which no 1-second sample ended
+  (after the workload's end, or shorter than a second) raises `windows.NoSamples`, never TPS 0.
 - `client.mark(folder, "run_start" | "t0" | "t1" | "run_end", run_id=..., scenario=...)`: the
   workload judges its baseline outside the scenarios' windows and reports each window separately.
+  Refused (`client.ServiceFailed`) unless the workload is warming up or running and its process is alive.
 - `duration_s: null`: run until the stop command (a suite of any length).
 - Clerks connect with `application_name = 'resilience-workload'` and the settings file's
   `session:` settings (`lock_timeout`, `statement_timeout`, `transaction_timeout` 0 in oltp-common).

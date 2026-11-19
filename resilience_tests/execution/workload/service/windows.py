@@ -30,11 +30,22 @@ class NoHistograms(ValueError):
     """The samples carry no latency histograms (not written by the common workload)."""
 
 
+class NoSamples(ValueError):
+    """No 1-second sample ended inside the window (before the workload's first sample, after its
+    end, or shorter than a second): there is nothing to measure, so no figures are given."""
+
+
 def window(samples: Sequence[Mapping[str, Any]], from_wall: float, to_wall: float) -> dict[str, Any]:
     """The window (from_wall, to_wall] over 1-second samples (metrics-1s.jsonl lines). Fields as
     driver.MeasuredWindow, plus `samples`, `first_sample_start_wall`, `last_sample_end_wall`,
-    `max_ms` and `percentiles` (how they were computed)."""
+    `max_ms` and `percentiles` (how they were computed). Raises NoSamples when no sample ended
+    inside the window (never TPS 0 for a window that was not measured)."""
     inside = [s for s in samples if from_wall < float(s["t_wall"]) <= to_wall]
+    if not inside:
+        first = float(samples[0]["t_wall"]) if samples else None
+        last = float(samples[-1]["t_wall"]) if samples else None
+        raise NoSamples(f"no 1-second sample ended inside the window ({from_wall:.3f}, {to_wall:.3f}]"
+                        + (f"; the samples run from {first:.3f} to {last:.3f}" if samples else "; there are no samples"))
     missing = [s for s in inside if "latency_hist" not in s]
     if missing:
         raise NoHistograms(f"{len(missing)} sample(s) in the window carry no latency histogram")

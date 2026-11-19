@@ -21,6 +21,7 @@
 - [X] T022 Run until stopped (`duration_s: null`)
 - [X] T023 Clerks' application_name `resilience-workload`; session settings in `workloads/oltp-common.yaml`
 - [X] T024 Rules for reading live files; lock and kill-switch confirmations (`handover-attach.md`, tests)
+- [X] T025 `client.mark` refused unless the workload is warming up or running; `client.window` raises `NoSamples` for a window without a sample (VM run 2026-11-18)
 - [ ] T012 Lab: capacity record for 64 clerks on all warehouses (`tpcc/capacity.py --clerks 64`), then a 15-minute service run
 - [ ] T013 Lab: fault survival during a 30-minute run (database restart, kill -9, 5 minutes down)
 - [ ] T014 Lab: 3 x 2-hour baselines; the lead signs off the thresholds and the rate

@@ -138,11 +138,25 @@ def summary(folder: str | Path) -> dict[str, Any] | None:
         return None
 
 
+MARK_STATES = frozenset({st.WARMING_UP, st.RUNNING})   # the clerks are sending transactions
+
+
 def mark(folder: str | Path, kind: str, *, run_id: str, scenario: str, t_wall: float | None = None,
          **extra: Any) -> dict[str, Any]:
     """A scenario mark in the running workload's folder (run_start, t0, t1, run_end): the workload
-    judges its own baseline outside the scenarios' windows and reports each window separately."""
-    return st.write_mark(Path(folder), kind, run_id=run_id, scenario=scenario, t_wall=t_wall, **extra)
+    judges its own baseline outside the scenarios' windows and reports each window separately.
+    Refused (ServiceFailed) unless the workload is warming up or running and its process is alive:
+    a mark written after the workload has ended (or before its clerks run) belongs to no run."""
+    folder = Path(folder)
+    s = status(folder)
+    if s is None:
+        raise ServiceFailed(f"mark {kind!r} refused: no workload status in {folder}")
+    if s.get("state") not in MARK_STATES:
+        raise ServiceFailed(f"mark {kind!r} refused: the workload is {s.get('state')!r}, not warming up or running"
+                            + (f" ({s['failure']})" if s.get("failure") else ""))
+    if not st.pid_alive(s.get("pid")):
+        raise ServiceFailed(f"mark {kind!r} refused: the workload's process is gone (last state {s.get('state')!r})")
+    return st.write_mark(folder, kind, run_id=run_id, scenario=scenario, t_wall=t_wall, **extra)
 
 
 def window(folder: str | Path, from_wall: float, to_wall: float) -> dict[str, Any]:
