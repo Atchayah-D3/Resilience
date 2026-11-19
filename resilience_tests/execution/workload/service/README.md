@@ -22,6 +22,8 @@ phases: `specs/007-common-oltp-workload/handover-attach.md`.
 .venv/bin/python -m resilience_tests.execution.workload.service.cli stop   --env e2-u22-3
 # a finished run's last status
 .venv/bin/python -m resilience_tests.execution.workload.service.cli status --env e2-u22-3 --folder <run folder>
+# a run whose process died before its summary: the end checks and baseline rules from its files
+.venv/bin/python -m resilience_tests.execution.workload.service.cli check  --env e2-u22-3 --folder <run folder>
 # kill switch: undo injections AND stop the workload (the workload is never stopped without the flag)
 .venv/bin/python -m resilience_tests.control.killswitch --env e2-u22-3 --stop-workload
 ```
@@ -36,7 +38,7 @@ First time on a target with `rate_fraction_of_capacity`: measure the maximum for
 | start (once) | target checks; refused while a scenario run holds the target; the workload lock on the target (`/var/tmp/resilience-workload-<port>.lock`); the workload's tables emptied (markers, churn; churn seeded); TPC-C data loaded or reset **only if needed** (missing, other size, grown past the limit, inconsistent, or `fresh_load`); data checked; rate fixed; clerks started; warm-up (not measured) |
 | while running | the clerks send transactions at the rate; every writing transaction writes its journal lines before and after (lost-commit evidence); the files below are written live. Nothing is reloaded or emptied. A database that is down does not stop it: clerks reconnect, the gap is reported as an outage |
 | end | at `duration_s`, on `stop`, or when the workload itself fails (a journal line cannot be saved, a worker process dies, the harness is the limit, the lock is taken over) |
-| after the stop | lost commits and phantoms (journals against the marker table), TPC-C checks, baseline rules, `summary.json` and `summary.txt` |
+| after the stop | lost commits and phantoms (journals against the marker table), TPC-C checks, baseline rules, `summary.json` and `summary.txt`. Every journal line is copied into temporary tables on one database connection, in batches, and the database compares (`endchecks.py`, `adapters/postgresql/journal_check.py`): the harness's memory does not grow with the run (the old in-memory comparison was killed at 7 GB on a 1-hour run at 2,500 TPS). The temporary tables take room on the target's disk while the check runs (about 2 x the journals' size: 333 MB for the 15-minute lab run, about 3.5 GB for an hour at 2,500 TPS) and disappear when it ends; the check does not start unless the target's data filesystem has 1.5 x that free |
 
 ## For a harness attached to the running workload
 

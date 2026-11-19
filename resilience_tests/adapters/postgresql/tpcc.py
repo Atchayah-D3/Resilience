@@ -80,6 +80,33 @@ FUNCTIONS_FILE = "tpcc_functions.sql"
 # --- one TPC-C transaction = one call (build step 6) --------------------------------------
 
 S = TPCC_SCHEMA
+
+# The per-order check over the temporary table tpcc_acked (w, d, o_id, ol_cnt): one row per
+# acknowledged New-Order. A New-Order can be delivered afterwards (new_order row gone, carrier
+# set): that is complete too. Missing = no order row. Incomplete = an order row with a wrong line
+# count, or no new_order row on an order no Delivery has touched. Shared by tpcc_order_check and
+# the end checks of a long run (journal_check.py), so both judge with the same query.
+ORDER_CHECK_SQL = f"""
+    SELECT count(*) FILTER (WHERE o.o_id IS NULL) AS missing,
+           count(*) FILTER (WHERE o.o_id IS NOT NULL AND (o.o_ol_cnt <> a.ol_cnt OR l.lines <> a.ol_cnt
+                                  OR (n.no_o_id IS NULL AND o.o_carrier_id IS NULL))) AS incomplete
+      FROM tpcc_acked a
+      LEFT JOIN {S}.orders o ON (o.o_w_id, o.o_d_id, o.o_id) = (a.w, a.d, a.o_id)
+      LEFT JOIN {S}.new_order n ON (n.no_w_id, n.no_d_id, n.no_o_id) = (a.w, a.d, a.o_id)
+      LEFT JOIN LATERAL (SELECT count(*) AS lines FROM {S}.order_line l
+                          WHERE (l.ol_w_id, l.ol_d_id, l.ol_o_id) = (a.w, a.d, a.o_id)) l ON true"""
+
+# The per-payment check over the temporary table tpcc_paid (w, d, c_w, c_d, c, amt): how many
+# confirmed payments have no history row written since $1 by that customer, in that district,
+# for that amount. Identical payments count as many times as they were confirmed. Shared as above.
+PAYMENT_CHECK_SQL = f"""
+    SELECT coalesce(sum(greatest(e.n - coalesce(h.n, 0), 0)), 0)
+      FROM (SELECT w, d, c_w, c_d, c, amt, count(*) AS n FROM tpcc_paid GROUP BY 1, 2, 3, 4, 5, 6) e
+      LEFT JOIN (SELECT h_w_id, h_d_id, h_c_w_id, h_c_d_id, h_c_id, (h_amount * 100)::int AS amt,
+                        count(*) AS n
+                   FROM {S}.history WHERE h_date >= $1 GROUP BY 1, 2, 3, 4, 5, 6) h
+        ON (h.h_w_id, h.h_d_id, h.h_c_w_id, h.h_c_d_id, h.h_c_id, h.amt)
+         = (e.w, e.d, e.c_w, e.c_d, e.c, e.amt)"""
 TPCC_CALL_SQL = {
     NEW_ORDER: f"SELECT {S}.new_order($1, $2, $3, $4, $5, $6::int[], $7::int[], $8::int[])",
     PAYMENT: f"SELECT {S}.payment($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -280,18 +307,7 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
             async with conn.transaction():
                 await conn.execute("CREATE TEMP TABLE tpcc_acked (w int, d int, o_id int, ol_cnt int) ON COMMIT DROP")
                 await conn.copy_records_to_table("tpcc_acked", records=rows)
-                # A New-Order can be delivered afterwards (new_order row gone, carrier set): that is
-                # complete too. Missing = no order row. Incomplete = an order row with a wrong line
-                # count, or no new_order row on an order no Delivery has touched.
-                row = await conn.fetchrow(f"""
-                    SELECT count(*) FILTER (WHERE o.o_id IS NULL) AS missing,
-                           count(*) FILTER (WHERE o.o_id IS NOT NULL AND (o.o_ol_cnt <> a.ol_cnt OR l.lines <> a.ol_cnt
-                                                  OR (n.no_o_id IS NULL AND o.o_carrier_id IS NULL))) AS incomplete
-                      FROM tpcc_acked a
-                      LEFT JOIN {S}.orders o ON (o.o_w_id, o.o_d_id, o.o_id) = (a.w, a.d, a.o_id)
-                      LEFT JOIN {S}.new_order n ON (n.no_w_id, n.no_d_id, n.no_o_id) = (a.w, a.d, a.o_id)
-                      LEFT JOIN LATERAL (SELECT count(*) AS lines FROM {S}.order_line l
-                                          WHERE (l.ol_w_id, l.ol_d_id, l.ol_o_id) = (a.w, a.d, a.o_id)) l ON true""")
+                row = await conn.fetchrow(ORDER_CHECK_SQL)
                 return {"checked": len(rows), "missing": int(row["missing"]), "incomplete": int(row["incomplete"])}
         finally:
             await conn.close()
@@ -319,14 +335,7 @@ class TpccMixin(TpccSupport, PostgreSQLCore):
                 await conn.execute("CREATE TEMP TABLE tpcc_paid (w int, d int, c_w int, c_d int, c int, amt int) "
                                    "ON COMMIT DROP")
                 await conn.copy_records_to_table("tpcc_paid", records=rows)
-                missing = await conn.fetchval(f"""
-                    SELECT coalesce(sum(greatest(e.n - coalesce(h.n, 0), 0)), 0)
-                      FROM (SELECT w, d, c_w, c_d, c, amt, count(*) AS n FROM tpcc_paid GROUP BY 1, 2, 3, 4, 5, 6) e
-                      LEFT JOIN (SELECT h_w_id, h_d_id, h_c_w_id, h_c_d_id, h_c_id, (h_amount * 100)::int AS amt,
-                                        count(*) AS n
-                                   FROM {S}.history WHERE h_date >= $1 GROUP BY 1, 2, 3, 4, 5, 6) h
-                        ON (h.h_w_id, h.h_d_id, h.h_c_w_id, h.h_c_d_id, h.h_c_id, h.amt)
-                         = (e.w, e.d, e.c_w, e.c_d, e.c, e.amt)""", since)
+                missing = await conn.fetchval(PAYMENT_CHECK_SQL, since)
                 return {"checked": len(rows), "missing": int(missing)}
         finally:
             await conn.close()

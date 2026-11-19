@@ -31,7 +31,7 @@ import asyncio
 import json
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -40,16 +40,10 @@ from resilience_tests.adapters.base import adapter_for
 from resilience_tests.control.profile import EnvProfile, Node
 from resilience_tests.execution.workload import contract
 from resilience_tests.execution.workload.hooks import hooks_for
-from resilience_tests.execution.workload.markers import (
-    ACKED_JOURNAL,
-    MarkerJournals,
-    diff_from_journals,
-    journal_paths,
-    read_journal,
-    write_db_markers,
-)
+from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.execution.workload.profiles.base import WorkloadProfile
 from resilience_tests.execution.workload.service import baseline as baseline_mod
+from resilience_tests.execution.workload.service import endchecks
 from resilience_tests.execution.workload.service import state as st
 from resilience_tests.execution.workload.service.config import ServiceConfig
 from resilience_tests.execution.workload.service import windows as windows_mod
@@ -65,7 +59,7 @@ from resilience_tests.observability.event_stream import Event, EventStream
 READY_TIMEOUT_S = 120.0       # every clerk connected, or the start fails
 LOOP_S = 1.0
 MEMORY_EVERY_S = 30.0
-LOST_LIST_MAX = 100           # lost markers named in the summary (all are in the evidence files)
+LOST_LIST_MAX = endchecks.LOST_LIST_MAX
 
 
 class ServiceRunner:
@@ -112,7 +106,8 @@ class ServiceRunner:
         self.outages = OutageTracker(config.workload.rate_tps, config.no_commit_alert_s)
         self.last_interval: dict[str, Any] | None = None
         self.alerts: list[str] = []
-        self._lost_t_ack: dict[str, float] = {}
+        self._lost_t_ack: Sequence[float] = ()   # when each lost commit was acknowledged (end checks)
+        self.summary_extra: dict[str, Any] = {}  # added to summary.json (a run checked again: recover.py)
 
     # --- control from outside ----------------------------------------------------------------
 
@@ -246,6 +241,7 @@ class ServiceRunner:
                 rss = st.process_tree_rss_bytes(os.getpid())
                 if rss:
                     self.memory.append((round(now - self.t0, 1), rss))
+                    self.stream.emit("service", "memory", elapsed_s=round(now - self.t0, 1), rss_bytes=rss)
                 next_memory = now + MEMORY_EVERY_S
             if self.driver.failure:
                 self.failure = f"the workload failed: {self.driver.failure}"
@@ -287,41 +283,34 @@ class ServiceRunner:
                          ran_s=round(self.ended_s, 1))
 
     async def _end_checks(self) -> dict[str, Any]:
-        """Every acknowledged commit in the database, no phantom, then the TPC-C checks. A part
-        that cannot run is recorded and its measure stays unknown (the baseline then fails)."""
+        """Every acknowledged commit in the database, no phantom, then the TPC-C checks, compared in
+        the database line by line (endchecks.py: the harness's memory does not grow with the run).
+        A part that cannot run is recorded and its measure stays unknown (the baseline then fails)."""
         self.state, self.step = st.CHECKING, "end checks"
         self._write_status()
-        end: dict[str, Any] = {"_errors": []}
-        try:
-            db = await self.adapter.marker_ids()
-            self.facts["markers_db_file"] = write_db_markers(self.folder, db)
-            diff, torn = diff_from_journals(self.folder, db)
-            trusted = not torn and not diff.unjournalled_ack
-            if diff.lost:
-                # when each lost commit was acknowledged: placed in a scenario's window or outside them
-                lost = set(diff.lost)
-                self._lost_t_ack = {r["uuid"]: float(r.get("t_ack", 0.0)) for p in journal_paths(self.folder, ACKED_JOURNAL)
-                                    for r in read_journal(p).records if r.get("uuid") in lost}
-            end.update({"rpo_txn": diff.rpo_txn if trusted else None, "phantom": len(diff.phantom),
-                        "markers": {"written": diff.written, "acked": diff.acked, "in_db": diff.in_db,
-                                    "lost": sorted(diff.lost)[:LOST_LIST_MAX], "lost_count": len(diff.lost),
-                                    "indeterminate": len(diff.indeterminate),
-                                    "indeterminate_committed": len(diff.indeterminate_committed),
-                                    "rolled_back": len(diff.rolled_back), "phantom": sorted(diff.phantom)[:LOST_LIST_MAX],
-                                    "unjournalled_ack": len(diff.unjournalled_ack), "torn_journal_lines": torn}})
-            if not trusted:
-                end["_errors"].append("the journals disagree with themselves (torn lines or acknowledgements "
-                                      "without a marker line): the lost-commit count is not trusted")
-        except Exception as exc:  # noqa: BLE001
-            end["_errors"].append(f"lost-commit check: {type(exc).__name__}: {exc}")
-        try:
-            checks = await self.profile.consistency_checks(self.adapter, self.folder)
-            end["_not_measured"] = checks.pop("_not_measured", {})
-            end["tpcc_facts"] = checks.pop("_facts", {})
-            end.update(checks)
-        except Exception as exc:  # noqa: BLE001
-            end["_errors"].append(f"TPC-C checks: {type(exc).__name__}: {exc}")
+        tpcc = self.tpcc_inputs()
+        result = await endchecks.run_end_checks(self.adapter, self.folder, tpcc=tpcc, step=self._set_step)
+        self.facts.update(result.facts)
+        self._lost_t_ack = result.lost_t_ack
+        end = result.end
+        if tpcc is None:
+            # the custom workloads: their hooks' own checks (none today), as in a scenario run
+            try:
+                checks = await self.profile.consistency_checks(self.adapter, self.folder)
+                end["_not_measured"] = checks.pop("_not_measured", {})
+                end["tpcc_facts"] = checks.pop("_facts", {})
+                end.update(checks)
+            except Exception as exc:  # noqa: BLE001
+                end["_errors"].append(f"profile checks: {type(exc).__name__}: {exc}")
         return end
+
+    def tpcc_inputs(self) -> endchecks.TpccInputs | None:
+        if self.cfg.workload.profile != "tpcc":
+            return None
+        w = self.profile_workload
+        return endchecks.TpccInputs(orders_before=getattr(self.profile, "orders_at_prepare", None),
+                                    history_since=getattr(self.profile, "history_since", None),
+                                    warehouses=int(w.tpcc.warehouses))
 
     async def _release(self) -> None:
         if self._lock_held:
@@ -403,6 +392,8 @@ class ServiceRunner:
                       "intervals": st.metrics_interval_file(self.cfg.metrics_interval_s), "events": st.EVENTS_FILE,
                       "journals": ["marker*.jrnl", "acked*.jrnl", "aborted*.jrnl"], "summary": st.SUMMARY_FILE},
             "workload_lock": (self.facts.get("workload_lock") or {}).get("path"),
+            "disclosures": list(self.disclosures),
+            "start_facts": {k: v for k, v in self.facts.items() if k in ("hostname", "data_step", "prepare")},
         })
 
     def _set_step(self, step: str) -> None:
@@ -448,7 +439,7 @@ class ServiceRunner:
         inside = [x for x in self.seconds if w["start_wall"] < x.t_wall <= w["end_wall"]]
         outs = [o for o in self.outages.outages + ([self.outages.open_outage()] if self.outages.open_outage() else [])
                 if w["start_wall"] <= o["started_wall"] <= w["end_wall"]]
-        lost = sum(1 for t in self._lost_t_ack.values() if w["start_wall"] <= t <= w["end_wall"])
+        lost = sum(1 for t in self._lost_t_ack if w["start_wall"] <= t <= w["end_wall"])
         return {**w, **self._totals(inside), "outages": len(outs),
                 "outage_seconds": round(sum(o.get("seconds", 0.0) for o in outs), 1),
                 "lost_commits_acked_inside": lost}
@@ -468,8 +459,8 @@ class ServiceRunner:
         excluded = [(w["start_wall"] - self.clerks_started_wall, w["end_wall"] - self.clerks_started_wall)
                     for w in scen]
         if end.get("rpo_txn") is not None and scen:
-            outside = [u for u, t in self._lost_t_ack.items() if windows_mod.in_any(t, scen) is None]
-            end["rpo_outside_scenarios"] = len(outside) + (end["rpo_txn"] - len(self._lost_t_ack))
+            outside = sum(1 for t in self._lost_t_ack if windows_mod.in_any(t, scen) is None)
+            end["rpo_outside_scenarios"] = outside + (end["rpo_txn"] - len(self._lost_t_ack))
         # judged up to the moment the stop began: the engine's last, part-second sample covers the
         # clerks finishing their transactions, not the workload's normal running
         judged = [x for x in self.seconds if x.elapsed_s <= ran_s + 1e-6] if ran_s else self.seconds
@@ -507,6 +498,7 @@ class ServiceRunner:
                         "memory_max_mb": round(max(b for _, b in self.memory) / 1e6) if self.memory else None},
             "end_checks": end, "start": self.facts, "disclosures": self.disclosures,
         }
+        summary.update(self.summary_extra)
         (self.folder / st.SUMMARY_FILE).write_text(json.dumps(summary, indent=2, default=str) + "\n")
         (self.folder / st.SUMMARY_TEXT_FILE).write_text(summary_text(summary))
         return summary
@@ -515,8 +507,10 @@ class ServiceRunner:
 def summary_text(s: dict[str, Any]) -> str:
     t, m = s["times"], s["totals"]["measured"]
     rate = (s["settings"]["workload_used"] or {}).get("rate_tps")
+    rec = s.get("recovered")
     lines = [
         f"common workload {s['id']}  ({s['run_id']})",
+        *([f"END CHECKS REDONE by the check command on {rec['checked_at']}: {rec['why']}"] if rec else []),
         f"state: {s['state'].upper()}" + (f"  -- {s['failure']}" if s.get("failure") else "")
         + (f"  (stopped by {s['stop_requested_by']})" if s.get("stop_requested_by") else ""),
         (f"ran {t['ran_s']:.0f} s of {t['duration_s']:.0f} s" if t["duration_s"] is not None

@@ -410,25 +410,36 @@ class TpccProfile(WorkloadProfile):
 
 def _driver_load(events: Path) -> dict[str, Any] | None:
     """From the run's events: was the harness ever the limit, and how busy were its processes."""
+    limited, max_cpu, max_lag, processes = False, 0.0, 0.0, 1
     try:
-        lines = events.read_text().splitlines()
+        fh = events.open("rb")          # line by line: a long run's events file can be large
     except OSError:
         return None
-    limited, max_cpu, max_lag, processes = False, 0.0, 0.0, 1
-    for line in lines:
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if e.get("source") != "workload":
-            continue
-        d = e.get("data", {})
-        if e.get("kind") == "driver_load":
-            max_cpu = max([max_cpu, *d.get("cpu_share", [])])
-            max_lag = max([max_lag, *d.get("loop_lag_s", [])])
-        elif e.get("kind") == "fatal" and d.get("driver_limited"):
-            limited = True
-        elif e.get("kind") == "start":
-            processes = d.get("processes", 1)
+    with fh:
+        for e in _event_lines(fh):
+            limited, max_cpu, max_lag, processes = _driver_load_step(e, limited, max_cpu, max_lag, processes)
     return {"driver_limited": limited, "max_cpu_share": round(max_cpu, 3), "max_loop_lag_s": round(max_lag, 3),
             "processes": processes}
+
+
+def _event_lines(fh: Any) -> Any:
+    for raw in fh:
+        try:
+            yield json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+
+
+def _driver_load_step(e: Any, limited: bool, max_cpu: float, max_lag: float,
+                      processes: int) -> tuple[bool, float, float, int]:
+    if not isinstance(e, dict) or e.get("source") != "workload":
+        return limited, max_cpu, max_lag, processes
+    d = e.get("data", {})
+    if e.get("kind") == "driver_load":
+        max_cpu = max([max_cpu, *d.get("cpu_share", [])])
+        max_lag = max([max_lag, *d.get("loop_lag_s", [])])
+    elif e.get("kind") == "fatal" and d.get("driver_limited"):
+        limited = True
+    elif e.get("kind") == "start":
+        processes = d.get("processes", 1)
+    return limited, max_cpu, max_lag, processes

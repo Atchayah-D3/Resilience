@@ -3,9 +3,12 @@
     python -m resilience_tests.execution.workload.service.cli start  --env e2-u22-3 --config workloads/oltp-common.yaml
     python -m resilience_tests.execution.workload.service.cli status --env e2-u22-3
     python -m resilience_tests.execution.workload.service.cli stop   --env e2-u22-3
+    python -m resilience_tests.execution.workload.service.cli check  --env e2-u22-3 --folder <run folder>
 
 `start` checks the settings file, then runs the workload in the background (it keeps running
 after the terminal closes) and returns. The run ends by itself after `duration_s`, or on `stop`.
+`check` runs the end checks and the baseline rules of a run whose process died before writing
+its summary, from the run's files (recover.py).
 Evidence: <driver_host.run_dir>/workload-<id>-<time>/ (status.json, metrics-1s.jsonl,
 intervals-<n>s.jsonl, events.jsonl, the journals, summary.json, summary.txt, service.log).
 """
@@ -162,6 +165,22 @@ def cmd_run(a: argparse.Namespace) -> int:
     return 0 if summary["state"] != st.FAILED else 1
 
 
+def cmd_check(a: argparse.Namespace) -> int:
+    """The end checks of a run whose process died before its summary (recover.py)."""
+    from resilience_tests.execution.workload.service.recover import CheckRefused, check_folder
+
+    env = load_profile(a.env)
+    node = _node(env, a.node)
+    folder = Path(a.folder).expanduser()
+    try:
+        asyncio.run(check_folder(env, node, folder, say=lambda s: print(f"  {s}", flush=True)))
+    except CheckRefused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    print((folder / st.SUMMARY_TEXT_FILE).read_text())
+    return 0
+
+
 def summary_line(summary: dict[str, Any]) -> str:
     return (f"{summary['state']}: baseline {'valid' if summary['baseline_valid'] else 'not valid'}"
             + (f"; {summary['failure']}" if summary.get("failure") else ""))
@@ -171,7 +190,7 @@ def _args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="python -m resilience_tests.execution.workload.service.cli",
                                  description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
-    for name in ("start", "status", "stop", "_run"):
+    for name in ("start", "status", "stop", "check", "_run"):
         p = sub.add_parser(name)
         p.add_argument("--env", required=True)
         p.add_argument("--node")
@@ -183,7 +202,7 @@ def _args(argv: list[str]) -> argparse.Namespace:
             p.add_argument("--folder", help="show this run folder's status (e.g. a finished run)")
         if name == "stop":
             p.add_argument("--wait", type=float, default=STOP_WAIT_S, help="seconds to wait for the end checks")
-        if name == "_run":
+        if name in ("_run", "check"):
             p.add_argument("--folder", required=True)
     return ap.parse_args(argv)
 
@@ -191,7 +210,8 @@ def _args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     a = _args(sys.argv[1:] if argv is None else argv)
     try:
-        return {"start": cmd_start, "status": cmd_status, "stop": cmd_stop, "_run": cmd_run}[a.command](a)
+        return {"start": cmd_start, "status": cmd_status, "stop": cmd_stop, "check": cmd_check,
+                "_run": cmd_run}[a.command](a)
     except (ValueError, OSError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2

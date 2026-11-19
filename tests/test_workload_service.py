@@ -8,6 +8,7 @@ engine against a scripted session, for a few seconds.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import fcntl
 import json
 import os
@@ -19,6 +20,7 @@ from catalog.schema import Workload
 from resilience_tests.adapters.base import DatabaseSession
 from resilience_tests.control.profile import load_profile
 from resilience_tests.execution.workload import contract as c
+from resilience_tests.execution.workload.contract import NEW_ORDER
 from resilience_tests.execution.workload.markers import read_journal
 from resilience_tests.execution.workload.service import baseline as bl
 from resilience_tests.execution.workload.service import runner as runner_mod
@@ -292,8 +294,9 @@ def test_a_scenario_holding_the_target_is_seen_through_its_lock_file(tmp_path):
 
 
 class Shop:
-    """A database that commits everything; it can be 'down' (connections refused, open ones lost)."""
-    committed: set = set()
+    """A database that commits everything; it can be 'down' (connections refused, open ones lost).
+    It keeps each committed marker's transaction type, so its order counter moves as a real one."""
+    committed: dict = {}
     down = False
 
 
@@ -310,7 +313,7 @@ class ShopSession(DatabaseSession):
             self._closed = True
             return ("unknown", {}, None)
         if marker is not None:
-            Shop.committed.add(marker[1])
+            Shop.committed[marker[1]] = txn_type
         return ("committed", {}, None)
 
     async def try_write(self):
@@ -337,17 +340,36 @@ class ShopAdapter(FakeAdapter):
             raise ConnectionRefusedError("down")
         return ShopSession()
 
+    def _kept(self):
+        """The committed markers the database still holds: with lose_one, the first one (marker and
+        rows) is gone -- a lost commit, as after a crash."""
+        ids = sorted(Shop.committed)
+        return ids[1:] if self.lose_one and ids else ids
+
     async def marker_ids(self):
-        ids = set(Shop.committed)
-        if self.lose_one and ids:
-            ids.pop()
-        return ids
+        return set(self._kept())
+
+    # the TPC-C checks, as a consistent database answers them (the engine's journal lines carry no
+    # order numbers here, so there is nothing for the per-order and per-payment checks to look up)
+    async def tpcc_order_check(self, orders):
+        return {"checked": len(orders), "missing": 0, "incomplete": 0}
+
+    async def tpcc_payment_check(self, payments, since):
+        return {"checked": len(payments), "missing": 0}
+
+    async def tpcc_data_status(self):
+        return {"current_orders": ShopProfile.ORDERS_AT_START
+                + sum(1 for u in self._kept() if Shop.committed[u] == NEW_ORDER)}
+
+    async def tpcc_consistency(self, rules, district_sample=None, seed=None):
+        return {r: 0 for r in rules}
 
 
 class ShopProfile(TpccProfile):
     """The TPC-C profile without its data steps (they need a database)."""
 
     calls: list = []
+    ORDERS_AT_START = 1000
 
     async def reset_data(self, adapter, extend_phase=None, fresh=False):
         ShopProfile.calls.append(("reset_data", fresh))
@@ -356,15 +378,14 @@ class ShopProfile(TpccProfile):
     async def prepare(self, adapter):
         ShopProfile.calls.append(("prepare",))
         self.set_run_constants(100)
+        self.orders_at_prepare = ShopProfile.ORDERS_AT_START
+        self.history_since = datetime.datetime.now(datetime.timezone.utc)
         if self.workload.rate_fraction_of_capacity is not None:      # as resolve_rate: a share of 400 TPS
             rate = self.workload.rate_fraction_of_capacity * 400
             self.workload = self.workload.model_copy(update={"rate_tps": rate, "rate_fraction_of_capacity": None})
             self.rate = {"fraction": 0.5, "capacity_tps": 400, "rate_tps": rate}
         return {"tpcc_data": {"warehouses": 8}, "_disclosures": []}
 
-    async def consistency_checks(self, adapter, run_dir):
-        return {"partial_commits": 0, "aborted_markers_present": 0, "tpcc_consistency_violations": 0,
-                "_facts": {}, "_not_measured": {}}
 
 
 class FakeLock:
@@ -396,7 +417,7 @@ def _config(**kw):
 
 
 def service(tmp_path, monkeypatch, cfg=None, adapter=None, scenario_holder=None):
-    Shop.committed, Shop.down = set(), False
+    Shop.committed, Shop.down = {}, False
     ShopAdapter.settings_seen = []
     ShopProfile.calls = []
     monkeypatch.setattr(runner_mod, "LOOP_S", 0.05)
@@ -835,3 +856,70 @@ def test_the_kill_switch_stops_the_workload_only_when_asked(tmp_path, monkeypatc
     assert called == []
     killswitch.main(["--env", "e2-dedicated-vm", "--stop-workload"])
     assert called == [env]
+
+
+# --- the check command: a run whose process died before its summary ---------------------------------
+
+
+def test_check_rebuilds_the_summary_of_a_run_that_died_with_the_same_results(tmp_path, monkeypatch):
+    from resilience_tests.execution.workload.service import recover
+
+    r, lock, env = service(tmp_path, monkeypatch)
+    original = asyncio.run(r.run())
+    folder = tmp_path / "workload-test"
+    # the process "died" during its end checks: no summary, status left at 'checking', process gone
+    (folder / st.SUMMARY_FILE).unlink()
+    (folder / st.SUMMARY_TEXT_FILE).unlink()
+    st.write_status(folder, {**st.read_status(folder), "state": st.CHECKING, "pid": 2**22 + 12345})
+
+    async def target_check(e, n, a, writes=True):
+        assert writes is False                                  # the check writes nothing but temporary tables
+        return "BDB-QA-U22-30"
+
+    said = []
+    again = asyncio.run(recover.check_folder(env, env.nodes[0], folder, adapter=ShopAdapter(NODE),
+                                             target_check=target_check, say=said.append))
+    assert again["state"] == original["state"] == st.FINISHED
+    assert again["baseline_valid"] is original["baseline_valid"] is True
+    assert [(c["name"], c["status"]) for c in again["baseline_checks"]] == \
+           [(c["name"], c["status"]) for c in original["baseline_checks"]]
+    assert again["totals"] == original["totals"] and again["outages"] == original["outages"]
+    for k in ("rpo_txn", "phantom", "partial_commits", "aborted_markers_present", "tpcc_consistency_violations",
+              "indeterminate_txn", "markers"):
+        assert again["end_checks"][k] == original["end_checks"][k], k
+    assert again["recovered"]["tpcc_checks"] == "run" and "still exactly the same" in again["recovered"]["database_markers"]
+    assert again["settings"]["workload_used"]["rate_tps"] == original["settings"]["workload_used"]["rate_tps"]
+    assert "END CHECKS REDONE" in (folder / st.SUMMARY_TEXT_FILE).read_text()
+    assert st.read_status(folder)["state"] == st.FINISHED and said
+    # once it has a summary, it is not checked again
+    with pytest.raises(recover.CheckRefused, match="already has its summary"):
+        asyncio.run(recover.check_folder(env, env.nodes[0], folder, adapter=ShopAdapter(NODE),
+                                         target_check=target_check))
+
+
+def test_check_refuses_a_live_run_and_judges_tpcc_not_measured_once_the_database_changed(tmp_path, monkeypatch):
+    from resilience_tests.execution.workload.service import recover
+
+    r, lock, env = service(tmp_path, monkeypatch)
+    asyncio.run(r.run())
+    folder = tmp_path / "workload-test"
+    (folder / st.SUMMARY_FILE).unlink()
+
+    async def target_check(e, n, a, writes=True):
+        return "BDB-QA-U22-30"
+
+    st.write_status(folder, {**st.read_status(folder), "state": st.CHECKING, "pid": os.getpid()})
+    with pytest.raises(recover.CheckRefused, match="still alive"):
+        asyncio.run(recover.check_folder(env, env.nodes[0], folder, adapter=ShopAdapter(NODE), target_check=target_check))
+    st.write_status(folder, {**st.read_status(folder), "pid": 2**22 + 12345})
+    # a later run emptied and refilled the marker table: lost commits from the saved copy, TPC-C not measured
+    Shop.committed = {"11111111-1111-4111-8111-111111111111": NEW_ORDER}
+    again = asyncio.run(recover.check_folder(env, env.nodes[0], folder, adapter=ShopAdapter(NODE),
+                                             target_check=target_check))
+    e = again["end_checks"]
+    assert e["rpo_txn"] == 0 and e["phantom"] == 0                     # from markers_db.txt.gz
+    assert "has changed since" in again["recovered"]["database_markers"]
+    assert "partial_commits" not in e and "changed since the run" in e["_not_measured"]["partial_commits"]
+    assert not again["baseline_valid"]                                 # not measured is never a pass
+    statuses = {c["name"]: c["status"] for c in again["baseline_checks"]}
+    assert statuses["no half-saved transaction"] == "NOT_MEASURED"

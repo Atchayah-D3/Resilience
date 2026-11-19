@@ -70,41 +70,89 @@ class Evidence:
     torn_aborted_lines: int = 0
 
 
+@dataclass
+class EvidenceCounts:
+    """The same evidence reduced to the numbers the checks use, so a run too large to hold its
+    journals in memory (the common workload: millions of transactions) is judged by exactly the
+    same rules: the counts come from the database comparing the journals in temporary tables
+    (service/endchecks.py), or from the sets of a small run (counts_of)."""
+
+    written: int                                 # distinct markers in the marker journals
+    acked: int                                   # distinct markers in the "committed" journals
+    aborted: int                                 # distinct markers in the "rolled back" journals
+    db_read: bool                                # False: the markers in the database could not be read
+    lost: int = 0                                # acked, not in the database
+    phantom: int = 0                             # in the database, never written
+    rolled_back_but_kept: int = 0                # "rolled back" line, but in the database
+    unknown: int = 0                             # written, neither acked nor rolled back
+    unknown_committed: int = 0                   # ... and in the database
+    new_orders_with_marker: int = 0              # markers in the database whose marker line says New-Order
+    acked_order_check: Mapping[str, int] | None = None
+    lost_order_check: Mapping[str, int] | None = None
+    orders_before: int | None = None
+    orders_after: int | None = None
+    acked_payment_check: Mapping[str, int] | None = None
+    lost_payment_check: Mapping[str, int] | None = None
+    rules: dict[int, int | None] = field(default_factory=dict)
+    sample: dict[str, Any] | None = None
+    torn_aborted_lines: int = 0
+
+
+def counts_of(ev: Evidence) -> EvidenceCounts:
+    """The numbers of a run whose evidence fits in memory (sets and dicts)."""
+    base = dict(acked_order_check=ev.acked_order_check, lost_order_check=ev.lost_order_check,
+                orders_before=ev.orders_before, orders_after=ev.orders_after,
+                acked_payment_check=ev.acked_payment_check, lost_payment_check=ev.lost_payment_check,
+                rules=ev.rules, sample=ev.sample, torn_aborted_lines=ev.torn_aborted_lines)
+    if ev.db is None:
+        return EvidenceCounts(written=len(ev.written), acked=len(ev.acked), aborted=len(ev.aborted),
+                              db_read=False, **base)
+    db = ev.db
+    written, acked, aborted = set(ev.written), set(ev.acked), set(ev.aborted)
+    unknown = written - acked - aborted
+    return EvidenceCounts(
+        written=len(written), acked=len(acked), aborted=len(aborted), db_read=True,
+        lost=len(acked - db), phantom=len(db - written), rolled_back_but_kept=len(aborted & db),
+        unknown=len(unknown), unknown_committed=len(unknown & db),
+        new_orders_with_marker=sum(1 for u in db if ev.written.get(u) == NEW_ORDER), **base)
+
+
 def evaluate(ev: Evidence) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     """(measures, facts, not_measured reasons). Pure."""
+    return evaluate_counts(counts_of(ev))
+
+
+def evaluate_counts(c: EvidenceCounts) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    """(measures, facts, not_measured reasons) from the numbers. Pure. The one place the TPC-C
+    labels are decided, for a run judged in memory and for one judged in the database."""
     measures: dict[str, Any] = {}
     reasons: dict[str, str] = {}
-    facts: dict[str, Any] = {"written": len(ev.written), "acked": len(ev.acked), "aborted": len(ev.aborted)}
+    facts: dict[str, Any] = {"written": c.written, "acked": c.acked, "aborted": c.aborted}
 
-    if ev.db is None:
+    if not c.db_read:
         for m in ("aborted_markers_present", "partial_commits", "indeterminate_txn"):
             reasons[m] = "the markers in the database could not be read after recovery"
     else:
-        db = ev.db
-        written, acked, aborted = set(ev.written), set(ev.acked), set(ev.aborted)
-        unknown = written - acked - aborted
-        unknown_committed = unknown & db
-        kept = aborted & db
-        facts.update({"lost": len(acked - db), "phantom": len(db - written), "rolled_back_but_kept": len(kept),
-                      "unknown": len(unknown), "unknown_committed": len(unknown_committed)})
+        facts.update({"lost": c.lost, "phantom": c.phantom, "rolled_back_but_kept": c.rolled_back_but_kept,
+                      "unknown": c.unknown, "unknown_committed": c.unknown_committed})
         # Unknown = neither committed nor surely rolled back: exact, because the TPC-C engine
         # journals sure rollbacks (the custom workload counts those as unknown too).
-        measures["indeterminate_txn"] = len(unknown)
-        if ev.torn_aborted_lines:
-            reasons["aborted_markers_present"] = (f"{ev.torn_aborted_lines} unreadable line(s) in the rolled-back journal")
+        measures["indeterminate_txn"] = c.unknown
+        if c.torn_aborted_lines:
+            reasons["aborted_markers_present"] = (f"{c.torn_aborted_lines} unreadable line(s) in the rolled-back journal")
         else:
-            measures["aborted_markers_present"] = len(kept)
+            measures["aborted_markers_present"] = c.rolled_back_but_kept
 
-        partial, why = _partial_commits(ev, db, unknown_committed)
+        partial, why = _partial_commits(c)
         facts["partial_commit_parts"] = why
         if partial is None:
             reasons["partial_commits"] = why.get("reason", "a part of the partial-commit check could not run")
         else:
             measures["partial_commits"] = partial
 
-    rules = {r: ev.rules.get(r) for r in RULES_ALL_DATA + RULES_SAMPLED}
+    rules = {r: c.rules.get(r) for r in RULES_ALL_DATA + RULES_SAMPLED}
     facts["consistency"] = {str(r): v for r, v in rules.items()}
-    facts["consistency_sample_districts"] = ev.sample if ev.sample is not None else SAMPLE_DISTRICTS
+    facts["consistency_sample_districts"] = c.sample if c.sample is not None else SAMPLE_DISTRICTS
     if any(v is None for v in rules.values()):
         missing = sorted(r for r, v in rules.items() if v is None)
         reasons["tpcc_consistency_violations"] = f"consistency rule(s) {missing} could not be evaluated after recovery"
@@ -113,31 +161,31 @@ def evaluate(ev: Evidence) -> tuple[dict[str, Any], dict[str, Any], dict[str, st
     return measures, facts, reasons
 
 
-def _partial_commits(ev: Evidence, db: set[str], unknown_committed: set[str]) -> tuple[int | None, dict[str, Any]]:
+def _partial_commits(c: EvidenceCounts) -> tuple[int | None, dict[str, Any]]:
     parts: dict[str, Any] = {}
-    if ev.acked_order_check is None or ev.lost_order_check is None:
+    if c.acked_order_check is None or c.lost_order_check is None:
         return None, {"reason": "the per-order check could not run after recovery"}
-    if ev.orders_before is None or ev.orders_after is None:
+    if c.orders_before is None or c.orders_after is None:
         return None, {"reason": "the number of orders before or after the run could not be read"}
-    if ev.acked_payment_check is None or ev.lost_payment_check is None:
+    if c.acked_payment_check is None or c.lost_payment_check is None:
         return None, {"reason": "the per-payment check could not run after recovery"}
-    pay_missing = int(ev.acked_payment_check.get("missing", 0))
-    lost_pay_checked = int(ev.lost_payment_check.get("checked", 0))
-    lost_pay_found = lost_pay_checked - int(ev.lost_payment_check.get("missing", 0))   # history row survived
-    acked_missing = int(ev.acked_order_check.get("missing", 0))
-    acked_incomplete = int(ev.acked_order_check.get("incomplete", 0))
-    lost_checked = int(ev.lost_order_check.get("checked", 0))
-    lost_found = lost_checked - int(ev.lost_order_check.get("missing", 0))       # rows survived, marker did not
-    new_orders_with_marker = sum(1 for u in db if ev.written.get(u) == NEW_ORDER)
-    created = ev.orders_after - ev.orders_before
+    pay_missing = int(c.acked_payment_check.get("missing", 0))
+    lost_pay_checked = int(c.lost_payment_check.get("checked", 0))
+    lost_pay_found = lost_pay_checked - int(c.lost_payment_check.get("missing", 0))   # history row survived
+    acked_missing = int(c.acked_order_check.get("missing", 0))
+    acked_incomplete = int(c.acked_order_check.get("incomplete", 0))
+    lost_checked = int(c.lost_order_check.get("checked", 0))
+    lost_found = lost_checked - int(c.lost_order_check.get("missing", 0))       # rows survived, marker did not
+    new_orders_with_marker = c.new_orders_with_marker
+    created = c.orders_after - c.orders_before
     # created = (New-Orders with marker) - (their missing orders) + (lost ones whose rows survived)
     #           + (unknown ones whose rows survived without a marker) - (unknown ones with a marker but no rows)
     unexplained = created - new_orders_with_marker + acked_missing - lost_found
     parts.update({"acknowledged_order_missing": acked_missing, "acknowledged_order_incomplete": acked_incomplete,
                   "lost_but_rows_present": lost_found, "orders_created": created,
                   "new_orders_with_marker": new_orders_with_marker, "unexplained_order_count": unexplained,
-                  "unknown_committed": len(unknown_committed),
-                  "payments_checked": int(ev.acked_payment_check.get("checked", 0)),
+                  "unknown_committed": c.unknown_committed,
+                  "payments_checked": int(c.acked_payment_check.get("checked", 0)),
                   "acknowledged_payment_missing": pay_missing, "lost_payment_rows_present": lost_pay_found})
     return acked_missing + acked_incomplete + lost_found + abs(unexplained) + pay_missing + lost_pay_found, parts
 

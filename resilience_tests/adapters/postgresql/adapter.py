@@ -563,6 +563,18 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
         finally:
             await conn.close()
 
+    async def journal_check(self) -> Any:
+        """The end checks of a long run compared in the database: one connection whose temporary
+        tables take every journal line (journal_check.py). The harness then keeps only one batch
+        of lines in memory, however long the run."""
+        from resilience_tests.adapters.postgresql.journal_check import PgJournalCheck
+        conn = await self._connect(timeout_s=30.0, command_timeout=None)
+        try:
+            return await PgJournalCheck.open(conn)
+        except BaseException:
+            await conn.close()
+            raise
+
     async def sentinel(self, table: str, hostname: str) -> dict[str, Any] | None:
         conn = await self._connect()
         try:
