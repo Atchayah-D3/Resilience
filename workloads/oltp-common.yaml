@@ -41,7 +41,7 @@ baseline:
   tps_window_s: 60
   tps_share_min: 0.95                 # every 60 s window keeps 95% of the rate
   p99_window_s: 10
-  p99_limit_ms: 3000                  # median of the 1-second p99 values in every 10 s window
+  p99_limit_ms: 3000                  # p99 of all the transactions of every 10 s window
   error_share_max: 0.0001             # 0.01% of all transactions (business rollbacks excluded)
   memory_growth_max: 0.10             # harness memory from minute 10 to the end
   memory_from_s: 600

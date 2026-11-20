@@ -131,9 +131,13 @@ GOOD_END = {"rpo_txn": 0, "phantom": 0, "partial_commits": 0, "aborted_markers_p
             "tpcc_consistency_violations": 0}
 
 
+def steady_p99(starts, length):
+    return [10.0] * len(starts)
+
+
 def judge(seconds, end=GOOD_END, memory=((0, 100_000_000), (60, 105_000_000)), **kw):
     args = dict(seconds=seconds, measure_start_s=0.0, rate_tps=100, rules=RULES, memory=memory, end=end,
-                driver_limited=False, full_duration=True, ran_s=60, duration_s=60)
+                driver_limited=False, full_duration=True, ran_s=60, duration_s=60, window_p99=steady_p99)
     args.update(kw)
     checks = bl.evaluate(**args)
     return {ch["name"].split(":")[0]: ch["status"] for ch in checks}, bl.passed(checks)
@@ -150,11 +154,62 @@ def test_one_slow_minute_window_fails_the_throughput_rule():
     assert statuses["throughput"] == bl.FAIL and not ok
 
 
-def test_a_single_slow_second_passes_the_p99_window_rule_but_a_slow_stretch_fails_it():
-    spike = [sec(t, p99=900.0 if t == 12 else 10.0) for t in range(1, 61)]
-    assert judge(spike)[0]["latency"] == bl.PASS                # median of 5 seconds ignores one spike
-    stretch = [sec(t, p99=900.0 if 11 <= t <= 13 else 10.0) for t in range(1, 61)]
-    assert judge(stretch)[0]["latency"] == bl.FAIL
+def _metrics_file(tmp_path, latencies_by_second):
+    """metrics-1s.jsonl lines as the service writes them: elapsed_s and the latency histogram."""
+    from resilience_tests.execution.workload.histogram import latency_histogram
+    path = tmp_path / st.METRICS_1S_FILE
+    with path.open("w") as fh:
+        for t, lat in latencies_by_second.items():
+            fh.write(json.dumps({"elapsed_s": float(t), "interval_s": 1.0, "commits": len(lat),
+                                 "latency_hist": latency_histogram(lat)}) + "\n")
+    return path
+
+
+def _p99_from(path):
+    from resilience_tests.execution.workload.service import windows as wm
+    return lambda starts, length: wm.window_p99s(path, starts, length)
+
+
+def test_the_latency_rule_is_the_p99_of_all_the_transactions_of_each_window(tmp_path):
+    """100 transactions a second, 5 s windows (500 transactions; the p99 is the 495th fastest).
+    A 1-second stall (all 100 of that second at 900 ms) is the window's p99: it FAILS, where the
+    median of the 1-second p99 values (10, 10, 900, 10, 10 -> 10 ms) passed it. A single slow
+    transaction among 500 is within the 1% a p99 allows: it passes."""
+    seconds = [sec(t) for t in range(1, 61)]
+    steady = {t: [10.0] * 100 for t in range(1, 61)}
+    assert judge(seconds, window_p99=_p99_from(_metrics_file(tmp_path, steady)))[0]["latency"] == bl.PASS
+    stall = {t: ([900.0] * 100 if t == 12 else [10.0] * 100) for t in range(1, 61)}
+    checks = bl.evaluate(seconds=seconds, measure_start_s=0.0, rate_tps=100, rules=RULES,
+                         memory=((0, 100_000_000), (60, 105_000_000)), end=GOOD_END, driver_limited=False,
+                         full_duration=True, ran_s=60, duration_s=60,
+                         window_p99=_p99_from(_metrics_file(tmp_path, stall)))
+    lat = next(c for c in checks if c["name"].startswith("latency"))
+    assert lat["status"] == bl.FAIL and "window from 10 s" in lat["detail"] and "1 window(s) over" in lat["detail"]
+    assert lat["name"] == "latency: p99 of every 5 s window (all its transactions) at or under 100 ms"
+    one = {t: ([900.0] + [10.0] * 99 if t == 12 else [10.0] * 100) for t in range(1, 61)}
+    assert judge(seconds, window_p99=_p99_from(_metrics_file(tmp_path, one)))[0]["latency"] == bl.PASS
+
+
+def test_the_latency_rule_without_histograms_or_transactions_never_passes(tmp_path):
+    seconds = [sec(t) for t in range(1, 61)]
+    assert judge(seconds, window_p99=None)[0]["latency"] == bl.NOT_MEASURED
+    path = tmp_path / st.METRICS_1S_FILE
+    path.write_text("".join(json.dumps({"elapsed_s": float(t), "commits": 1}) + "\n" for t in range(1, 61)))
+    assert judge(seconds, window_p99=_p99_from(path))[0]["latency"] == bl.NOT_MEASURED     # no histogram
+    empty = {t: ([] if 21 <= t <= 25 else [10.0] * 100) for t in range(1, 61)}
+    assert judge(seconds, window_p99=_p99_from(_metrics_file(tmp_path, empty)))[0]["latency"] == bl.FAIL
+
+
+def test_window_p99s_reads_the_file_line_by_line_and_skips_scenario_windows(tmp_path):
+    from resilience_tests.execution.workload.service import windows as wm
+    lat = {t: [float(t)] * 10 for t in range(1, 31)}
+    path = _metrics_file(tmp_path, lat)
+    with path.open("a") as fh:
+        fh.write('{"elapsed_s": 31.0, "latency_hist"')           # a last line still being written
+    starts = bl.window_starts(30.0, 0.0, 10.0, excluded=[(12.0, 18.0)])
+    assert starts == [0.0, 20.0]                                   # the window over the scenario is left out
+    got = wm.window_p99s(path, starts, 10.0)
+    assert 10.0 <= got[0] <= 10.0 * 1.02 and 30.0 <= got[1] <= 30.0 * 1.02    # each window's slowest second
 
 
 def test_errors_unknown_outcomes_and_dropped_connections_fail():

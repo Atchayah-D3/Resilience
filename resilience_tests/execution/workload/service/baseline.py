@@ -8,8 +8,7 @@ without evidence (constitution III). The thresholds come from the settings file
 
 from __future__ import annotations
 
-import statistics
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from resilience_tests.execution.workload.service.config import BaselineRules
@@ -22,20 +21,32 @@ def _check(name: str, ok: bool | None, detail: str) -> dict[str, Any]:
     return {"name": name, "status": NOT_MEASURED if ok is None else (PASS if ok else FAIL), "detail": detail}
 
 
-def windows(seconds: Sequence[Second], start_s: float, length_s: float,
-            excluded: Sequence[tuple[float, float]] = ()) -> list[list[Second]]:
-    """Full, back-to-back windows of `length_s` from `start_s` (a last partial window is left out);
-    a window that overlaps an excluded span (a scenario's) is left out too."""
-    if not seconds:
-        return []
-    end = max(s.elapsed_s for s in seconds)
-    out: list[list[Second]] = []
+# The p99 of each window, given the windows' start times and their length: from the samples'
+# latency histograms (windows.window_p99s reads metrics-1s.jsonl); None when they carry none.
+WindowP99 = Callable[[Sequence[float], float], "Sequence[float | None] | None"]
+
+
+def window_starts(end_s: float, start_s: float, length_s: float,
+                  excluded: Sequence[tuple[float, float]] = ()) -> list[float]:
+    """Starts of the full, back-to-back windows (t, t + length_s] from `start_s` up to `end_s` (a
+    last partial window is left out); a window that overlaps an excluded span (a scenario's) is
+    left out too."""
+    out: list[float] = []
     t = start_s
-    while t + length_s <= end + 1e-6:
+    while t + length_s <= end_s + 1e-6:
         if not any(a < t + length_s and t < b for a, b in excluded):
-            out.append([s for s in seconds if t < s.elapsed_s <= t + length_s])
+            out.append(t)
         t += length_s
     return out
+
+
+def windows(seconds: Sequence[Second], start_s: float, length_s: float,
+            excluded: Sequence[tuple[float, float]] = ()) -> list[list[Second]]:
+    """The seconds of each window of window_starts()."""
+    if not seconds:
+        return []
+    starts = window_starts(max(s.elapsed_s for s in seconds), start_s, length_s, excluded)
+    return [[s for s in seconds if t < s.elapsed_s <= t + length_s] for t in starts]
 
 
 def throughput_check(seconds: Sequence[Second], start_s: float, rate_tps: float | None,
@@ -61,23 +72,27 @@ def throughput_check(seconds: Sequence[Second], start_s: float, rate_tps: float 
 
 
 def latency_check(seconds: Sequence[Second], start_s: float, rules: BaselineRules,
-                  excluded: Sequence[tuple[float, float]] = ()) -> dict[str, Any]:
-    name = (f"latency: median of the 1-second p99 values in every {rules.p99_window_s} s window at or under "
+                  excluded: Sequence[tuple[float, float]] = (), window_p99: WindowP99 | None = None) -> dict[str, Any]:
+    """The p99 of ALL the transactions of each window (their latency histograms summed: the upper
+    bound of a 2% bucket, never below the exact value), at or under the limit. A stall of a second
+    or two inside a window shows in its p99; a median of 1-second p99 values would hide it."""
+    name = (f"latency: p99 of every {rules.p99_window_s} s window (all its transactions) at or under "
             f"{rules.p99_limit_ms:g} ms")
-    ws = windows(seconds, start_s, rules.p99_window_s, excluded)
-    if not ws:
+    starts = window_starts(max(s.elapsed_s for s in seconds), start_s, rules.p99_window_s, excluded) if seconds else []
+    if not starts:
         return _check(name, None, f"no full {rules.p99_window_s} s window was measured")
-    medians = []
-    for i, w in enumerate(ws):
-        vals = [s.p99_ms for s in w if s.p99_ms is not None]
-        medians.append((statistics.median(vals) if vals else None, i))
-    empty = [i for v, i in medians if v is None]
-    over = [(v, i) for v, i in medians if v is not None and v > rules.p99_limit_ms]
-    known = [(v, i) for v, i in medians if v is not None]
-    detail = f"{len(ws)} windows"
+    values = window_p99(starts, float(rules.p99_window_s)) if window_p99 is not None else None
+    if values is None:
+        return _check(name, None, "the samples carry no latency histograms, so no window's p99 can be computed")
+    if len(values) != len(starts):
+        return _check(name, None, f"{len(values)} window p99 values for {len(starts)} windows")
+    empty = [i for i, v in enumerate(values) if v is None]
+    over = [(v, i) for i, v in enumerate(values) if v is not None and v > rules.p99_limit_ms]
+    known = [(v, i) for i, v in enumerate(values) if v is not None]
+    detail = f"{len(starts)} windows"
     if known:
         worst, at = max(known)
-        detail += f"; highest median {worst:.1f} ms (window from {start_s + at * rules.p99_window_s:.0f} s)"
+        detail += f"; highest p99 {worst:.1f} ms (window from {starts[at]:.0f} s)"
     if over:
         detail += f"; {len(over)} window(s) over the limit"
     if empty:
@@ -147,9 +162,11 @@ def end_checks(end: Mapping[str, Any], tpcc: bool = True) -> list[dict[str, Any]
 def evaluate(*, seconds: Sequence[Second], measure_start_s: float, rate_tps: float | None, rules: BaselineRules,
              memory: Sequence[tuple[float, int]], end: Mapping[str, Any], driver_limited: bool,
              full_duration: bool, ran_s: float, duration_s: float | None, tpcc: bool = True,
-             excluded: Sequence[tuple[float, float]] = ()) -> list[dict[str, Any]]:
+             excluded: Sequence[tuple[float, float]] = (), window_p99: WindowP99 | None = None) -> list[dict[str, Any]]:
     """`excluded`: the scenarios' spans (seconds since the clerks started): not judged as the
-    workload's baseline (a scenario's fault breaks these rules by design)."""
+    workload's baseline (a scenario's fault breaks these rules by design). `window_p99`: the p99
+    of each latency window from the samples' histograms (without it the latency rule is NOT
+    MEASURED)."""
     measured = [s for s in seconds if s.elapsed_s > measure_start_s
                 and not any(a < s.elapsed_s <= b for a, b in excluded)]
     duration = (_check("ran the full duration", full_duration, f"{ran_s:.0f} s of {duration_s:.0f} s")
@@ -158,7 +175,7 @@ def evaluate(*, seconds: Sequence[Second], measure_start_s: float, rate_tps: flo
     return [
         duration,
         throughput_check(measured, measure_start_s, rate_tps, rules, excluded),
-        latency_check(measured, measure_start_s, rules, excluded),
+        latency_check(measured, measure_start_s, rules, excluded, window_p99),
         error_check(measured, rules),
         connection_check(measured),
         _check("the harness was not the limit", not driver_limited,

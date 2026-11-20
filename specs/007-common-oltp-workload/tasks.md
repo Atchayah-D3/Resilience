@@ -24,6 +24,7 @@
 - [X] T025 `client.mark` refused unless the workload is warming up or running; `client.window` raises `NoSamples` for a window without a sample (VM run 2026-11-18)
 - [X] T026 End checks for runs of any length: every journal line sent to temporary tables in batches, compared in the database; the same numbers as the in-memory checks on clean and damaged runs (`service/endchecks.py`, `adapters/postgresql/journal_check.py`, shared queries `tpcc.ORDER_CHECK_SQL`/`PAYMENT_CHECK_SQL`, `checks.evaluate_counts`; `tests/test_endchecks_db.py`). Cause: the 1-hour run of 19 Nov 2026 at 2,500 TPS was killed out of memory (7 GB) in its end checks
 - [X] T027 `check` command: the end checks and baseline rules of a run whose process died, from its files (`service/recover.py`); memory readings and the start's disclosures now saved (events.jsonl, service.json) so a later check is complete
+- [X] T028 Baseline latency rule: the p99 of all the transactions of each 10 s window (histograms summed, read from metrics-1s.jsonl line by line) instead of the median of the 1-second p99 values, which hid a 2 s stall on the 20 Nov 2026 run (320 ms reported, 2,095 ms true) (`service/baseline.py`, `windows.window_p99s`)
 - [ ] T012 Lab: capacity record for 64 clerks on all warehouses (`tpcc/capacity.py --clerks 64`), then a 15-minute service run
 - [ ] T013 Lab: fault survival during a 30-minute run (database restart, kill -9, 5 minutes down)
 - [ ] T014 Lab: 3 x 2-hour baselines; the lead signs off the thresholds and the rate

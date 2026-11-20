@@ -28,8 +28,8 @@ class BaselineRules(_Model):
     # throughput: every full window of this length keeps at least this share of the rate
     tps_window_s: int = Field(default=60, gt=0)
     tps_share_min: float = Field(default=0.95, gt=0, le=1)
-    # latency: the median of the 1-second p99 values over each window of this length stays at or
-    # under the limit (the window rule discussed for scenario 1: single seconds spike at checkpoints)
+    # latency: the p99 of all the transactions of each window of this length stays at or
+    # under the limit (histograms summed: a stall of a second or two inside a window shows)
     p99_window_s: int = Field(default=10, gt=0)
     p99_limit_ms: float = Field(default=3000.0, gt=0)
     # errors (server rollbacks other than TPC-C's business rollbacks, and unknown outcomes) as a

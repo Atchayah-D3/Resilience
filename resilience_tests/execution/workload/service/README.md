@@ -81,7 +81,7 @@ lets scenarios attach to the running workload instead.
 ## Baseline rules (settings file, NEEDS SIGN-OFF)
 
 Measured part only (after the warm-up). Valid only if every rule passes and the run finished its duration:
-every 60 s window at least 95% of the rate; the median of the 1-second p99 values in every 10 s
-window at or under the limit; errors (server rollbacks except business rollbacks, unknown outcomes)
+every 60 s window at least 95% of the rate; the p99 of all the transactions of every 10 s window
+(their latency histograms summed, read from metrics-1s.jsonl) at or under the limit; errors (server rollbacks except business rollbacks, unknown outcomes)
 at most 0.01%; no dropped connection; the harness was not the limit; harness memory grows at most
 10% from minute 10; no lost commit, no phantom; TPC-C checks clean. Missing evidence fails.

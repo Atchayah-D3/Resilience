@@ -333,7 +333,9 @@ class ServiceRunner:
             part = "measured" if self.measure_start_s is not None and elapsed > self.measure_start_s else "warmup"
             self._m1.write(json.dumps({"t_wall": round(event.t_wall, 3), "elapsed_s": round(elapsed, 3),
                                        "part": part, **d}, separators=(",", ":"), default=str) + "\n")
-            second = Second.from_sample(d, elapsed, event.t_wall)
+            # elapsed as written to metrics-1s.jsonl, so the latency windows (read from that file)
+            # and the other rules put every second in the same window
+            second = Second.from_sample(d, round(elapsed, 3), event.t_wall)
             self.seconds.append(second)
             self.interval.add(d)
             for kind, n in (d.get("error_kinds") or {}).items():
@@ -468,7 +470,8 @@ class ServiceRunner:
             seconds=judged, measure_start_s=measure_start, rate_tps=self.profile_workload.rate_tps,
             rules=self.cfg.baseline, memory=self.memory, end=end, driver_limited=self.driver_limited,
             full_duration=full, ran_s=ran_s, duration_s=self.cfg.duration_s,
-            tpcc=self.cfg.workload.profile == "tpcc", excluded=excluded)
+            tpcc=self.cfg.workload.profile == "tpcc", excluded=excluded,
+            window_p99=lambda starts, length: windows_mod.window_p99s(self.folder / st.METRICS_1S_FILE, starts, length))
         valid = baseline_mod.passed(checks) and full
         measured = [s for s in self.seconds if s.elapsed_s > measure_start]
         workload_used = self.profile_workload.model_dump(mode="json")

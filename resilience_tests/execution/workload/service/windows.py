@@ -81,6 +81,42 @@ MEASURED_WINDOW_FIELDS = ("duration_s", "commits", "tps", "p99_ms", "journal_p99
                           "drops", "reconnects", "connect_failures", "p50_ms", "p95_ms", "p99_corrected_ms", "missed")
 
 
+def window_p99s(path: Path, starts: Sequence[float], length_s: float, q: float = 0.99) -> list[float | None] | None:
+    """The percentile `q` of every window (t, t + length_s] for t in `starts` (seconds since the
+    clerks started, as the samples' `elapsed_s`), from the latency histograms of the samples that
+    ended inside it, summed. metrics-1s.jsonl is read one line at a time and only the windows still
+    open are kept, so the memory does not grow with the run. None for a window without a single
+    transaction; None for the whole result when a sample inside a window carries no histogram."""
+    import bisect
+    import json
+
+    starts = list(starts)
+    if not starts:
+        return []
+    out: list[float | None] = [None] * len(starts)
+    open_: dict[int, dict[str, int]] = {}
+
+    def close(i: int) -> None:
+        out[i] = hist_percentile(open_.pop(i, {}), q)
+
+    with path.open("rb") as fh:
+        for raw in fh:
+            if not raw.endswith(b"\n"):
+                break                                  # a last line still being written
+            line = json.loads(raw)
+            e = float(line["elapsed_s"])
+            i = bisect.bisect_left(starts, e) - 1      # the last start before e
+            if i >= 0 and starts[i] < e <= starts[i] + length_s + 1e-9:
+                if "latency_hist" not in line:
+                    return None
+                open_[i] = merge_histograms([open_.get(i, {}), line["latency_hist"]])
+            for j in [j for j in open_ if starts[j] + length_s < e - 5.0]:
+                close(j)                               # samples arrive in time order: this one is complete
+    for j in list(open_):
+        close(j)
+    return out
+
+
 def window_from_file(folder: Path, from_wall: float, to_wall: float) -> dict[str, Any]:
     """window() over the running workload's metrics-1s.jsonl (whole lines only)."""
     return window(st.read_complete_lines(folder / st.METRICS_1S_FILE), from_wall, to_wall)
