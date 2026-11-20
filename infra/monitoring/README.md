@@ -63,5 +63,73 @@ discloses what was not recorded.
    own number before trusting it).
 
 Adding a target later: add it to an env profile, run step 1 on it, re-run step 3.
+
+### A target whose sudo runs no shell (e2-u22-3, 10.11.21.14)
+
+`setup-target-exporter.sh` needs `sudo bash`. On an account whose sudo forbids shells and
+`useradd` (env profile `sudo_shell: false`), the same result comes from one program per sudo, run
+on the target as the SSH user (done for 10.11.21.14 on 20 Nov 2026). The exporter runs as
+`nobody` and connects through the local socket, so no password is created or stored -- this needs
+`local all all trust` in pg_hba.conf, as that target's env profile discloses; elsewhere use the
+script and its password.
+
+```bash
+# 1. the exporter binary (downloaded as the SSH user; only `install` runs with sudo)
+V=0.20.1; mkdir -p ~/pe && cd ~/pe
+curl -fsSL -o pe.tar.gz "https://github.com/prometheus-community/postgres_exporter/releases/download/v$V/postgres_exporter-$V.linux-amd64.tar.gz"
+tar xzf pe.tar.gz --strip-components=1
+sudo install -m 755 ~/pe/postgres_exporter /usr/local/bin/postgres_exporter && rm -rf ~/pe
+
+# 2. the read-only login (pg_monitor) and its settings -- SQL in a file psql reads as postgres
+cat > /tmp/resilience-monitor.sql <<'SQL'
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'resilience_monitor') THEN
+    CREATE ROLE resilience_monitor LOGIN IN ROLE pg_monitor;
+  END IF;
+END $$;
+ALTER ROLE resilience_monitor SET lock_timeout = '200ms';      -- never queue behind a lock
+ALTER ROLE resilience_monitor SET statement_timeout = '800ms';
+ALTER ROLE resilience_monitor SET log_min_messages = 'fatal';  -- keep its skipped queries out of the log
+SQL
+chmod 644 /tmp/resilience-monitor.sql
+cd /tmp && sudo -u postgres -- /usr/pgsql-17.11.1.0/bin/psql -X -p 5434 -d resilience -v ON_ERROR_STOP=1 -f /tmp/resilience-monitor.sql
+rm -f /tmp/resilience-monitor.sql
+
+# 3. how it connects: the local socket (unix_socket_directories = /tmp), no secret
+printf '%s\n' 'DATA_SOURCE_NAME=postgresql:///resilience?host=/tmp&port=5434&user=resilience_monitor&sslmode=disable' \
+  | sudo tee /etc/default/postgres_exporter > /dev/null
+
+# 4. the service, as user nobody
+cat <<'UNIT' | sudo tee /etc/systemd/system/postgres_exporter.service > /dev/null
+[Unit]
+Description=Prometheus PostgreSQL exporter for the resilience harness (port 5434)
+After=network-online.target
+[Service]
+User=nobody
+EnvironmentFile=/etc/default/postgres_exporter
+ExecStart=/usr/local/bin/postgres_exporter --web.listen-address=:9187 --collector.stat_checkpointer --collector.long_running_transactions --collector.postmaster
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload && sudo systemctl enable postgres_exporter && sudo systemctl restart postgres_exporter
+curl -s localhost:9187/metrics | grep '^pg_up '       # expect: pg_up 1
+```
+
+Then on the harness host: add the `observability:` section to the env profile, and regenerate
+Prometheus's targets for every lab it watches, without restarting anything:
+
+```bash
+cd ~/resilience-attach
+cp ~/monitoring/prometheus.yml ~/monitoring/prometheus.yml.bak
+.venv/bin/python -m resilience_tests.observability.scrape_config --env e2-dedicated-vm-u22-2 --env e2-u22-3 \
+    --out ~/monitoring/prometheus.yml
+~/monitoring/prometheus/promtool check config ~/monitoring/prometheus.yml
+curl -X POST localhost:9090/-/reload
+curl -s localhost:9090/api/v1/targets | grep -o '"scrapeUrl":"[^"]*","globalUrl":"[^"]*","lastError":"[^"]*","lastScrape":"[^"]*","lastScrapeDuration":[^,]*,"health":"[a-z]*"' | grep -o 'scrapeUrl":"[^"]*\|health":"[a-z]*'
+```
+
+On 10.11.21.14 the "I/O pressure" graph stays empty: its kernel has no /proc/pressure (PSI is
+off unless the machine is booted with `psi=1`).
 Changing the dashboard: edit `metrics.py` / `dashboard.py`, then
 `python -m resilience_tests.observability.dashboard --out infra/monitoring/grafana/dashboards/resilience-run.json`.

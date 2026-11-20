@@ -59,6 +59,12 @@ nodes:
     # statement_timeout 2min) and read access to resilience_tpcc; password in ~/.pgpass
     analytics: {host: 10.11.21.14, port: 5434, dbname: resilience, user: analytics_role}
 
+observability:                   # L4 (Arch §9): context only, never pass/fail -- infra/monitoring/README.md
+  prometheus_url: http://localhost:9090
+  grafana_url: http://10.11.21.13:3000             # the report links here: reachable from a browser
+  grafana_token_file: ~/.config/resilience/grafana-token
+  exporters: {node: 9100, postgres: 9187}          # postgres_exporter installed on 20 Nov 2026 (infra/monitoring/README.md)
+
 safety:                          # Arch §15: default deny, plus an operator-created sentinel
   allowlist:
     hostname_pattern: '^BDB-QA-U22-3$'

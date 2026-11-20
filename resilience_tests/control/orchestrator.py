@@ -575,8 +575,10 @@ class TestOrchestrator:
             raise PhaseAbort(f"cannot attach to the common workload in {folder}: " + "; ".join(problems))
         self.attached = attached
         # before anything is changed (server settings restart the database): from here on, the
-        # workload's own baseline does not count what this scenario does to it
+        # workload's own baseline does not count what this scenario does to it, and the run copies
+        # the workload's events from this moment
         attached.mark("run_start", run_id=self.run_id, scenario=self.scenario.id)
+        attached.copy_from_now()
 
     async def _init_attached(self) -> None:
         """init's workload part when attached: nothing is reset, loaded or started -- the running

@@ -132,6 +132,7 @@ class AttachedWorkload:
         self._offset = 0
         self._window_from: float | None = None
         self._task: asyncio.Task[None] | None = None
+        self._copy_from: int | None = None        # events.jsonl offset of the moment of attach
 
     # --- what it runs ------------------------------------------------------------------------
 
@@ -263,9 +264,14 @@ class AttachedWorkload:
 
     # --- WorkloadDriverContract ----------------------------------------------------------------
 
+    def copy_from_now(self) -> None:
+        """Remember where the workload's events stand at attach: start() copies from here, so what
+        the scenario's init does to the workload (a restart for server settings) is in the run too."""
+        self._copy_from = self._complete_size(self.folder / st.EVENTS_FILE)
+
     async def start(self) -> None:
-        """Copy the workload's events into the run from now on (the workload itself already runs)."""
-        self._offset = self._complete_size(self.folder / st.EVENTS_FILE)
+        """Copy the workload's events into the run from the moment of attach (or from now)."""
+        self._offset = self._copy_from if self._copy_from is not None else self._complete_size(self.folder / st.EVENTS_FILE)
         self._task = asyncio.create_task(self._follow(), name="attached-workload")
 
     async def wait_until_ready(self, poll_s: float = 0.1) -> None:

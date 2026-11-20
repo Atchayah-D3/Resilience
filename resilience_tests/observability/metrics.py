@@ -40,6 +40,10 @@ SNAPSHOT_QUERIES: tuple[tuple[str, str], ...] = (
      '1000 * rate(node_disk_write_time_seconds_total{{{sel},device!~"sr[0-9]+"}}[{rate}]) '
      '/ (rate(node_disk_writes_completed_total{{{sel},device!~"sr[0-9]+"}}[{rate}]) > 0)'),
     ("disk_busy_pct", '100 * rate(node_disk_io_time_seconds_total{{{sel},device!~"sr[0-9]+"}}[{rate}])'),
+    # Average I/O requests waiting or in service on each disk (iostat's aqu-sz). Every kernel
+    # exports it, unlike io_pressure: the kernel's pressure stall information is off on RHEL 9
+    # kernels unless booted with psi=1 (e2-u22-3, 10.11.21.14), and that graph is then empty.
+    ("disk_queue_depth", 'rate(node_disk_io_time_weighted_seconds_total{{{sel},device!~"sr[0-9]+"}}[{rate}])'),
     ("network_receive_bytes_per_s",
      'sum by (device) (rate(node_network_receive_bytes_total{{{sel},device!="lo"}}[{rate}]))'),
     ("network_transmit_bytes_per_s",

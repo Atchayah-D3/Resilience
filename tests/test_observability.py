@@ -325,3 +325,14 @@ def test_the_watcher_prints_a_moment_when_it_happened_not_when_it_was_announced(
          "data": {"t1_mono_ns": 94 * 10**9}}
     assert happened_at(e) == pytest.approx(4_994.0)
     assert happened_at({**e, "data": {}}) == 5_000.0
+
+
+def test_the_watcher_follows_scenario_runs_not_the_common_workloads_folder(tmp_path):
+    from resilience_tests.observability import watch
+    workload = tmp_path / "workload-attach-check-1"
+    scenario = tmp_path / "NL-N-I03a-run1"
+    for d in (scenario, workload):                      # the workload's folder is written to last
+        d.mkdir()
+        (d / "events.jsonl").write_text("{}\n")
+    (workload / "service.log").write_text("")             # all it has at its start (no service.json yet)
+    assert watch.newest(tmp_path) == scenario

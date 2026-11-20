@@ -2,7 +2,8 @@
 scenario and never touches the target. Read only; it changes nothing and judges nothing.
 
     python -m resilience_tests.observability.watch            # the newest run (start it before or after the run)
-    python -m resilience_tests.observability.watch --next     # wait for the next run to start, then follow it
+    python -m resilience_tests.observability.watch --next     # wait for the next scenario run to start, then follow it
+    python -m resilience_tests.observability.watch --keep     # follow every scenario run of a suite, one after another
     python -m resilience_tests.observability.watch --run-dir ~/resilience-runs/<run id>   # one run (also replays a finished one)
 
 Prints each phase starting and ending, the workload every few seconds (TPS, p99, errors), the
@@ -125,6 +126,11 @@ class Narrator:
             out.append(f"{at}  ***** T1  RECOVERY MEASURED FROM HERE  {d.get('action') or ''}")
         elif kind in ("cycle_recovered", "cycle_not_recovered", "cleanup_incomplete"):
             out.append(f"{at}  {kind.upper().replace('_', ' ')}  {json.dumps(d)[:140]}")
+        elif src == "service" and kind == "outage_start":
+            out.append(f"{at}  !! the common workload sees no commit (outage started)")
+        elif src == "service" and kind == "outage_end":
+            out.append(f"{at}  the common workload commits again after {d.get('seconds', 0):.0f} s "
+                       f"(dropped {d.get('drops', 0)}, failed connection attempts {d.get('connect_failures', 0)})")
         elif kind == "run_end":
             out.append(f"{at}  ===== RUN END")
         return out
@@ -193,34 +199,93 @@ def follow(run_dir: Path, every_s: float, out=sys.stdout) -> None:
                 return
 
 
+# The common workload's own run folder (specs/007) also has an events.jsonl; it is not a scenario
+# run, and a scenario attached to it copies its samples anyway. Told apart by the files the
+# workload writes from its first second (service.log at once; status.json, service.json later):
+# service.json alone is written only once its clerks run, after the data step.
+WORKLOAD_RUN_MARKERS = ("service.log", "status.json", "service.json")
+
+
+def is_workload_run(p: Path) -> bool:
+    return p.name.startswith("workload-") or any((p / m).exists() for m in WORKLOAD_RUN_MARKERS)
+
+
+def scenario_runs(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return [p for p in root.iterdir() if p.is_dir() and (p / EVENTS).exists() and not is_workload_run(p)]
+
+
+def workload_progress(root: Path) -> str | None:
+    """While no scenario runs yet: what the newest common workload is doing (its status.json)."""
+    folders = [p for p in root.iterdir() if p.is_dir() and is_workload_run(p)] if root.exists() else []
+    if not folders:
+        return None
+    folder = max(folders, key=lambda p: p.stat().st_ctime)
+    try:
+        s = json.loads((folder / "status.json").read_text())
+    except (OSError, ValueError):
+        return f"common workload {folder.name}: starting"
+    if s.get("state") in ("stopped", "finished", "failed"):
+        return None
+    last = s.get("last_interval") or {}
+    figures = (f", {last['tps']:.1f} TPS, p99 {last.get('p99_ms') or 0:.0f} ms"
+               if isinstance(last.get("tps"), (int, float)) else "")
+    return f"common workload {folder.name}: {s.get('state')} ({s.get('step')}){figures}"
+
+
+def in_progress(run_dir: Path) -> bool:
+    """A scenario run that has not ended yet (no results.json)."""
+    return not (run_dir / "results.json").exists()
+
+
 def newest(root: Path) -> Path | None:
-    runs = [p for p in root.iterdir() if p.is_dir() and (p / EVENTS).exists()] if root.exists() else []
-    return max(runs, key=lambda p: (p / EVENTS).stat().st_mtime) if runs else None
+    """The scenario run most recently started (its folder's creation, not its last write: a
+    finished run's report can be rewritten later)."""
+    runs = scenario_runs(root)
+    return max(runs, key=lambda p: p.stat().st_ctime) if runs else None
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-dir", type=Path, help="this run's folder (also replays a finished run)")
     ap.add_argument("--runs-root", type=Path, default=DEFAULT_ROOT, help="where runs are written (default ~/resilience-runs)")
-    ap.add_argument("--next", action="store_true", help="wait for the next run to start, then follow it")
+    ap.add_argument("--next", action="store_true", help="wait for the next scenario run to start, then follow it")
+    ap.add_argument("--keep", action="store_true",
+                    help="after a run ends, wait for the next one and follow it too (every scenario of a suite); Ctrl-C ends")
     ap.add_argument("--every", type=float, default=10.0, help="seconds per workload summary line (default 10)")
     args = ap.parse_args(argv)
     if args.run_dir:
-        run_dir = args.run_dir.expanduser()
-    else:
-        root = args.runs_root.expanduser()
-        before = newest(root) if args.next else None
-        print("waiting for the next run to start ..." if args.next else "", end="\n" if args.next else "", flush=True)
-        while True:
-            run_dir = newest(root)
-            if run_dir is not None and (not args.next or run_dir != before):
-                break
-            time.sleep(1)
+        try:
+            follow(args.run_dir.expanduser(), args.every)
+        except KeyboardInterrupt:
+            return 130
+        return 0
+    root = args.runs_root.expanduser()
+    before = newest(root) if (args.next or args.keep) else None
+    if args.keep and before is not None and in_progress(before):
+        before = None                          # started while a scenario runs: follow that one first
     try:
-        follow(run_dir, args.every)
+        while True:
+            if args.next or args.keep or before is not None:
+                print("waiting for the next scenario run to start ...", flush=True)
+            said, last_said = None, 0.0
+            while True:
+                run_dir = newest(root)
+                if run_dir is not None and (not (args.next or args.keep or before) or run_dir != before):
+                    break
+                progress = workload_progress(root)        # while the scenario waits for the workload
+                if progress and (progress.split(",")[0] != said or time.time() - last_said >= 30):
+                    print(f"{_clock(time.time())}  {progress}", flush=True)
+                    said, last_said = progress.split(",")[0], time.time()
+                time.sleep(1)
+            follow(run_dir, args.every)
+            if not args.keep:
+                return 0
+            before = run_dir
+            print("", flush=True)
     except KeyboardInterrupt:
         return 130
-    return 0
 
 
 if __name__ == "__main__":

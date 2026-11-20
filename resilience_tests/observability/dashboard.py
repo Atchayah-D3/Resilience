@@ -50,7 +50,8 @@ ROWS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
     ("Disk and network", (
         ("disk_write_latency_ms", "Disk write latency (per write)", "ms"),
         ("disk_busy_pct", "Disk busy %", "percent"),
-        ("io_pressure", "I/O pressure (share of time stalled)", "percentunit"),
+        ("disk_queue_depth", "Disk queue (I/O requests waiting or in service, average)", "short"),
+        ("io_pressure", "I/O pressure (share of time stalled; empty where the kernel has no PSI)", "percentunit"),
         ("network_receive_bytes_per_s", "Network receive", "Bps"),
         ("network_transmit_bytes_per_s", "Network transmit", "Bps"),
     )),

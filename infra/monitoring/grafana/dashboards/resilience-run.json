@@ -1076,7 +1076,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -1102,12 +1102,53 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "expr": "rate(node_disk_io_time_weighted_seconds_total{env=\"$env\",node=\"$node\",device!~\"sr[0-9]+\"}[15s])",
+          "legendFormat": "__auto",
+          "refId": "A"
+        }
+      ],
+      "title": "Disk queue (I/O requests waiting or in service, average)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 76
+      },
+      "id": 24,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "expr": "rate(node_pressure_io_stalled_seconds_total{env=\"$env\",node=\"$node\"}[15s])",
           "legendFormat": "__auto",
           "refId": "A"
         }
       ],
-      "title": "I/O pressure (share of time stalled)",
+      "title": "I/O pressure (share of time stalled; empty where the kernel has no PSI)",
       "type": "timeseries"
     },
     {
@@ -1124,10 +1165,10 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 76
+        "x": 0,
+        "y": 84
       },
-      "id": 24,
+      "id": 25,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1165,10 +1206,10 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 84
       },
-      "id": 25,
+      "id": 26,
       "options": {
         "legend": {
           "displayMode": "list",
