@@ -594,8 +594,15 @@ class TestOrchestrator:
             f"Attached to the running common workload {d['id']} ({d['folder']}): profile {d['profile']}, "
             f"{d['clerks']} clerks, {d['rate_tps']} TPS"
             + (f", {d['warehouses']} warehouses" if d.get("warehouses") else "")
+            + (f" (the clerks use warehouses 1-{d['active_warehouses']}; "
+               f"{d['extra_warehouses'][0]}-{d['extra_warehouses'][1]} only the fault reads)"
+               if d.get("extra_warehouses") else "")
             + "; this run neither started, warmed up nor stopped it, and its own workload section's sizes and "
               "rate were not used.")
+        # the TPC-C layout the running workload's clerks use, for the fault (e.g. NL-N-I01's index
+        # reports read the extra warehouses): what a run's own workload hands over at prepare
+        if attached.tpcc_layout is not None:
+            self.adapter.set_tpcc_layout(attached.tpcc_layout)
         if d.get("session"):
             self.disclosures.append("The common workload's connections set their own session settings: "
                                     + ", ".join(f"{k}={v}" for k, v in sorted(d["session"].items())))

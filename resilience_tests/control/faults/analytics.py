@@ -224,6 +224,12 @@ class AnalyticsLoadFault(HeldFault):
         await self._snapshot("hold_end")
 
     def planned_rate(self) -> float | None:
+        """The rate the customers were planned to run: the running common workload's when attached
+        (this run neither sized nor started it), else what the run's own workload resolved at
+        prepare (rate_fraction_of_capacity), else the scenario's rate_tps."""
+        attached = self.ctx.attached_rate_tps
+        if attached:
+            return float(attached)
         prepared = (self.ctx.facts.get("workload_prepare") or {}).get("tpcc_data") or {}
         rate = (prepared.get("rate") or {}).get("rate_tps")
         return float(rate) if rate else self.ctx.scenario.workload.rate_tps
@@ -240,7 +246,11 @@ class AnalyticsLoadFault(HeldFault):
                              f"{BASELINE_HIT_RATIO_MIN}: their data is not in the memory cache, so a loss caused by "
                              "the reports could not be seen (fewer active warehouses or a larger cache are needed)")
         rate, baseline = self.planned_rate(), ctx.baseline
-        if rate and baseline is not None and baseline.tps < RATE_KEPT_FRACTION * rate:
+        if not rate:
+            # never skipped: a baseline that missed the plan could not be told from one that kept it
+            raise PhaseAbort("invalid run: the customers' planned rate is not known, so the baseline cannot be "
+                             "checked against it")
+        if baseline is not None and baseline.tps < RATE_KEPT_FRACTION * rate:
             raise PhaseAbort(f"invalid run: the baseline delivered {baseline.tps:.1f} TPS, below "
                              f"{RATE_KEPT_FRACTION:.0%} of the planned {rate:g} TPS")
         helpers = self.helpers_per_report()

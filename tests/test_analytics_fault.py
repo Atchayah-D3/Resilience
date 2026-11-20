@@ -70,7 +70,8 @@ def ctx(tmp_path, **extra: Any) -> Any:
     fault = SimpleNamespace(analytics_load=AnalyticsLoad(), duration=300.0, type="analytics_load")
     scenario = SimpleNamespace(fault=fault, workload=SimpleNamespace(rate_tps=900.0), repeat=None)
     base = dict(scenario=scenario, facts={}, not_measured={}, disclosures=[], run_dir=tmp_path,
-                baseline=SimpleNamespace(tps=900.0), adapter=None, phase_timeout_s=lambda phase: 120.0)
+                baseline=SimpleNamespace(tps=900.0), adapter=None, phase_timeout_s=lambda phase: 120.0,
+                attached_rate_tps=None)
     return SimpleNamespace(**{**base, **extra})
 
 
@@ -105,6 +106,27 @@ def test_a_baseline_below_the_planned_rate_is_invalid(tmp_path):
     f._cache = {"baseline_start": {"customers": {"hit": 0, "read": 0}},
                 "baseline_end": {"customers": {"hit": 995, "read": 5}}}
     with pytest.raises(PhaseAbort, match="below 95% of the planned 900 TPS"):
+        asyncio.run(f.before_inject())
+
+
+def test_attached_the_planned_rate_is_the_running_workloads_and_a_baseline_below_it_is_invalid(tmp_path):
+    # attached to the common workload: the scenario's own rate (here 900) and prepare's are not used
+    f = fault(tmp_path, baseline=SimpleNamespace(tps=1300.0), attached_rate_tps=1400.0)
+    assert f.planned_rate() == 1400.0
+    f._cache = {"baseline_start": {"customers": {"hit": 0, "read": 0}},
+                "baseline_end": {"customers": {"hit": 995, "read": 5}}}
+    with pytest.raises(PhaseAbort, match="1300.0 TPS, below 95% of the planned 1400 TPS"):
+        asyncio.run(f.before_inject())
+
+
+def test_an_unknown_planned_rate_is_invalid_never_skipped(tmp_path):
+    # rate_fraction_of_capacity with no rate recorded at prepare and no running workload: nothing to check against
+    f = fault(tmp_path, scenario=SimpleNamespace(fault=SimpleNamespace(analytics_load=AnalyticsLoad(), duration=300.0,
+                                                                       type="analytics_load"),
+                                                 workload=SimpleNamespace(rate_tps=None), repeat=None))
+    f._cache = {"baseline_start": {"customers": {"hit": 0, "read": 0}},
+                "baseline_end": {"customers": {"hit": 995, "read": 5}}}
+    with pytest.raises(PhaseAbort, match="planned rate is not known"):
         asyncio.run(f.before_inject())
 
 

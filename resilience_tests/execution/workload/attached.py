@@ -48,6 +48,7 @@ from resilience_tests.execution.workload.markers import (
 from resilience_tests.execution.workload.service import client
 from resilience_tests.execution.workload.service import endchecks
 from resilience_tests.execution.workload.service import state as st
+from resilience_tests.execution.workload.tpcc.sizing import Layout
 from resilience_tests.execution.workload.service import windows as win
 from resilience_tests.observability.event_stream import Event, EventStream
 
@@ -147,22 +148,43 @@ class AttachedWorkload:
         return float(rate) if rate else None
 
     @property
+    def tpcc_layout(self) -> dict[str, Any] | None:
+        """The TPC-C layout the clerks run (tpcc/sizing.Layout.as_dict): warehouses loaded, the
+        warehouses they use (1 .. active_warehouses; None: every one) and the extra warehouses they
+        never touch. From the settings the service runs (sizes as numbers), with the memory cache
+        it was calculated from when the service recorded it. None when the workload is not TPC-C."""
+        used = self.used
+        tpcc = used.get("tpcc") or {}
+        if used.get("profile") != "tpcc" or not tpcc.get("warehouses"):
+            return None
+        active = tpcc.get("active_warehouses")
+        recorded = ((self.info.get("start_facts") or {}).get("data_step") or {}).get("tpcc_layout") or {}
+        return Layout(warehouses=int(tpcc["warehouses"]), active_warehouses=int(active) if active else None,
+                      cache_bytes=recorded.get("cache_bytes"),
+                      by_cache=tuple(recorded.get("by_cache") or ())).as_dict()
+
+    @property
     def pid(self) -> int | None:
         """For messages only (never a decision)."""
         return (self.status() or {}).get("pid") or self.info.get("pid")
 
     def describe(self) -> dict[str, Any]:
         used, tpcc = self.used, (self.used.get("tpcc") or {})
+        layout = self.tpcc_layout or {}
         return {"folder": str(self.folder), "workload_run_id": self.info.get("run_id"), "id": self.info.get("id"),
                 "profile": used.get("profile"), "clerks": used.get("concurrency"), "rate_tps": self.rate_tps,
-                "warehouses": tpcc.get("warehouses"), "session": used.get("session") or {},
+                "warehouses": tpcc.get("warehouses"), "active_warehouses": layout.get("active_warehouses"),
+                "extra_warehouses": layout.get("extra_warehouses"), "session": used.get("session") or {},
                 "clerks_started_wall": self.info.get("clerks_started_wall"),
                 "application_name": self.info.get("application_name")}
 
     def match_problems(self, wanted: Any, profile_name: str, node_name: str) -> list[str]:
         """Why this workload is not the one the scenario declares (empty: it is). Must match: the
-        target, the profile, transaction markers, the session settings and no Elle history. Sizes
-        and the rate are taken from the running workload and reported, not compared."""
+        target, the profile, transaction markers, the session settings, no Elle history and -- when
+        the scenario keeps its clerks on part of the warehouses (workload.tpcc.active_warehouses) --
+        a workload whose clerks leave warehouses untouched. Sizes and the rate are taken from the
+        running workload and reported, not compared (a number of active warehouses the scenario
+        states is compared: it is the scenario's own rule, not a size calculated from the target)."""
         problems: list[str] = []
         if not self.info:
             return ["the workload has not written service.json yet (its clerks are not running)"]
@@ -182,7 +204,25 @@ class AttachedWorkload:
             problems.append(f"session settings {have or 'none'}, the scenario needs {need or 'none'}")
         if wanted.groups:
             problems.append("the scenario declares clerk groups; the common workload has none")
+        problems += self._layout_problems(wanted)
         return problems
+
+    def _layout_problems(self, wanted: Any) -> list[str]:
+        """A scenario that keeps its clerks on part of the warehouses (its other warehouses are read
+        by the fault alone, e.g. NL-N-I01's index reports) needs a workload that does the same."""
+        need = getattr(getattr(wanted, "tpcc", None), "active_warehouses", None)
+        if wanted.profile != "tpcc" or need is None or self.used.get("profile") != "tpcc":
+            return []
+        layout = self.tpcc_layout or {}
+        active, loaded = layout.get("active_warehouses"), layout.get("warehouses")
+        if not layout.get("extra_warehouses"):
+            return [f"the scenario keeps its clerks on part of the warehouses (active_warehouses: {need}), but the "
+                    f"common workload's clerks use every one of its {loaded} warehouses; start it with "
+                    "workload.tpcc.active_warehouses set (workloads/oltp-common.yaml)"]
+        if isinstance(need, int) and need != active:
+            return [f"the scenario's clerks use {need} warehouses (active_warehouses), the common workload's "
+                    f"use {active}"]
+        return []
 
     # --- health --------------------------------------------------------------------------------
 

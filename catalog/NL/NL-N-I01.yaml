@@ -18,6 +18,13 @@
 # python -m resilience_tests.execution.workload.tpcc.capacity --env <env> --clerks 64
 #   --active-warehouses by_cache).
 #
+# Attached to the common workload (--attach-workload or the suite runner; specs/007): the running
+# workload's rate, sizes and warm-up are used, not the ones below, and nothing is loaded or started.
+# It must keep its clerks on part of the warehouses (workloads/oltp-common.yaml: active_warehouses),
+# so the index reports have warehouses only they read, and it must set the same session settings;
+# otherwise the run is refused at init. The planned rate the baseline is checked against is the
+# running workload's.
+#
 # Invalid (stopped, never a pass): the login cannot log in or allows fewer sessions than needed; a limit
 # the limit tests need is not set; the customers' baseline cache hit ratio is below 99%; the baseline
 # missed the planned rate; the reports cannot occupy every core.
@@ -58,6 +65,10 @@ workload:
   transaction_markers: true
   rate_fraction_of_capacity: 0.6 # the document: about 60% of the measured maximum (NEEDS SIGN-OFF, Framework §7.5)
   latency_from: intended_start   # the document: latency from when the transaction should have started
+  session:                       # on every customer connection, as the common workload's (an attached run
+    lock_timeout: "0"            #   needs the same): no server or login default cancels a customer that
+    statement_timeout: "0"       #   waits; the limits under test are the report login's own (session
+    transaction_timeout: "0"     #   settings only; nothing on the server or any role changes)
   tpcc:
     warehouses: by_cache
     order_line_cache_multiple: 8 # the document: order_line about 8 x the memory cache
