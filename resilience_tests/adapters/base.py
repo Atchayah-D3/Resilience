@@ -189,6 +189,15 @@ class CoreAdapter(ABC):
     async def marker_ids(self) -> set[str]:
         """Every marker present after recovery -- the `db` set of the RPO arithmetic."""
 
+    async def marker_snapshot(self, path: Any) -> dict[str, Any]:
+        """For a scenario attached to the running common workload (specs/007): the markers and,
+        when the TPC-C data exists, its order count (`current_orders`, sum of D_NEXT_O_ID - 1),
+        read in ONE snapshot while the workload keeps writing -- so the journals cut at that
+        moment can be compared with both. The markers are streamed to `path` (sorted as text with
+        the C collation, one per line, gzip -- as markers_db.txt.gz), never held in memory: a long
+        run at a high rate has millions. Returns {"file", "count", "sha256", "current_orders"}."""
+        raise NotImplementedError(f"engine {self.engine!r}: marker_snapshot is not built")
+
     @abstractmethod
     async def sentinel(self, table: str, hostname: str) -> dict[str, Any] | None:
         """The operator-created sentinel row (Arch §15). Adapters never create it."""

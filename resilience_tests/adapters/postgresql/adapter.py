@@ -54,6 +54,7 @@ from resilience_tests.adapters.postgresql.tpcc import TpccMixin, call_tpcc  # TP
 from resilience_tests.adapters.postgresql.analytics import AnalyticsMixin  # NL-N-I01 report sessions
 from resilience_tests.adapters.postgresql.configuration import ConfigurationMixin  # catalog server_settings
 from resilience_tests.control.profile import DbEndpoint, Node
+from resilience_tests.execution.workload.contract import TPCC_TABLES
 from resilience_tests.execution.remote import RemoteHost, privileged
 
 HARNESS_DDL = """
@@ -574,6 +575,30 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
         except BaseException:
             await conn.close()
             raise
+
+    async def marker_snapshot(self, path: Any) -> dict[str, Any]:
+        """See CoreAdapter.marker_snapshot: one REPEATABLE READ snapshot, the markers streamed to
+        `path` (sorted as text, one per line, gzip -- as markers_db.txt.gz) a batch at a time."""
+        import gzip
+        import hashlib
+        conn = await self._connect(timeout_s=60.0, command_timeout=None)
+        sha, count = hashlib.sha256(), 0
+        try:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                with gzip.open(path, "wb") as fh:
+                    async for r in conn.cursor(f'{SELECT_MARKERS} ORDER BY uuid::text COLLATE "C"', prefetch=10_000):
+                        line = (r[0] + "\n").encode()
+                        fh.write(line)
+                        sha.update(line)
+                        count += 1
+                orders = None
+                if await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", TPCC_TABLES["district"]):
+                    orders = await conn.fetchval(f"SELECT sum(d_next_o_id - 1) FROM {TPCC_TABLES['district']}")
+            return {"file": str(path), "count": count, "sha256": sha.hexdigest(),
+                    "current_orders": int(orders) if orders is not None else None}
+        finally:
+            await conn.close()
+
 
     async def sentinel(self, table: str, hostname: str) -> dict[str, Any] | None:
         conn = await self._connect()

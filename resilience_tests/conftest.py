@@ -18,6 +18,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     g.addoption("--tpcc-warehouses", action="store", type=int, default=None,
                 help="run the scenarios with the TPC-C workload (this many warehouses; the run loads them "
                      "if needed) in place of their own; disclosed in every report (TPC-C build steps 7, 10)")
+    g.addoption("--attach-workload", action="store_true",
+                help="attach every scenario to the common workload already running on the target (specs/007) "
+                     "instead of starting its own; refused when none runs or it is not the one a scenario needs")
     g.addoption("--tpcc-fresh-load", action="store_true",
                 help="TPC-C runs load the data again before the baseline even when it is fine (default: only "
                      "when missing, of another size, grown or changed); disclosed in the report")

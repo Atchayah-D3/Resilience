@@ -202,6 +202,8 @@ class ConfigurationMixin(ConfigurationSupport, PostgreSQLCore):
         detail: dict[str, Any] = {"config_file": config_file, "backup": backup, "tag": tag, "begin": begin,
                                   "end": end, "changes": dict(changes)}
         encoded = base64.b64encode(block.encode()).decode()
+        if not self.node.ssh.sudo_shell:
+            return await self._apply_without_shell(detail, changes, config_file, backup, begin, encoded)
         script = (f"set -e; f={q(config_file)}; b={q(backup)}; test -f \"$f\"; "
                   f"if grep -qxF {q(begin)} \"$f\"; then echo PRESENT; exit 0; fi; "
                   f"cp -p \"$f\" \"$b\"; sha256sum \"$b\" | cut -d' ' -f1; "
@@ -224,6 +226,83 @@ class ConfigurationMixin(ConfigurationSupport, PostgreSQLCore):
         detail["verified"] = True
         return detail
 
+    # --- the same steps on an account whose sudo runs no shell (env profile sudo_shell: false):
+    # one program per sudo, as the database's OS user; pipes and redirections run in the SSH
+    # user's own shell, so only the program that reads or writes the file has higher rights.
+
+    def _conf_program(self, *argv: str) -> str:
+        return privileged(self.node.ssh, list(argv), user=self.node.os_user)
+
+    async def _sha(self, host: RemoteHost, path: str) -> str:
+        return (await host.run(self._conf_program("/usr/bin/sha256sum", path), timeout_s=SSH_TIMEOUT_S)).stdout.split()[0]
+
+    async def _has_line(self, host: RemoteHost, path: str, line: str) -> bool:
+        r = await host.run(self._conf_program("/usr/bin/grep", "-qxF", line, path), timeout_s=SSH_TIMEOUT_S, check=False)
+        if r.exit_status not in (0, 1):
+            raise RuntimeError(f"cannot read {path}: {r.stderr.strip()}")
+        return r.exit_status == 0
+
+    async def _exists(self, host: RemoteHost, path: str) -> bool:
+        r = await host.run(self._conf_program("/usr/bin/test", "-f", path), timeout_s=SSH_TIMEOUT_S, check=False)
+        return r.exit_status == 0
+
+    async def _apply_without_shell(self, detail: dict[str, Any], changes: Mapping[str, Any], config_file: str,
+                                   backup: str, begin: str, encoded: str) -> dict[str, Any]:
+        async with RemoteHost(self.node.ssh) as host:
+            if not await self._exists(host, config_file):
+                raise RuntimeError(f"{config_file} does not exist on {self.node.name}")
+            if not await self._has_line(host, config_file, begin):
+                await host.run(self._conf_program("/usr/bin/cp", "-p", config_file, backup), timeout_s=SSH_TIMEOUT_S)
+                detail["original_sha256"] = await self._sha(host, backup)
+                last = (await host.run(self._conf_program("/usr/bin/tail", "-c1", config_file),
+                                       timeout_s=SSH_TIMEOUT_S)).stdout
+                # a file without a final newline gets one first, so the block starts on its own line
+                text = (f"printf '\\n' | {self._conf_program('/usr/bin/tee', '-a', config_file)} > /dev/null; "
+                        if last not in ("", "\n") else "")
+                await host.run(f"{text}printf '%s' {q(encoded)} | base64 -d | "
+                               f"{self._conf_program('/usr/bin/tee', '-a', config_file)} > /dev/null",
+                               timeout_s=SSH_TIMEOUT_S)
+                detail["applied_sha256"] = await self._sha(host, config_file)
+            detail["restart_s"] = await self._restart_and_wait(host)
+        check = await self._check_values(changes, "to")
+        detail["check"] = check
+        detail["after"] = {n: c.get("setting") for n, c in check.items()}
+        if not all(c["ok"] for c in check.values()):
+            wrong = {n: c for n, c in check.items() if not c["ok"]}
+            detail["restore"] = await self.restore_server_settings(detail)
+            raise RuntimeError(f"server settings not in effect after the restart: {wrong}; the change was "
+                               "removed again")
+        detail["verified"] = True
+        return detail
+
+    async def _restore_without_shell(self, host: RemoteHost, config_file: str, backup: str, begin: str,
+                                     end: str, applied: str) -> list[str]:
+        """The restore script's decisions, one program at a time; returns the same two words."""
+        tmp = f"{config_file}.resilience-tmp"
+        have_backup = await self._exists(host, backup)
+        if have_backup and await self._sha(host, config_file) == applied:
+            # `cp` onto the existing file keeps its owner and mode, as `cat >` does
+            await host.run(self._conf_program("/usr/bin/cp", backup, config_file), timeout_s=SSH_TIMEOUT_S)
+            await host.run(self._conf_program("/usr/bin/rm", "-f", backup), timeout_s=SSH_TIMEOUT_S)
+            return ["REMOVED", "SAME"]
+        if await self._has_line(host, config_file, begin):
+            program = "$0==b{skip=1;next} skip&&$0==e{skip=0;next} !skip"
+            await host.run(f"{self._conf_program('/usr/bin/awk', '-v', f'b={begin}', '-v', f'e={end}', program, config_file)}"
+                           f" | {self._conf_program('/usr/bin/tee', tmp)} > /dev/null", timeout_s=SSH_TIMEOUT_S)
+            await host.run(self._conf_program("/usr/bin/cp", tmp, config_file), timeout_s=SSH_TIMEOUT_S)
+            await host.run(self._conf_program("/usr/bin/rm", "-f", tmp), timeout_s=SSH_TIMEOUT_S)
+            block = "REMOVED"
+        else:
+            block = "ABSENT"
+        if not have_backup:
+            return [block, "NOBACKUP"]
+        same = await host.run(self._conf_program("/usr/bin/cmp", "-s", config_file, backup), timeout_s=SSH_TIMEOUT_S,
+                              check=False)
+        if same.exit_status == 0:
+            await host.run(self._conf_program("/usr/bin/rm", "-f", backup), timeout_s=SSH_TIMEOUT_S)
+            return [block, "SAME"]
+        return [block, "DIFFERENT"]
+
     async def restore_server_settings(self, detail: Mapping[str, Any]) -> dict[str, Any]:
         """See ConfigurationSupport.restore_server_settings."""
         # from the ledger detail alone (the kill switch after a crash): markers and backup follow the tag
@@ -244,7 +323,10 @@ class ConfigurationMixin(ConfigurationSupport, PostgreSQLCore):
                   f"else echo NOBACKUP; fi")
         out: dict[str, Any] = {"config_file": config_file}
         async with RemoteHost(self.node.ssh) as host:
-            words = (await host.run(as_user(self.node.os_user, script), timeout_s=SSH_TIMEOUT_S)).stdout.split()
+            if self.node.ssh.sudo_shell:
+                words = (await host.run(as_user(self.node.os_user, script), timeout_s=SSH_TIMEOUT_S)).stdout.split()
+            else:
+                words = await self._restore_without_shell(host, config_file, backup, begin, end, applied)
             out["block"], out["file_vs_backup"] = words[0], words[1]
             if out["file_vs_backup"] == "DIFFERENT":
                 # someone else edited the file during the run: their edit stays, the backup is kept

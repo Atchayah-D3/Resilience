@@ -24,6 +24,7 @@ from typing import Any
 import re
 
 from resilience_tests.analysis.predicates import NOT_APPLICABLE, NOT_MEASURED
+from resilience_tests.execution.workload.histogram import hist_percentile
 from resilience_tests.observability.event_stream import Event
 
 # Framework §6.2 RTO-to-SLO definition
@@ -183,15 +184,26 @@ def _sample_commits(e: Event) -> float:
 def _slo_recovery_windowed(events: Sequence[Event], t0_ns: int, baseline: Baseline, max_sample_interval_s: float,
                            tps_fraction: float | None, window_s: float) -> tuple[float | None, float | None]:
     """The earliest window of `window_s` after T0, made of consecutive 1 s samples, in which
-    the committed TPS over the WHOLE window is >= the fraction of baseline TPS and EVERY
-    sample's p99 is <= 1.5x the baseline p99. Every sample must also be short (not a starved
-    sampler) and follow the previous one without a gap -- the same rules as the per-second form.
+    the committed TPS over the WHOLE window is >= the fraction of baseline TPS and the p99 is
+    <= 1.5x the baseline p99. Every sample must also be short (not a starved sampler) and follow
+    the previous one without a gap -- the same rules as the per-second form.
 
     Why the TPS is taken over the window: at tens of TPS a 1 s count is dominated by when the
     commits happen to land (a stall of a few hundred ms moves a third of a second's commits into
-    the next second), so a per-second 95% bound fails an undisturbed service most seconds. The
-    thresholds are unchanged; p99 is still held per second, which is stricter than a window p99."""
+    the next second), so a per-second 95% bound fails an undisturbed service most seconds.
+
+    The p99, like for like with the baseline's: the baseline p99 is the 99th percentile of EVERY
+    transaction of the baseline window, so the window is judged by the 99th percentile of every
+    transaction inside it -- from the samples' latency histograms (the common workload writes
+    them; percentiles are a bucket's upper edge, never below the exact value, as the baseline's
+    own). Held per second instead, each 1 s p99 at tens of TPS is that second's slowest
+    transaction: a single slow one fails the second, so even an undisturbed baseline cannot hold
+    it (measured on e2-u22-3: baseline p99 14 ms, 5 of 120 undisturbed seconds above 1.5x). The
+    window form still fails a real stall: in 60 s at 60 TPS the p99 is the 36th slowest of
+    ~3,600 transactions, so one second in which every transaction waited lifts it over the bound.
+    Samples without histograms (a scenario's own workload) are held per second, as before."""
     fraction = SLO_TPS_FRACTION if tps_fraction is None else tps_fraction
+    p99_bound = SLO_P99_MULTIPLIER * baseline.p99_ms
     samples = [e for e in events if e.kind == "sample" and e.source == "workload"]
     for j, first in enumerate(samples):
         start_ns = first.t_mono_ns - int(first.data["interval_s"] * 1e9)
@@ -199,17 +211,28 @@ def _slo_recovery_windowed(events: Sequence[Event], t0_ns: int, baseline: Baseli
             continue
         commits = 0.0
         prev_end_ns: int | None = None
+        merged: dict[str, int] | None = {}       # the window's latency histogram, while every sample has one (counts added in place)
         for e in samples[j:]:
             interval_ns = int(e.data["interval_s"] * 1e9)
             p99 = e.data.get("p99_ms")
-            if (e.data["interval_s"] > max_sample_interval_s or p99 is None
-                    or p99 > SLO_P99_MULTIPLIER * baseline.p99_ms
+            hist = e.data.get("latency_hist")
+            if merged is not None and hist is None:
+                merged = None                    # judged per second from here (no histogram to sum)
+            per_second_breach = merged is None and (p99 is None or p99 > p99_bound)
+            if (e.data["interval_s"] > max_sample_interval_s or per_second_breach
                     or (prev_end_ns is not None and (e.t_mono_ns - interval_ns) - prev_end_ns > interval_ns // 2)):
                 break
+            if merged is not None:
+                for bucket, n in hist.items():
+                    merged[bucket] = merged.get(bucket, 0) + int(n)
             commits += _sample_commits(e)
             prev_end_ns = e.t_mono_ns
             span_s = (e.t_mono_ns - start_ns) / 1e9
             if span_s >= window_s - 1e-9:
+                if merged is not None:
+                    window_p99 = hist_percentile(merged, 0.99)
+                    if window_p99 is None or window_p99 > p99_bound:
+                        break
                 if commits / span_s >= fraction * baseline.tps:
                     return (start_ns - t0_ns) / 1e9, (e.t_mono_ns - t0_ns) / 1e9
                 break

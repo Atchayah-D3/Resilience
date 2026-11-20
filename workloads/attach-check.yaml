@@ -1,0 +1,36 @@
+# The common workload for the first live checks of the attach story (specs/007) on e2-u22-3:
+# the data already loaded there (283 warehouses, so nothing is reloaded) at a fixed 60 TPS (no
+# capacity record needed), running until the suite runner stops it.
+#   python -m resilience_tests.control.suite --env e2-u22-3 --workload workloads/attach-check.yaml --scenario NL-N-I03a
+id: attach-check
+description: >-
+  TPC-C at 60 TPS on the loaded data, for checking scenarios attached to the common workload.
+
+duration_s: null            # until stopped: the suite runner stops it after the last scenario
+warmup_s: 300
+metrics_interval_s: 10
+status_interval_s: 5
+no_commit_alert_s: 600
+scenario_settle_s: 30      # a scenario's window extends this long past its run_end: the clerks' reconnects
+                            # after its cleanup restart count with the scenario, not against this baseline
+fresh_load: false
+
+workload:
+  profile: tpcc
+  concurrency: 64
+  transaction_markers: true
+  rate_tps: 60
+  latency_from: intended_start
+  session: {lock_timeout: "0", statement_timeout: "0", transaction_timeout: "0"}
+  tpcc:
+    warehouses: 283
+    worker_processes: 2
+
+baseline:
+  tps_window_s: 60
+  tps_share_min: 0.95
+  p99_window_s: 10
+  p99_limit_ms: 3000
+  error_share_max: 0.0001
+  memory_growth_max: 0.10
+  memory_from_s: 600

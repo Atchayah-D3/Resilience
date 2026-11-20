@@ -93,6 +93,21 @@ class EventStream:
                 pass
         return event
 
+    def record(self, event: Event) -> Event:
+        """Append an event that happened elsewhere on this host, with its own timestamps (a scenario
+        attached to the common workload copies the workload's samples into its run, specs/007).
+        Both processes stamp with this host's clocks, so the times line up with emit()'s."""
+        with self._lock:
+            self._fh.write(event.to_json() + "\n")
+            if self._keep:
+                self._events.append(event)
+        for callback in self._subscribers:
+            try:
+                callback(event)
+            except Exception:  # noqa: BLE001 -- see subscribe()
+                pass
+        return event
+
     def sync(self) -> None:
         with self._lock:
             self._fh.flush()

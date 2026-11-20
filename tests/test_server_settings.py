@@ -150,8 +150,12 @@ class LocalShell:
         if "systemctl" in command and "restart" in command:
             self.server.restart()
             return RemoteResult(0, "", "")
-        argv = shlex.split(command)
-        script = argv[argv.index("-c") + 1]
+        if " sh -c " in command:                       # sudo_shell: the whole script under sudo
+            argv = shlex.split(command)
+            script = argv[argv.index("-c") + 1]
+        else:                                          # no shell under sudo: one program per sudo
+            assert " sh -c" not in command and "bash" not in command
+            script = re.sub(r"sudo (-n )?(-u \S+ )?-- ", "", command)
         done = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
         if check and done.returncode != 0:
             raise RuntimeError(f"exit {done.returncode}: {done.stderr}")
@@ -175,14 +179,18 @@ class ConfigAdapter(ConfigurationMixin):
         return 0.0
 
 
-@pytest.fixture
-def setup(tmp_path, monkeypatch):
+@pytest.fixture(params=[True, False], ids=["sudo-shell", "no-shell"])
+def setup(tmp_path, monkeypatch, request):
+    """Both forms the environment file allows: the whole script under `sudo sh -c`, and an account
+    whose sudo runs no shell (e2-u22-3), where every program runs on its own."""
     conf = tmp_path / "postgresql.conf"
     conf.write_text(ORIGINAL)
     server = FakeServer(conf)
     calls: list[str] = []
     monkeypatch.setattr(configuration, "RemoteHost", LocalShell(server, calls))
-    node = NODE.model_copy(update={"pgdata": str(tmp_path), "config_file": str(conf)})
+    node = NODE.model_copy(update={"pgdata": str(tmp_path), "config_file": str(conf),
+                                   "ssh": NODE.ssh.model_copy(update={"sudo_shell": request.param,
+                                                                      "sudo_noninteractive": request.param})})
     return ConfigAdapter(node, server), conf, server, calls
 
 
@@ -350,3 +358,15 @@ def test_a_file_without_a_final_newline_is_restored_exactly(setup):
     assert "fsync = on\n# END resilience harness target\n# >>> resilience-harness" in conf.read_text()
     run(adapter.restore_server_settings(detail))
     assert sha(conf) == before
+
+
+def test_the_real_adapter_uses_the_no_shell_steps_of_this_mixin():
+    """The mixin's helpers are not shadowed by a same-named method of the adapter's core (they
+    once were: the no-shell form then failed on the target)."""
+    from resilience_tests.adapters.postgresql.adapter import PostgreSQLAdapter
+    node = NODE.model_copy(update={"ssh": NODE.ssh.model_copy(update={"sudo_shell": False,
+                                                                        "sudo_noninteractive": False})})
+    a = PostgreSQLAdapter(node)
+    for name in ("_conf_program", "_sha", "_has_line", "_exists", "_apply_without_shell", "_restore_without_shell"):
+        assert getattr(PostgreSQLAdapter, name) is getattr(ConfigurationMixin, name), name
+    assert a._conf_program("/usr/bin/cp", "a", "b") == f"sudo -u {node.os_user} -- /usr/bin/cp a b"

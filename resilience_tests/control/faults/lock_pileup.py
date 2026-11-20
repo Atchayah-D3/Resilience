@@ -101,11 +101,13 @@ class LockPileupFault(HeldFault):
             "as latency; the workload driver still abandons a transaction after its own 10 s bound "
             "(counted as indeterminate, never as lost).")
         ctx.disclosures.append(
-            f"Back to normal (rto_to_slo_s) uses this scenario's definition: TPS >= {NORMAL_TPS_FRACTION:.0%} "
-            f"of the baseline over a {rto_decomposer.SLO_SUSTAIN_S:g} s window and p99 <= "
-            f"{rto_decomposer.SLO_P99_MULTIPLIER:g}x in every second of it ({rto_decomposer.SLO_SUSTAIN_S:g} s "
-            f"straight), counted from the moment the lock queue cleared. TPS is judged over the window, "
-            f"not per second, because a 1 s count at this rate swings with when commits land.")
+            f"Back to normal (rto_to_slo_s) uses this scenario's definition: over a "
+            f"{rto_decomposer.SLO_SUSTAIN_S:g} s window, TPS >= {NORMAL_TPS_FRACTION:.0%} of the baseline and p99 <= "
+            f"{rto_decomposer.SLO_P99_MULTIPLIER:g}x the baseline p99, counted from the moment the lock queue "
+            "cleared. Both are taken over the whole window, as the baseline's own are: the p99 of every "
+            "transaction in it, from the common workload's latency histograms (a scenario's own workload "
+            "has none, and its p99 is then held in every second). A 1 s count or 1 s p99 at this rate swings "
+            "with single transactions.")
 
     async def hold_and_release(self) -> dict[str, Any]:
         ctx = self.ctx
@@ -331,8 +333,9 @@ class LockPileupFault(HeldFault):
     def _lock_waits_logged(self, events: list[Any], issued: int | None) -> dict[str, Any]:
         """The engine's own lock-wait log lines after the schema change was issued (PostgreSQL
         writes them only with log_lock_waits on, after deadlock_timeout of waiting). Reported:
-        the server's record of the pile-up, independent of the harness's own polling. The
-        harness never turns the setting on -- configuration is observed, not written."""
+        the server's record of the pile-up, independent of the harness's own polling. The value
+        that counts is the one in effect during the run: the scenario's own server_settings
+        when it set log_lock_waits (written before the baseline), else what init observed."""
         name = "lock_waits_logged"
         ctx = self.ctx
         patterns = [re.compile(p) for p in ctx.adapter.lock_wait_log_patterns()]
@@ -342,10 +345,11 @@ class LockPileupFault(HeldFault):
         if not patterns:
             ctx.not_measured[name] = "this engine names no lock-wait log lines"
             return {name: NOT_MEASURED}
-        setting = (ctx.facts.get("scenario_observed") or {}).get("log_lock_waits")
+        set_by_run = ((ctx.facts.get("server_settings") or {}).get("applied") or {}).get("after") or {}
+        setting = set_by_run.get("log_lock_waits", (ctx.facts.get("scenario_observed") or {}).get("log_lock_waits"))
         if setting is not None and str(setting).lower() not in ("on", "true", "1"):
-            ctx.not_measured[name] = (f"log_lock_waits is {setting!r} on the target, so the server logs no lock "
-                                      "waits; the harness does not change server configuration")
+            ctx.not_measured[name] = (f"log_lock_waits is {setting!r} on the target during the run, so the server "
+                                      "logs no lock waits")
             return {name: NOT_MEASURED}
         if not any(e.kind == "log_line" for e in events):
             ctx.not_measured[name] = "no line of the engine's log reached the harness during the run"

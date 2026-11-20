@@ -63,7 +63,20 @@ from resilience_tests.execution.probes.probers import (
     measure_clock_offset,
 )
 from resilience_tests.execution.remote import run_once
+from resilience_tests.execution.workload.attached import (
+    INIT_MARKERS_FILE,
+    VALIDATE_MARKERS_FILE,
+    AttachedWorkload,
+    AttachRefused,
+    CutOff,
+    SpanCheckAdapter,
+    compare_snapshots,
+    find_folder,
+)
+from resilience_tests.execution.workload.markers import DB_MARKERS_FILE
+from resilience_tests.execution.workload.service import endchecks
 from resilience_tests.execution.workload.contract import WorkloadDriverContract
+from resilience_tests.execution.workload.service.windows import PERCENTILE_NOTE
 from resilience_tests.execution.workload.driver import MeasuredWindow
 from resilience_tests.execution.workload.history_writer import HistoryWriter
 from resilience_tests.execution.workload.hooks import (
@@ -78,7 +91,8 @@ from resilience_tests.execution.workload.markers import MarkerJournals, diff_fro
 from resilience_tests.execution.workload.service.state import WorkloadRunning
 from resilience_tests.execution.workload.service.state import refuse_if_running as refuse_if_workload_running
 from resilience_tests.observability.event_stream import EventStream
-from resilience_tests.observability.observer import NoObserver, RunObserver, observer_for
+from resilience_tests.observability.event_stream import Event
+from resilience_tests.observability.observer import NoObserver, RunObserver, marker_time, observer_for
 
 EVENTS_FILE = "events.jsonl"
 INTEGRITY_FILE = "integrity.txt"
@@ -96,6 +110,9 @@ RECOVERY_EXIT_MARGIN_S = 5.0  # leave the recovery loop before its phase timeout
 MAX_LANDING_ATTEMPTS = 3
 
 
+# The workload checks the end checks return (service/endchecks.run_end_checks, tpcc/checks.py)
+TPCC_END_MEASURES = ("partial_commits", "aborted_markers_present", "tpcc_consistency_violations")
+
 # TargetBusy: another run holds this target. Two runs against one node corrupt each other's
 # measurements (the second run's init truncates the first run's marker table), so the harness
 # refuses rather than producing numbers nobody can trust. Raised by the driver host's own lock
@@ -110,6 +127,8 @@ class RunOptions:
     workload_note: str | None = None
     # load the workload's data again even when it is fine (--tpcc-fresh-load)
     tpcc_fresh_load: bool = False
+    # attach to the running common workload instead of starting the scenario's own (specs/007)
+    attach_workload: bool = False
 
 
 @dataclass
@@ -143,6 +162,9 @@ class TestOrchestrator:
         self.journals: MarkerJournals | None = None
         self.history: HistoryWriter | None = None
         self.workload: WorkloadDriverContract | None = None
+        # the running common workload this run is attached to (RunOptions.attach_workload)
+        self.attached: AttachedWorkload | None = None
+        self._init_snapshot: CutOff | None = None   # the database's markers at init, when attached
         self.write_prober: WriteProber | None = None
         self.log_tailer: LogTailer | None = None
         self.disk_prober: DiskUsageProber | None = None
@@ -301,6 +323,10 @@ class TestOrchestrator:
         results = self._results(status, error)
         await self._phase("report", results=results, swallow=True)
         await self._phase("cleanup", swallow=True)
+        if self.attached is not None:
+            self.attached.mark("run_end", run_id=self.run_id, scenario=self.scenario.id)
+            if self.attached.mark_problems:
+                self.facts["common_workload_marks"] = list(self.attached.mark_problems)
         status, error = self._after_cleanup(status, error)
         await self._release_remote_lock()       # after cleanup: the target is ours until it is clean
         await self._finish_observation(status)
@@ -436,10 +462,13 @@ class TestOrchestrator:
         # The common long-running workload (specs/007) owns the marker table, the TPC-C data and the
         # clerks while it runs; this run would empty the first, may reload the second and starts its
         # own clerks. Scenarios attach to that workload in the next story; until then, refused.
-        try:
-            await refuse_if_workload_running(self.profile, self.node, f"scenario {self.scenario.id}")
-        except WorkloadRunning as exc:
-            raise PhaseAbort(str(exc)) from None
+        if self.options.attach_workload:
+            self._attach_workload()
+        else:
+            try:
+                await refuse_if_workload_running(self.profile, self.node, f"scenario {self.scenario.id}")
+            except WorkloadRunning as exc:
+                raise PhaseAbort(str(exc)) from None
         hostname = (await run_once(self.node.ssh, "hostname", timeout_s=15)).stdout.strip()
         sentinel = await self.adapter.sentinel(self.profile.safety.sentinel_table, hostname)
         self.facts["fingerprint"] = self.safety.check_fingerprint(self.node, hostname, sentinel)
@@ -462,7 +491,11 @@ class TestOrchestrator:
 
         # Integrity counters are cumulative in most engines; the run is judged on its own delta.
         self.facts["integrity_baseline"] = await self.adapter.mark_integrity_baseline()
-        await self.adapter.prepare_harness_state()
+        if self.attached is not None:
+            # never the workload's tables (markers, churn): the running workload writes them
+            await self.adapter.prepare_scenario_state()
+        else:
+            await self.adapter.prepare_harness_state()
         grants = self.adapter.harness_grants
         if grants:
             self.disclosures.append(
@@ -497,6 +530,9 @@ class TestOrchestrator:
         # after the deployment's settings were recorded above, before the workload's data and the
         # baseline: the run is measured under the settings it declares
         await self._apply_server_settings()
+        if self.attached is not None:
+            await self._init_attached()
+            return {"hostname": hostname, "settings": settings}
         # Profile hooks (docs/tpcc-contract.md §6): the custom workload's do nothing.
         self.workload_hooks = hooks_for(self.scenario.workload)
         # after the target checks above: a reset writes to the target
@@ -522,6 +558,112 @@ class TestOrchestrator:
         self.workload = make_workload_driver(self.adapter, self.scenario.workload, self.journals, self.stream,
                                              history=self.history, hooks=self.workload_hooks)
         return {"hostname": hostname, "settings": settings}
+
+    def _attach_workload(self) -> None:
+        """Find the running common workload, check it is healthy and the one the scenario declares,
+        and refuse (before anything is applied) when it is not."""
+        assert self.stream is not None
+        try:
+            folder = find_folder(self.profile, self.node)
+        except AttachRefused as exc:
+            raise PhaseAbort(str(exc)) from None
+        attached = AttachedWorkload(folder, self.stream)
+        problems = attached.match_problems(self.scenario.workload, self.profile.name, self.node.name)
+        problems += attached.health_problems()
+        self.facts["common_workload"] = attached.describe()
+        if problems:
+            raise PhaseAbort(f"cannot attach to the common workload in {folder}: " + "; ".join(problems))
+        self.attached = attached
+        # before anything is changed (server settings restart the database): from here on, the
+        # workload's own baseline does not count what this scenario does to it
+        attached.mark("run_start", run_id=self.run_id, scenario=self.scenario.id)
+
+    async def _init_attached(self) -> None:
+        """init's workload part when attached: nothing is reset, loaded or started -- the running
+        workload did that once at its start. Recorded: what it runs, and the commits an earlier
+        scenario already lost (this run is charged only with losses that appear after it)."""
+        attached = self.attached
+        assert attached is not None and self.stream is not None
+        # the workload's checks after the fault run in validate on this scenario's span
+        # (service/endchecks.run_end_checks), not through the profile's hooks
+        self.workload_hooks = NoProfileHooks()
+        d = attached.describe()
+        self.disclosures.append(
+            f"Attached to the running common workload {d['id']} ({d['folder']}): profile {d['profile']}, "
+            f"{d['clerks']} clerks, {d['rate_tps']} TPS"
+            + (f", {d['warehouses']} warehouses" if d.get("warehouses") else "")
+            + "; this run neither started, warmed up nor stopped it, and its own workload section's sizes and "
+              "rate were not used.")
+        if d.get("session"):
+            self.disclosures.append("The common workload's connections set their own session settings: "
+                                    + ", ".join(f"{k}={v}" for k, v in sorted(d["session"].items())))
+        self.disclosures.append(f"Window figures (baseline, hold) come from the common workload's 1-second "
+                                f"samples: {PERCENTILE_NOTE}.")
+        if attached.used.get("profile") == "tpcc":
+            self.disclosures.append("The TPC-C checks after the fault cover everything the common workload did since "
+                                    "its start (earlier scenarios included), compared with the database at the "
+                                    "cut-off moment while the workload kept writing.")
+        await self.fault_behaviour.check_ready()
+        # the database before this scenario: compared with the validate snapshot, it shows what was
+        # lost DURING the scenario (losses an earlier scenario left are already missing from it)
+        self._init_snapshot = await attached.cut_off(self.adapter, self.run_dir / INIT_MARKERS_FILE, settle_s=0)
+        self.facts["init_snapshot"] = self._init_snapshot.facts()
+        self.stream.subscribe(self._mark_on_event)
+        self.workload = attached
+
+    async def _attached_end_checks(self, m: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+        """Validate's lost-commit and workload checks when attached (handover-attach §validate):
+        the validate snapshot (markers streamed to a file + TPC-C order count), the snapshots
+        compared (what appeared during the scenario; what was there before and is gone), this
+        scenario's journal lines copied by time, and then the workload service's own end checks
+        (service/endchecks.run_end_checks) on them -- compared in the database in batches, so the
+        harness's memory does not grow with the workload's size. Returns (journal problem, the
+        end checks' result for the TPC-C measures)."""
+        attached, init = self.attached, self._init_snapshot
+        assert attached is not None and init is not None
+        try:
+            cut = await attached.cut_off(self.adapter, self.run_dir / VALIDATE_MARKERS_FILE)
+            attached.copy_span(init, cut, self.run_dir)
+            snaps = compare_snapshots(init.file, cut.file, self.run_dir / DB_MARKERS_FILE)
+            self.facts["validate_snapshot"] = cut.facts()
+            self.facts["markers_db_file"] = snaps["new_file"]
+            span = SpanCheckAdapter(self.adapter, init, cut)
+            tpcc = None
+            if attached.used.get("profile") == "tpcc":
+                hooks = attached.tpcc_hooks()
+                tpcc = endchecks.TpccInputs(orders_before=init.current_orders, history_since=hooks.history_since,
+                                            warehouses=int((attached.used.get("tpcc") or {}).get("warehouses") or 0))
+            result = await endchecks.run_end_checks(span, self.run_dir, tpcc=tpcc, markers_from_file=True)
+        except Exception as exc:  # noqa: BLE001 -- recorded; the measures then count as missing
+            self.facts["markers_error"] = f"{type(exc).__name__}: {exc}"
+            return None, None
+        end = result.end
+        self.facts["journal_check"] = {**result.facts.get("journal_check", {}),
+                                       "excluded_in_flight_at_init": dict(span.excluded),
+                                       **({"temp_space": result.facts["temp_space"]} if "temp_space" in result.facts else {})}
+        markers = dict(end.get("markers") or {})
+        markers.update({"lost_of_this_scenario": markers.get("lost_count", 0),
+                        "destroyed_older": snaps["destroyed_listed"], "destroyed_older_count": snaps["destroyed"],
+                        "phantom_count": end.get("phantom")})
+        self.facts["markers"] = markers
+        errors = end.get("_errors") or []
+        if errors:
+            self.facts["markers_error"] = "; ".join(errors)
+        if end.get("rpo_txn") is None:
+            if markers.get("torn_journal_lines") or markers.get("unjournalled_ack"):
+                return (f"marker journals inconsistent (unjournalled acks {markers.get('unjournalled_ack')}, "
+                        f"torn lines {markers.get('torn_journal_lines')}); RPO cannot be evaluated"), end
+            return None, end
+        # this scenario's acknowledged commits that are missing, plus commits that were in the
+        # database before the scenario and are gone now (however old)
+        m["rpo_txn"] = int(end["rpo_txn"]) + snaps["destroyed"]
+        m["indeterminate_txn"] = int(markers.get("indeterminate", 0))
+        return None, end
+
+    def _mark_on_event(self, event: Event) -> None:
+        """T0 and T1 into the common workload's marks, at the moment they happened."""
+        if self.attached is not None and event.kind in ("t0", "t1") and event.source in ("injector", "orchestrator"):
+            self.attached.mark(event.kind, run_id=self.run_id, scenario=self.scenario.id, t_wall=marker_time(event))
 
     async def _p_baseline(self) -> dict[str, Any]:
         assert self.stream and self.workload
@@ -550,8 +692,15 @@ class TestOrchestrator:
         # then one full sample period settles, so the window opens on a running workload rather
         # than after a guessed delay.
         await self.workload.wait_until_ready()
+        if self.attached is not None:
+            # e.g. after init restarted the database for server settings: the baseline opens on a
+            # workload that has settled again, not on its reconnects (bounded by the phase)
+            self.facts["settled_before_baseline_s"] = await self.attached.wait_until_settled()
         await asyncio.sleep(WORKLOAD_RAMP_S)
-        warmup_s = self.scenario.steady_state.warmup_s
+        warmup_s = 0.0 if self.attached is not None else self.scenario.steady_state.warmup_s
+        if self.attached is not None:
+            # the common workload warmed up once at its start and has run since
+            self.facts["common_workload_warmup_s"] = self.attached.info.get("warmup_s")
         if warmup_s:
             # the load runs, unmeasured, until caches have filled and the workload has settled
             self.stream.emit("orchestrator", "warmup", seconds=warmup_s)
@@ -583,8 +732,9 @@ class TestOrchestrator:
     async def _p_pre_fault(self) -> dict[str, Any]:
         assert self.baseline is not None
         ss = self.scenario.steady_state
+        tps_min = self._tps_min()
         checks = {
-            f"tps >= {ss.tps_min}": self.baseline.tps >= ss.tps_min,
+            f"tps >= {tps_min:g}": self.baseline.tps >= tps_min,
             f"p99_ms <= {ss.p99_latency_ms_max}": self.baseline.p99_ms is not None and self.baseline.p99_ms <= ss.p99_latency_ms_max,
         }
         if ss.replication_lag_s_max is not None:
@@ -612,6 +762,18 @@ class TestOrchestrator:
             # crash) can restore what preflight observed rather than guess at it
             self.facts["injector_preflight"] = detail["injector_preflight"]
         return detail
+
+    def _tps_min(self) -> float:
+        """The steady-state TPS floor. Attached, the scenario's floor keeps its share of the rate it
+        was written for (45 of 60 TPS = 75%) and applies it to the running workload's rate."""
+        ss, wanted = self.scenario.steady_state, self.scenario.workload.rate_tps
+        rate = self.attached.rate_tps if self.attached is not None else None
+        if rate is None or not wanted:
+            return ss.tps_min
+        floor = round(ss.tps_min / wanted * rate, 2)
+        self.facts["steady_state_tps_min"] = {"declared": ss.tps_min, "for_rate": wanted, "running_rate": rate,
+                                              "applied": floor}
+        return floor
 
     async def _p_fault_inject(self) -> dict[str, Any]:
         r = self.scenario.repeat
@@ -929,26 +1091,30 @@ class TestOrchestrator:
             self.not_measured.update(repeated.not_measured)
 
         journal_problem: str | None = None
-        try:
-            db_uuids = await self.adapter.marker_ids()
-            self.facts["markers_db_file"] = write_db_markers(self.run_dir, db_uuids)
-            diff, torn = diff_from_journals(self.run_dir, db_uuids)
-            self.facts["markers"] = {
-                "written": diff.written, "acked": diff.acked, "in_db": diff.in_db, "lost": sorted(diff.lost),
-                "indeterminate": len(diff.indeterminate), "indeterminate_committed": len(diff.indeterminate_committed),
-                "rolled_back": len(diff.rolled_back), "rolled_back_kept": sorted(diff.rolled_back_kept),
-                "phantom": sorted(diff.phantom), "unjournalled_ack": sorted(diff.unjournalled_ack), "torn_journal_lines": torn,
-            }
-            if diff.unjournalled_ack or torn:
-                # The RPO arithmetic is only as good as the journals; if they disagree with
-                # themselves there is no RPO figure to evaluate.
-                journal_problem = (f"marker journals inconsistent (unjournalled acks {len(diff.unjournalled_ack)}, "
-                                   f"torn lines {torn}); RPO cannot be evaluated")
-            else:
-                m["rpo_txn"] = diff.rpo_txn
-                m["indeterminate_txn"] = len(diff.indeterminate)
-        except Exception as exc:  # noqa: BLE001 -- recorded; the measure then counts as missing
-            self.facts["markers_error"] = f"{type(exc).__name__}: {exc}"
+        workload_end: dict[str, Any] | None = None
+        if self.attached is not None:
+            journal_problem, workload_end = await self._attached_end_checks(m)
+        else:
+            try:
+                db_uuids = await self.adapter.marker_ids()
+                self.facts["markers_db_file"] = write_db_markers(self.run_dir, db_uuids)
+                diff, torn = diff_from_journals(self.run_dir, db_uuids)
+                self.facts["markers"] = {
+                    "written": diff.written, "acked": diff.acked, "in_db": diff.in_db, "lost": sorted(diff.lost),
+                    "indeterminate": len(diff.indeterminate), "indeterminate_committed": len(diff.indeterminate_committed),
+                    "rolled_back": len(diff.rolled_back), "rolled_back_kept": sorted(diff.rolled_back_kept),
+                    "phantom": sorted(diff.phantom), "unjournalled_ack": sorted(diff.unjournalled_ack), "torn_journal_lines": torn,
+                }
+                if diff.unjournalled_ack or torn:
+                    # The RPO arithmetic is only as good as the journals; if they disagree with
+                    # themselves there is no RPO figure to evaluate.
+                    journal_problem = (f"marker journals inconsistent (unjournalled acks {len(diff.unjournalled_ack)}, "
+                                       f"torn lines {torn}); RPO cannot be evaluated")
+                else:
+                    m["rpo_txn"] = diff.rpo_txn
+                    m["indeterminate_txn"] = len(diff.indeterminate)
+            except Exception as exc:  # noqa: BLE001 -- recorded; the measure then counts as missing
+                self.facts["markers_error"] = f"{type(exc).__name__}: {exc}"
 
         await self.fault_behaviour.before_integrity_check()
 
@@ -966,7 +1132,9 @@ class TestOrchestrator:
             # verified from the evidence rather than taken from the disclosure
             self.facts["integrity_check"] = dict(integrity.detail)
             self.facts["checksum_failures"] = integrity.checksum_failures
-            phantom = len(self.facts.get("markers", {}).get("phantom", [])) if "markers" in self.facts else None
+            markers = self.facts.get("markers")
+            phantom = (markers.get("phantom_count", len(markers.get("phantom", []))) if markers is not None
+                       else None)
             # corruption: structural findings + page checksum failures + rows nobody wrote. A
             # part the engine cannot answer for is NOT a zero -- the total is then not measured,
             # and any criterion over it fails rather than passing on a sum nobody could take.
@@ -1005,8 +1173,14 @@ class TestOrchestrator:
         m.update(await self.fault_behaviour.measure(events))
         # The workload profile's own checks after the fault (TPC-C: partial commits, rolled-back
         # transactions kept, consistency rules). A check it could not run is NOT_MEASURED, with why.
-        measures, workload_facts, workload_reasons = split_checks(
-            await self.workload_hooks.consistency_checks(self.adapter, self.run_dir))
+        if workload_end is not None:
+            # attached: the TPC-C checks ran with the journal check (run_end_checks) on this span
+            measures = {k: v for k, v in workload_end.items() if k in TPCC_END_MEASURES}
+            workload_facts = workload_end.get("tpcc_facts") or {}
+            workload_reasons = dict(workload_end.get("_not_measured") or {})
+        else:
+            measures, workload_facts, workload_reasons = split_checks(
+                await self.workload_hooks.consistency_checks(self.adapter, self.run_dir))
         m.update(measures)
         for name, why in workload_reasons.items():
             m[name] = NOT_MEASURED

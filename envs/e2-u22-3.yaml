@@ -49,6 +49,7 @@ nodes:
     db: {host: 10.11.21.14, port: 5434, dbname: resilience, user: harness}
     client: {host: 10.11.21.14, port: 5434, dbname: resilience, user: harness}
     pgdata: /var/lib/resilience/pgdata
+    config_file: /var/lib/resilience/pgdata/postgresql.conf   # catalog server_settings are written here (SHOW config_file)
     pg_bin: /usr/pgsql-17.11.1.0/bin
     os_user: postgres
     service: shaktidb-resilience.service
