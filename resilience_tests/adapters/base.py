@@ -195,7 +195,9 @@ class CoreAdapter(ABC):
         read in ONE snapshot while the workload keeps writing -- so the journals cut at that
         moment can be compared with both. The markers are streamed to `path` (sorted as text with
         the C collation, one per line, gzip -- as markers_db.txt.gz), never held in memory: a long
-        run at a high rate has millions. Returns {"file", "count", "sha256", "current_orders"}."""
+        run at a high rate has millions. Returns {"file", "count", "sha256", "current_orders",
+        "snapshot_wall"}: the wall time just after the snapshot was taken (its first query), not
+        after the markers were read."""
         raise NotImplementedError(f"engine {self.engine!r}: marker_snapshot is not built")
 
     @abstractmethod

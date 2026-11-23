@@ -101,10 +101,8 @@
 {% for p in v.phases %}<tr><td>{{ p.phase }}</td><td>{{ p.outcome }}</td><td class="mono">{{ p.duration_s }}</td><td>{{ p.error or "" }}</td></tr>{% endfor %}
 </table>
 
-<h2>Disclosures (what this environment and run could not prove)</h2>
-{% if v.disclosures %}<ul class="disc">{% for d in v.disclosures %}<li>{{ d }}</li>{% endfor %}</ul>
-{% else %}<p class="muted">None recorded.</p>{% endif %}
-
+{# Disclosures are not shown on this page (team decision, 20 Nov 2026); every run still records
+   them in results.json and summary.txt (constitution, Principle VII). #}
 <h2>Evidence files</h2>
 <ul>{% for f in v.files %}<li><a href="{{ f }}">{{ f }}</a></li>{% endfor %}</ul>
 

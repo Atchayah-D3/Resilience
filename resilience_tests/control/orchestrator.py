@@ -642,6 +642,7 @@ class TestOrchestrator:
         end = result.end
         self.facts["journal_check"] = {**result.facts.get("journal_check", {}),
                                        "excluded_in_flight_at_init": dict(span.excluded),
+                                       "in_flight_at_validate": dict(span.in_flight_at_validate),
                                        **({"temp_space": result.facts["temp_space"]} if "temp_space" in result.facts else {})}
         markers = dict(end.get("markers") or {})
         markers.update({"lost_of_this_scenario": markers.get("lost_count", 0),
