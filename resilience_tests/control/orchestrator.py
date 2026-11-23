@@ -635,7 +635,8 @@ class TestOrchestrator:
             t = step("database snapshot: reading every marker in the database (all of the common "
                      "workload's, since its start) while the workload keeps writing")
             cut = await attached.cut_off(self.adapter, self.run_dir / VALIDATE_MARKERS_FILE)
-            t = step(f"database snapshot taken: {cut.count:,} markers in {cut.t_after - cut.t_before:.0f} s "
+            read = f" read in {cut.read_s:.0f} s" if cut.read_s is not None else ""
+            t = step(f"database snapshot taken: {cut.count:,} markers{read} "
                      "(then a pause for the last acknowledgements)", since=t)
             attached.copy_span(init, cut, self.run_dir)
             t = step("this scenario's journal lines copied: " + ", ".join(
@@ -662,6 +663,7 @@ class TestOrchestrator:
         end = result.end
         self.facts["journal_check"] = {**result.facts.get("journal_check", {}),
                                        "excluded_in_flight_at_init": dict(span.excluded),
+                                       "in_flight_at_validate": dict(span.in_flight_at_validate),
                                        **({"temp_space": result.facts["temp_space"]} if "temp_space" in result.facts else {})}
         markers = dict(end.get("markers") or {})
         markers.update({"lost_of_this_scenario": markers.get("lost_count", 0),

@@ -348,7 +348,8 @@ def test_only_this_scenarios_journal_lines_are_checked_and_nothing_is_lost(tmp_p
     # the old commits are judged by the two snapshots; only straddle, new, late-ok come from the journals
     assert lines == {"marker.jrnl": 3, "acked.jrnl": 2}
     assert end["rpo_txn"] == 0 and end["phantom"] == 0 and snaps["destroyed"] == 0 and snaps["new"] == 3
-    assert end["markers"]["indeterminate_committed"] == 1          # late-ok: acknowledged after the snapshot, never lost
+    # late-ok committed before the snapshot and was acknowledged just after it: answered, not unknown
+    assert end["markers"]["indeterminate"] == 0 and end["markers"]["indeterminate_committed"] == 0
 
 
 def test_a_commit_destroyed_during_the_scenario_is_lost_however_old(tmp_path):
@@ -593,3 +594,44 @@ def test_a_few_single_slow_transactions_do_not_hide_recovery_but_a_stall_does_no
     stalled = [0] * 59 + [-3000, -3000] + [0] * 65
     start, _ = slo_recovery(_samples(stalled, t0), t0, base, tps_fraction=0.95, tps_window_s=60.0)
     assert start == 61.0                                   # normal only from the second after the stall
+
+
+def test_a_slow_snapshot_read_and_the_transactions_in_flight_at_the_cut_off_are_not_unknown(tmp_path):
+    """As found on a long run (NL-N-I01, 2.1 million markers, an 18.9 s read): the snapshot is
+    taken by its first query, so transactions that start while the markers are read are after the
+    cut-off; those in flight at it are settled by their answer, which comes just after."""
+    folder = folder_with(tmp_path)
+    tb, snap = 2000.0, 2000.005                      # t_before; the snapshot's own moment
+    rows = [("new", 1500, 1501),                     # this scenario's commit: in the snapshot
+            ("inflight-in", 1999.99, 2000.02),       # committed just before the snapshot, acknowledged after
+            ("inflight-out", 1999.99, 2000.03),      # committed just after the snapshot
+            ("never", 1999.99, None),                # in flight, never answered: truly unknown
+            ("during-read", 2010.0, 2010.01)]        # started while the markers were read
+    journals(folder, rows)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_snapshot(run_dir / "init.gz", set())
+    write_snapshot(run_dir / "val.gz", {"new", "inflight-in"})
+    init = CutOff(run_dir / "init.gz", 0, None, 1000.0, 1000.5)
+    val = CutOff(run_dir / "val.gz", 2, None, tb, snap, read_s=18.9)
+    AttachedWorkload(folder, None).copy_span(init, val, run_dir)
+    assert val.lines["marker.jrnl"] == 4                       # "during-read" is after the cut-off
+    assert len(val.late_acked) == 2                            # the two answered after it
+    compare_snapshots(init.file, val.file, run_dir / DB_MARKERS_FILE)
+    span = SpanCheckAdapter(NoJournalCheckEngine(), init, val)
+    end = asyncio.run(endchecks.run_end_checks(span, run_dir, tpcc=None, markers_from_file=True)).end
+    assert end["rpo_txn"] == 0 and end["phantom"] == 0, end
+    assert end["markers"]["indeterminate"] == 1                # only "never"
+    assert span.in_flight_at_validate == {"answered_after_cut_off_not_in_snapshot": 1,
+                                          "answered_after_cut_off_in_snapshot": 1}
+
+
+def test_the_cut_off_is_the_moment_the_snapshot_was_taken_not_the_end_of_reading_it(tmp_path):
+    class SlowRead:
+        async def marker_snapshot(self, path):
+            snap = time.time()
+            await asyncio.sleep(0.3)                           # reading millions of markers
+            return {**write_snapshot(path, {"a"}), "snapshot_wall": snap}
+    w = AttachedWorkload(folder_with(tmp_path), None)
+    cut = asyncio.run(w.cut_off(SlowRead(), tmp_path / "v.gz", settle_s=0))
+    assert cut.t_after - cut.t_before < 0.05 and cut.read_s >= 0.29

@@ -581,10 +581,15 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
         `path` (sorted as text, one per line, gzip -- as markers_db.txt.gz) a batch at a time."""
         import gzip
         import hashlib
+        import time
         conn = await self._connect(timeout_s=60.0, command_timeout=None)
         sha, count = hashlib.sha256(), 0
         try:
             async with conn.transaction(isolation="repeatable_read", readonly=True):
+                # the snapshot is taken by the transaction's first query: this one, so its moment is
+                # known to milliseconds -- reading millions of markers afterwards takes seconds
+                await conn.fetchval("SELECT 1")
+                snapshot_wall = time.time()
                 with gzip.open(path, "wb") as fh:
                     async for r in conn.cursor(f'{SELECT_MARKERS} ORDER BY uuid::text COLLATE "C"', prefetch=10_000):
                         line = (r[0] + "\n").encode()
@@ -595,7 +600,7 @@ class PostgreSQLAdapter(CorruptionMixin, OperationsMixin, SessionsMixin, TpccMix
                 if await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", TPCC_TABLES["district"]):
                     orders = await conn.fetchval(f"SELECT sum(d_next_o_id - 1) FROM {TPCC_TABLES['district']}")
             return {"file": str(path), "count": count, "sha256": sha.hexdigest(),
-                    "current_orders": int(orders) if orders is not None else None}
+                    "current_orders": int(orders) if orders is not None else None, "snapshot_wall": snapshot_wall}
         finally:
             await conn.close()
 

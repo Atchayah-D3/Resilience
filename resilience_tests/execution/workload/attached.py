@@ -65,7 +65,10 @@ JOURNAL_SETTLE_S = 10.0       # after the validate snapshot: acknowledgements of
 # runs -- the clerks abandon one after 10 s).
 SPAN_MARGIN_S = 60.0
 DESTROYED_LIST_MAX = 100     # destroyed markers named in the facts (the count is exact)
-SETTLED_S = 10.0              # before the baseline: this many clean seconds in a row (no drops, reconnects, unknowns)
+SETTLED_S = 10.0
+# A transaction whose marker line is this close before the validate cut-off may still have been
+# running at it (the clerks abandon a transaction after 10 s): its answer may come after the cut-off.
+INFLIGHT_S = 15.0              # before the baseline: this many clean seconds in a row (no drops, reconnects, unknowns)
 TAIL_BYTES = 512 * 1024       # the end of metrics-1s.jsonl read for the recent stretch
 # what is copied from the workload's events.jsonl into the run's stream
 COPIED = {("workload", "sample"), ("workload", "driver_load"), ("workload", "fatal")}
@@ -105,14 +108,21 @@ class CutOff:
     count: int
     current_orders: int | None
     t_before: float                         # acknowledgements before this: committed before the snapshot
-    t_after: float                          # marker lines before this: everything the snapshot can hold
+    t_after: float                          # the snapshot was taken by here: marker lines before this
     sha256: str = ""
     lines: dict[str, int] = field(default_factory=dict)
+    read_s: float | None = None             # how long reading the markers took (after the snapshot)
+    # this scenario's transactions in flight at the cut-off, answered after it (validate only):
+    # raw journal lines, kept so the check can count them as answered, never as "unknown"
+    late_acked: list[bytes] = field(default_factory=list)
+    late_aborted: list[bytes] = field(default_factory=list)
 
     def facts(self) -> dict[str, Any]:
         return {"t_before_wall": round(self.t_before, 3), "t_after_wall": round(self.t_after, 3),
+                "markers_read_s": None if self.read_s is None else round(self.read_s, 3),
                 "markers_file": self.file.name, "markers_in_snapshot": self.count, "sha256": self.sha256,
-                "orders_in_snapshot": self.current_orders, "journal_lines_copied": self.lines}
+                "orders_in_snapshot": self.current_orders, "journal_lines_copied": self.lines,
+                "answered_after_cut_off": {"acked": len(self.late_acked), "aborted": len(self.late_aborted)}}
 
 
 class AttachedWorkload:
@@ -435,11 +445,14 @@ class AttachedWorkload:
         pause, so the acknowledgements of commits from before the snapshot reach the journals."""
         t_before = time.time()
         snap = await adapter.marker_snapshot(path)
-        t_after = time.time()
+        t_read = time.time()
+        # the snapshot's own moment (its first query), not the end of reading every marker: a
+        # transaction that starts while millions of markers are read is after the cut-off
+        t_after = float(snap.get("snapshot_wall") or t_read)
         if settle_s:
             await asyncio.sleep(settle_s)
         return CutOff(Path(path), int(snap["count"]), snap.get("current_orders"), t_before, t_after,
-                      sha256=snap.get("sha256", ""))
+                      sha256=snap.get("sha256", ""), read_s=t_read - t_after)
 
     def copy_span(self, init: CutOff, val: CutOff, run_dir: Path) -> None:
         """This scenario's journal lines, by time, into the run folder under their own names
@@ -456,6 +469,10 @@ class AttachedWorkload:
         lower = init.t_before - SPAN_MARGIN_S
         window = {MARKER_JOURNAL: (lower, val.t_after), ACKED_JOURNAL: (init.t_before, val.t_before),
                   ABORTED_JOURNAL: (lower, val.t_after)}
+        # in flight at the cut-off: a marker line from the last INFLIGHT_S before it; its answer,
+        # if it came after the cut-off, is kept apart (late_acked / late_aborted)
+        in_flight: set[str] = set()
+        val.late_acked, val.late_aborted = [], []
         for name, key in JOURNAL_TIME.items():
             low, high = window[name]
             total = 0
@@ -465,7 +482,8 @@ class AttachedWorkload:
                         if not raw.endswith(b"\n"):
                             break                               # the line still being written
                         try:
-                            t = float(json.loads(raw).get(key) or 0.0)
+                            rec = json.loads(raw)
+                            t = float(rec.get(key) or 0.0)
                         except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError, AttributeError):
                             dst.write(raw)
                             total += 1
@@ -473,6 +491,10 @@ class AttachedWorkload:
                         if low <= t < high:
                             dst.write(raw)
                             total += 1
+                            if name == MARKER_JOURNAL and t >= val.t_before - INFLIGHT_S:
+                                in_flight.add(rec.get("uuid"))
+                        elif t >= high and rec.get("uuid") in in_flight:
+                            (val.late_acked if name == ACKED_JOURNAL else val.late_aborted).append(raw.rstrip(b"\n"))
             if journal_paths(self.folder, name):
                 val.lines[name] = total
 
@@ -540,6 +562,7 @@ class SpanCheckAdapter:
     def __init__(self, adapter: Any, init: CutOff, val: CutOff) -> None:
         self._adapter, self._init, self._val = adapter, init, val
         self.excluded: dict[str, int] = {}
+        self.in_flight_at_validate: dict[str, int] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._adapter, name)
@@ -552,15 +575,22 @@ class SpanCheckAdapter:
     async def journal_check(self) -> Any:
         make = getattr(self._adapter, "journal_check", None)
         inner = await make() if make is not None else endchecks.InMemoryJournalCheck(self._adapter)
-        return _SpanSession(inner, self._init.file, self.excluded)
+        return _SpanSession(inner, self._init.file, self.excluded, self._val, self.in_flight_at_validate)
 
 
 class _SpanSession:
-    """A journal-check session that, just before comparing, removes the lines of uuids that were
-    already in the init snapshot."""
+    """A journal-check session that, just before comparing:
+      - removes the lines of uuids that were already in the init snapshot;
+      - settles the transactions in flight at the validate cut-off that were answered just after
+        it: one that is not in the snapshot committed (or rolled back) after the cut-off and is
+        left out; one that is in it committed before the cut-off, and its acknowledgement (or
+        rollback line) is counted. Neither is an "unknown outcome"; one never answered still is."""
 
-    def __init__(self, inner: Any, init_file: Path, excluded: dict[str, int]) -> None:
+    def __init__(self, inner: Any, init_file: Path, excluded: dict[str, int], val: CutOff | None = None,
+                 in_flight: dict[str, int] | None = None) -> None:
         self._inner, self._init_file, self._excluded = inner, init_file, excluded
+        self._val = val
+        self._in_flight = in_flight if in_flight is not None else {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -582,6 +612,7 @@ class _SpanSession:
                 status = await conn.execute(f"DELETE FROM jc_{kind} j USING jc_init i WHERE j.uuid = i.uuid")
                 self._excluded[kind] = int(status.split()[-1])
             await conn.execute("DROP TABLE jc_init")
+            await self._settle_in_flight_db(conn)
         else:                                                  # in memory (engines without journal_check)
             gone = {"marker": 0, "acked": 0, "aborted": 0}
             for u in _gz_lines(self._init_file):
@@ -589,7 +620,58 @@ class _SpanSession:
                 gone["acked"] += self._inner.acked.pop(u, None) is not None
                 gone["aborted"] += self._inner.aborted.pop(u, None) is not None
             self._excluded.update(gone)
+            self._settle_in_flight_memory()
         await self._inner.prepare()
+
+    def _late_rows(self, kind: str) -> list[tuple[Any, ...]]:
+        lines = (self._val.late_acked if kind == "acked" else self._val.late_aborted) if self._val else []
+        out = []
+        for n, raw in enumerate(lines, 1):
+            try:
+                out.append(endchecks._row(kind, 10_000, n, json.loads(raw), f"answered after the cut-off, line {n}"))
+            except (ValueError, endchecks.JournalLineError):
+                continue
+        return out
+
+    async def _settle_in_flight_db(self, conn: Any) -> None:
+        acked, aborted = self._late_rows("acked"), self._late_rows("aborted")
+        if not acked and not aborted:
+            self._in_flight.update({"answered_after_cut_off_not_in_snapshot": 0, "answered_after_cut_off_in_snapshot": 0})
+            return
+        await conn.execute("CREATE TEMP TABLE jc_late_acked (LIKE jc_acked); CREATE TEMP TABLE jc_late_aborted (LIKE jc_aborted)")
+        if acked:
+            await conn.copy_records_to_table("jc_late_acked", records=acked)      # rows in the table's own column order
+        if aborted:
+            await conn.copy_records_to_table("jc_late_aborted", records=aborted)
+        in_db = "EXISTS (SELECT 1 FROM jc_db d WHERE d.uuid = {a}.uuid)"
+        gone = await conn.execute(f"""DELETE FROM jc_marker m WHERE NOT {in_db.format(a='m')} AND (
+            EXISTS (SELECT 1 FROM jc_late_acked l WHERE l.uuid = m.uuid)
+            OR EXISTS (SELECT 1 FROM jc_late_aborted l WHERE l.uuid = m.uuid))""")
+        kept_a = await conn.execute(f"INSERT INTO jc_acked SELECT * FROM jc_late_acked l WHERE {in_db.format(a='l')}")
+        kept_b = await conn.execute(f"INSERT INTO jc_aborted SELECT * FROM jc_late_aborted l WHERE {in_db.format(a='l')}")
+        await conn.execute("DROP TABLE jc_late_acked; DROP TABLE jc_late_aborted")
+        self._in_flight.update({"answered_after_cut_off_not_in_snapshot": int(gone.split()[-1]),
+                                "answered_after_cut_off_in_snapshot": int(kept_a.split()[-1]) + int(kept_b.split()[-1])})
+
+    def _settle_in_flight_memory(self) -> None:
+        db = set(self._inner._db_rows or []) if getattr(self._inner, "_db_rows", None) is not None else None
+        if db is None:
+            return
+        gone = kept = 0
+        for kind, rows in (("acked", self._late_rows("acked")), ("aborted", self._late_rows("aborted"))):
+            for r in rows:
+                u = r[2]
+                if u not in db:
+                    gone += self._inner.written.pop(u, None) is not None
+                elif kind == "acked":
+                    keys = ("t_ack", "w", "d", "o_id", "ol_cnt", "c_w", "c_d", "c", "amt")
+                    self._inner.acked[u] = {"uuid": u, **{k: v for k, v in zip(keys, r[3:]) if v is not None}}
+                    kept += 1
+                else:
+                    self._inner.aborted[u] = {"uuid": u, "t_abort": r[3]}
+                    kept += 1
+        self._in_flight.update({"answered_after_cut_off_not_in_snapshot": gone, "answered_after_cut_off_in_snapshot": kept})
+
 
 
 INIT_MARKERS_FILE = "markers_db_at_init.txt.gz"

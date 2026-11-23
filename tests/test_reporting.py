@@ -186,7 +186,9 @@ def test_page_shows_every_rule_and_nm_reason(tmp_path):
         assert pred in html
     assert "not measured" in html and "no relation became eligible" in html
     assert "2 of 3 acceptance rules did not pass" in html
-    assert "Disclosure one." in html and "&lt;b&gt;of the instance&lt;/b&gt;" in html   # escaped, shown
+    # disclosures are not on the page (they stay in results.json and summary.txt)
+    assert "Disclosure one." not in html and "Disclosures" not in html
+    assert load_run(d).results["disclosures"][0] == "Disclosure one."
     view = build_run_view(load_run(d), now=NOW)
     nm = next(m for m in view["measures"] if m["name"] == "relations_left_unvacuumed")
     assert nm["kind"] == "not_measured" and nm["display"] == "not measured"
