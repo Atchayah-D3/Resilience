@@ -438,6 +438,9 @@ def _driver_load_step(e: Any, limited: bool, max_cpu: float, max_lag: float,
     if e.get("kind") == "driver_load":
         max_cpu = max([max_cpu, *d.get("cpu_share", [])])
         max_lag = max([max_lag, *d.get("loop_lag_s", [])])
+        # the processes that reported this second: an attached run's events (copied from the
+        # common workload from the init snapshot on) have no "start" event to read the count from
+        processes = max(processes, int(d.get("processes_reporting") or len(d.get("cpu_share", [])) or 1))
     elif e.get("kind") == "fatal" and d.get("driver_limited"):
         limited = True
     elif e.get("kind") == "start":

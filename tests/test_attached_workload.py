@@ -534,6 +534,14 @@ def test_a_kill_scenario_runs_all_nine_phases_attached_and_the_workload_keeps_ru
     copied = [json.loads(x) for x in (run_dir / "events.jsonl").read_text().splitlines()]
     assert sum(1 for e in copied if e["source"] == "workload" and e["kind"] == "sample") > 3
     assert any("Attached to the running common workload" in d for d in results["disclosures"])
+    # validate's steps, in order: the snapshot, the copy, the comparison, the end checks (with
+    # their own steps), then the integrity check
+    steps = [e["data"]["text"] for e in copied if e["kind"] == "validate_step"]
+    firsts = [next(i for i, t in enumerate(steps) if t.startswith(p)) for p in
+              ("database snapshot: reading", "database snapshot taken: ", "this scenario's journal lines copied: ",
+               "snapshots compared", "end checks started", "end checks: sending the marker journals",
+               "end checks done", "integrity check started", "integrity check done")]
+    assert firsts == sorted(firsts), steps
 
 
 def test_the_baseline_waits_until_the_workload_has_settled_after_a_restart(tmp_path):

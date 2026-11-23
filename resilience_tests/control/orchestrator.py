@@ -630,10 +630,18 @@ class TestOrchestrator:
         end checks' result for the TPC-C measures)."""
         attached, init = self.attached, self._init_snapshot
         assert attached is not None and init is not None
+        step = self._validate_step
         try:
+            t = step("database snapshot: reading every marker in the database (all of the common "
+                     "workload's, since its start) while the workload keeps writing")
             cut = await attached.cut_off(self.adapter, self.run_dir / VALIDATE_MARKERS_FILE)
+            t = step(f"database snapshot taken: {cut.count:,} markers in {cut.t_after - cut.t_before:.0f} s "
+                     "(then a pause for the last acknowledgements)", since=t)
             attached.copy_span(init, cut, self.run_dir)
+            t = step("this scenario's journal lines copied: " + ", ".join(
+                f"{name.split('.')[0]} {n:,}" for name, n in sorted(cut.lines.items())), since=t)
             snaps = compare_snapshots(init.file, cut.file, self.run_dir / DB_MARKERS_FILE)
+            t = step("snapshots compared (before the scenario and now)", since=t)
             self.facts["validate_snapshot"] = cut.facts()
             self.facts["markers_db_file"] = snaps["new_file"]
             span = SpanCheckAdapter(self.adapter, init, cut)
@@ -642,9 +650,14 @@ class TestOrchestrator:
                 hooks = attached.tpcc_hooks()
                 tpcc = endchecks.TpccInputs(orders_before=init.current_orders, history_since=hooks.history_since,
                                             warehouses=int((attached.used.get("tpcc") or {}).get("warehouses") or 0))
-            result = await endchecks.run_end_checks(span, self.run_dir, tpcc=tpcc, markers_from_file=True)
+            t = step("end checks started: this scenario's journal lines compared with the database"
+                     + (", then the TPC-C rules on all the data" if tpcc is not None else ""))
+            result = await endchecks.run_end_checks(span, self.run_dir, tpcc=tpcc, markers_from_file=True,
+                                                    step=step)
+            step("end checks done", since=t)
         except Exception as exc:  # noqa: BLE001 -- recorded; the measures then count as missing
             self.facts["markers_error"] = f"{type(exc).__name__}: {exc}"
+            step(f"lost-commit check failed: {type(exc).__name__}: {exc}"[:300])
             return None, None
         end = result.end
         self.facts["journal_check"] = {**result.facts.get("journal_check", {}),
@@ -668,6 +681,18 @@ class TestOrchestrator:
         m["rpo_txn"] = int(end["rpo_txn"]) + snaps["destroyed"]
         m["indeterminate_txn"] = int(markers.get("indeterminate", 0))
         return None, end
+
+    def _validate_step(self, text: str, since: float | None = None) -> float:
+        """One step of validate started or ended, as an event the watch window shows: a validate
+        that takes many minutes (attached: the snapshot, the end checks and pg_amcheck on the whole
+        database while the workload keeps writing) shows which step it is in and how long each
+        took. Evidence only: no measure is read from it. Returns the monotonic time now, for the
+        next call's `since` (the step's duration, took_s)."""
+        now = time.monotonic()
+        if self.stream is not None:
+            self.stream.emit("orchestrator", "validate_step", text=text,
+                             **({"took_s": round(now - since, 1)} if since is not None else {}))
+        return now
 
     def _mark_on_event(self, event: Event) -> None:
         """T0 and T1 into the common workload's marks, at the moment they happened."""
@@ -1104,6 +1129,7 @@ class TestOrchestrator:
         if self.attached is not None:
             journal_problem, workload_end = await self._attached_end_checks(m)
         else:
+            t = self._validate_step("lost-commit check: the database's markers compared with the journals")
             try:
                 db_uuids = await self.adapter.marker_ids()
                 self.facts["markers_db_file"] = write_db_markers(self.run_dir, db_uuids)
@@ -1122,13 +1148,21 @@ class TestOrchestrator:
                 else:
                     m["rpo_txn"] = diff.rpo_txn
                     m["indeterminate_txn"] = len(diff.indeterminate)
+                self._validate_step("lost-commit check done", since=t)
             except Exception as exc:  # noqa: BLE001 -- recorded; the measure then counts as missing
                 self.facts["markers_error"] = f"{type(exc).__name__}: {exc}"
+                self._validate_step(f"lost-commit check failed: {type(exc).__name__}: {exc}"[:300])
 
         await self.fault_behaviour.before_integrity_check()
 
+        integrity_limit_s = self.profile.phase_timeouts_s["validate"] / 2
+        t = self._validate_step(f"integrity check started on the whole database (at most {integrity_limit_s:.0f} s)")
         try:
-            integrity = await self.adapter.integrity_check(timeout_s=self.profile.phase_timeouts_s["validate"] / 2)
+            integrity = await self.adapter.integrity_check(timeout_s=integrity_limit_s)
+            self._validate_step("integrity check done: " + ", ".join(
+                f"{'not known' if n is None else n} {what}" for what, n in
+                (("structural errors", integrity.structural_errors),
+                 ("checksum failures", integrity.checksum_failures))), since=t)
             raw = (integrity.raw_output or "").strip()
             (self.run_dir / INTEGRITY_FILE).write_text(f"{raw}\n" if raw else "pg_amcheck run clean (exit 0)\n")
             # A capability the engine lacks is NOT_APPLICABLE, never zero: a criterion that
@@ -1160,11 +1194,14 @@ class TestOrchestrator:
                 m["corruption_count"] = sum(parts.values())
         except Exception as exc:  # noqa: BLE001 -- recorded; the measure then counts as missing
             self.facts["integrity_error"] = f"{type(exc).__name__}: {exc}"
+            self._validate_step(f"integrity check failed: {type(exc).__name__}: {exc}"[:300], since=t)
 
         # Transaction history checked by Elle (Arch §10.3, §17). Only a list-append history
         # with real reads is checkable; a run without one records no Elle result at all.
         if self.scenario.workload.history == "list_append":
+            t = self._validate_step("Elle check of the transaction history started")
             elle = ElleChecker.check(self.run_dir / HISTORY_FILE, self.run_dir / ELLE_DIR)
+            self._validate_step("Elle check done", since=t)
             self.facts["elle"] = {k: v for k, v in asdict(elle).items() if k != "raw_output"}
             (self.run_dir / ELLE_DIR).mkdir(exist_ok=True)
             (self.run_dir / ELLE_DIR / "elle-cli.out").write_text(elle.raw_output + "\n")
@@ -1179,7 +1216,9 @@ class TestOrchestrator:
             during_measures, fault_not_landed = await self.during_behaviour.verify(events)
             m.update(during_measures)
 
+        t = self._validate_step("the fault's own measures")
         m.update(await self.fault_behaviour.measure(events))
+        self._validate_step("the fault's own measures done", since=t)
         # The workload profile's own checks after the fault (TPC-C: partial commits, rolled-back
         # transactions kept, consistency rules). A check it could not run is NOT_MEASURED, with why.
         if workload_end is not None:
@@ -1188,8 +1227,10 @@ class TestOrchestrator:
             workload_facts = workload_end.get("tpcc_facts") or {}
             workload_reasons = dict(workload_end.get("_not_measured") or {})
         else:
+            t = self._validate_step("the workload's checks (TPC-C: partial commits, consistency rules)")
             measures, workload_facts, workload_reasons = split_checks(
                 await self.workload_hooks.consistency_checks(self.adapter, self.run_dir))
+            self._validate_step("the workload's checks done", since=t)
         m.update(measures)
         for name, why in workload_reasons.items():
             m[name] = NOT_MEASURED
