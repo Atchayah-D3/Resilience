@@ -153,6 +153,7 @@ def build_run_view(ev: RunEvidence, now: dt.datetime | None = None) -> dict[str,
         "rules_have_reasons": any(x.get("reason") for x in rules),
         "measures_have_reasons": any(m.get("reason") for m in measures),
         "phases_have_errors": any(p.get("error") for p in phases),
+        "timeline_has_cycles": any(m.get("cycle") is not None for m in timeline),   # repeated faults only
         "cycle_columns": cols, "cycle_rows": cycle_rows,
         "during": facts.get("during"), "during_verification": facts.get("during_verification"),
         "disclosures": list(r.get("disclosures") or []),

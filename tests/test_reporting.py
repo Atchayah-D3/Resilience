@@ -337,3 +337,10 @@ def test_the_page_leaves_out_what_does_not_apply_and_empty_columns(tmp_path):
     assert "mttd_s" not in html                                   # not measured, no rule uses it: results.json only
     assert load_run(d).results["measured"]["mttd_s"] == "NOT_MEASURED"
     assert "<th>Reason</th>" not in html and "<th>Error</th>" not in html and "Why not measured" not in html
+
+
+def test_the_cycle_column_is_drawn_only_for_a_repeated_fault(tmp_path):
+    """Key moments: a fault injected once has no cycle, so the column is not drawn."""
+    d = write_run(tmp_path, status="passed", rules=[PASS_RULE], measured={"rpo_txn": 0})
+    html = render_run(d, now=NOW).read_text()
+    assert "<th style=\"width:70px\">cycle</th>" not in html

@@ -45,9 +45,9 @@
 
 <h2>Key moments</h2>
 {% if v.timeline %}
-<table><tr><th style="width:90px">t (s)</th><th style="width:70px">cycle</th><th>event</th></tr>
+<table><tr><th style="width:90px">t (s)</th>{% if v.timeline_has_cycles %}<th style="width:70px">cycle</th>{% endif %}<th>event</th></tr>
 {% for m in v.timeline if m.kind != "phase" %}
-<tr><td class="mono">{{ m.t_s }}</td><td>{{ m.cycle if m.cycle is not none else "" }}</td>
+<tr><td class="mono">{{ m.t_s }}</td>{% if v.timeline_has_cycles %}<td>{{ m.cycle if m.cycle is not none else "" }}</td>{% endif %}
   <td class="m-{{ m.kind }}">{{ m.label }}</td></tr>
 {% endfor %}</table>
 {% else %}<p class="muted">No events were recorded.</p>{% endif %}
