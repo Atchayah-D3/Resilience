@@ -4,6 +4,22 @@
 <h1>{{ title }}</h1>
 <div class="muted">{% for status, n in counts %}<span class="badge s-{{ status }}">{{ status | replace("_", " ") }}: {{ n }}</span> {% endfor %}</div>
 {% if gate_text %}<pre>{{ gate_text }}</pre>{% endif %}
+{% if workload %}
+<h2>Common workload (one for the whole session)</h2>
+<div class="grid">
+  <div><b>Workload</b> {{ workload.profile }}, {{ workload.clerks }} clerks, {{ workload.rate_tps }} TPS{% if workload.warehouses %}, {{ workload.warehouses }} warehouses{% endif %}</div>
+  <div><b>Folder</b> <span class="mono">{{ workload.folder }}</span></div>
+  <div><b>Stopped by this session</b> {{ "yes" if workload.started_here else "no (it was already running)" }}{% if workload.state %} &middot; final state {{ workload.state }}{% endif %}</div>
+  {% if workload.grafana_link %}<div><a href="{{ workload.grafana_link }}">the whole session in Grafana</a></div>{% endif %}
+</div>
+{% if workload.state %}<p>Its own end checks over the whole session:
+  lost commits {{ workload.end_checks.rpo_txn }}, phantoms {{ workload.end_checks.phantom }},
+  partial commits {{ workload.end_checks.partial_commits }}, TPC-C rule violations {{ workload.end_checks.tpcc_consistency_violations }}
+  (details: summary.txt in its folder).</p>{% endif %}
+{% if workload.unhealthy %}<div class="banner err">{{ workload.unhealthy }}</div>{% endif %}
+{% for p in workload.problems %}<div class="banner err">{{ p }}</div>{% endfor %}
+<h2>Scenarios</h2>
+{% endif %}
 <table><tr><th>Scenario</th><th>Priority</th><th>Status</th><th>Run</th><th>Details</th></tr>
 {% for r in rows %}{% set c = r.c %}
 <tr><td><b>{{ c.scenario_id }}</b> <span class="muted">{{ c.name }}</span><div class="muted mono">{{ c.case_id }}</div></td>

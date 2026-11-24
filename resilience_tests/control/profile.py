@@ -195,6 +195,9 @@ class Observability(_Model):
     # exporter ports on every node, by Prometheus job name (scrape_config.py builds the targets)
     exporters: dict[str, int] = Field(default_factory=lambda: {"node": 9100, "postgres": 9187})
     scrape_interval_s: float = Field(default=1.0, gt=0)   # Arch §9: 1 s during test windows
+    # also copy the run window's series into the run folder (metrics.json). Off by default: the
+    # same data is on the dashboards (Prometheus keeps 15 days); turn on to keep it with the run.
+    save_metrics_snapshot: bool = False
 
 
 class EnvProfile(_Model):

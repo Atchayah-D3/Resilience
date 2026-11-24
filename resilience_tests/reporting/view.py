@@ -97,7 +97,7 @@ def build_run_view(ev: RunEvidence, now: dt.datetime | None = None) -> dict[str,
         notes.append("No result was recorded for this run (results.json missing or unreadable): "
                      "the harness stopped before it could write one. Nothing here is a verdict.")
     if ev.events_missing:
-        notes.append("events.jsonl is missing: no timeline or charts can be shown.")
+        notes.append("events.jsonl is missing: no key moments can be shown.")
     if ev.malformed_event_lines:
         notes.append(f"{ev.malformed_event_lines} unreadable line(s) in events.jsonl were skipped.")
 
@@ -110,7 +110,8 @@ def build_run_view(ev: RunEvidence, now: dt.datetime | None = None) -> dict[str,
         rules.append({
             "predicate": res.get("predicate"), "outcome": res.get("outcome"),
             "values": [{"name": k, **classify(v)} for k, v in (res.get("values") or {}).items()],
-            "margin": None if res.get("margin") is None else _fmt_float(float(res["margin"])),
+            "margin": None if res.get("margin") is None else _fmt_float(float(res["margin"]) + 0.0)
+                      if abs(float(res["margin"])) >= 5e-4 else "0",
             "reason": res.get("reason"),
         })
     measures = []
@@ -121,8 +122,14 @@ def build_run_view(ev: RunEvidence, now: dt.datetime | None = None) -> dict[str,
     for name in facts.get("declared_not_produced") or []:
         measures.append({"name": name, "kind": "missing", "display": "not produced",
                          "reason": "declared by the scenario but not produced by this run"})
+    # A measure that does not apply to this target (failover steps on a standalone node) is not
+    # shown; one that was not measured and that no acceptance rule uses goes to a short note --
+    # a not-measured value a rule depends on is still in the table, and fails that rule.
+    gated = {x["name"] for rule in rules for x in rule["values"]}
+    not_used = [m for m in measures if m["kind"] in ("not_measured", "missing") and m["name"] not in gated]
+    measures = [m for m in measures if m["kind"] != "not_applicable" and m not in not_used]
 
-    timeline, charts = build_timeline_and_charts(ev)
+    timeline, _charts = build_timeline_and_charts(ev)        # the charts are Grafana's now
     cycles = facts.get("cycles") or []
     cols = [c for c in CYCLE_COLUMNS if any(c in row for row in cycles)]
     cycle_rows = [[_cell(row.get(c)) for c in cols] for row in cycles]
@@ -142,7 +149,10 @@ def build_run_view(ev: RunEvidence, now: dt.datetime | None = None) -> dict[str,
         "duration": classify(total_s)["display"] if total_s else "",
         "phases": phases, "rules": rules,
         "rules_failed": sum(1 for x in rules if x["outcome"] != "pass"),
-        "measures": measures, "timeline": timeline, "charts": charts,
+        "measures": measures, "not_measured_ungated": not_used, "timeline": timeline,
+        "rules_have_reasons": any(x.get("reason") for x in rules),
+        "measures_have_reasons": any(m.get("reason") for m in measures),
+        "phases_have_errors": any(p.get("error") for p in phases),
         "cycle_columns": cols, "cycle_rows": cycle_rows,
         "during": facts.get("during"), "during_verification": facts.get("during_verification"),
         "disclosures": list(r.get("disclosures") or []),
@@ -194,6 +204,9 @@ def build_timeline_and_charts(ev: RunEvidence) -> tuple[list[dict[str, Any]], li
                             "label": f"T1: {d.get('action', '')}", "cycle": None})
         elif k == "run_end":
             markers.append({"t_s": sec(_t(e)), "kind": "run_end", "label": "run end", "cycle": None})
+        elif k == "fault_milestone":
+            markers.append({"t_s": sec(int(d.get("at_mono_ns") or _t(e))), "kind": "milestone",
+                            "label": str(d.get("text") or ""), "cycle": None})
 
     # Outage and recovery exactly as the run measured them (analysis/rto_decomposer.py) -- the
     # report never applies a rule of its own. Outage seen: the first failed write probe whose
@@ -211,11 +224,11 @@ def build_timeline_and_charts(ev: RunEvidence) -> tuple[list[dict[str, Any]], li
         down = next((e for e in probes if not (e.get("data") or {}).get("ok")
                      and t0 <= int((e.get("data") or {}).get("t_start_mono_ns") or _t(e)) < nxt), None)
         if down is None:
-            markers.append({"t_s": sec(t0), "kind": "note", "cycle": cyc,
-                            "label": "no failed write probe after this fault (outage not observed)"})
-        else:
-            markers.append({"t_s": sec(_t(down)), "kind": "outage_start", "cycle": cyc,
-                            "label": "outage seen (first write probe that failed)"})
+            # no outage (a lock pile-up, a reload, ...): nothing to show for it -- an outage a
+            # fault must cause but did not is judged by the run's own measures, not by this page
+            continue
+        markers.append({"t_s": sec(_t(down)), "kind": "outage_start", "cycle": cyc,
+                        "label": "outage seen (first write probe that failed)"})
         rec = recovery_by_cycle.get(cyc) if cyc is not None else single
         if _is_num(rec):
             markers.append({"t_s": sec(int(t0 + rec * 1e9)), "kind": "recovered", "cycle": cyc,

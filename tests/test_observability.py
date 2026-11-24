@@ -69,9 +69,10 @@ class FakePrometheus(PrometheusClient):
         return [{"metric": {"node": NODE.name}, "values": [[start_s, "1"], [end_s, "2"]]}]
 
 
-def observer(grafana=None, prometheus=None) -> StackObserver:
+def observer(grafana=None, prometheus=None, save_metrics=True) -> StackObserver:
     assert LAB.observability is not None
-    return StackObserver(LAB.observability, env=LAB.name, node=NODE, run_id="NL-N-I03a-run1", scenario="NL-N-I03a",
+    config = LAB.observability.model_copy(update={"save_metrics_snapshot": save_metrics})
+    return StackObserver(config, env=LAB.name, node=NODE, run_id="NL-N-I03a-run1", scenario="NL-N-I03a",
                          grafana=grafana or FakeGrafana(), prometheus=prometheus or FakePrometheus())
 
 
@@ -160,6 +161,13 @@ def test_the_run_windows_metrics_are_copied_into_the_run_folder(tmp_path):
     assert doc["series"]["commits_per_s"]["query"] == expected and 'datname="resilience"' in expected
     assert facts["metrics_empty"] == ["checkpoints_per_min"]    # reported, not hidden
     assert "never used in the verdict" in doc["note"]
+
+
+def test_by_default_the_metrics_stay_on_the_dashboards_and_no_copy_is_written(tmp_path):
+    _, facts = run(a_run(observer(save_metrics=False), tmp_path))
+    assert not (tmp_path / METRICS_FILE).exists() and "metrics_file" not in facts
+    assert facts["grafana_link"].startswith("http://grafana:3000/d/resilience-run?")
+    assert LAB.observability is not None and LAB.observability.save_metrics_snapshot is False
 
 
 def test_grafana_down_is_disclosed_and_the_metrics_are_still_kept(tmp_path):
@@ -275,7 +283,7 @@ def test_a_run_with_the_stack_gets_markers_metrics_and_a_report_link(env, monkey
     assert texts[0].startswith("run start: NL-C-01") and "T0: fault injected" in texts
     assert sum(t.startswith("phase: ") for t in texts) >= 8 and texts[-1].startswith("NL-C-01: passed")
     obs = results["facts"]["observability"]
-    assert obs["metrics_file"] == METRICS_FILE and Path(results["evidence_dir"], METRICS_FILE).exists()
+    assert "metrics_file" not in obs and not Path(results["evidence_dir"], METRICS_FILE).exists()   # off by default
     from resilience_tests.reporting.html import render_run
     page = render_run(results["evidence_dir"]).read_text()
     assert "open this run in Grafana" in page and obs["grafana_link"].split("?")[0] in page

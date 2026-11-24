@@ -18,9 +18,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     g.addoption("--tpcc-warehouses", action="store", type=int, default=None,
                 help="run the scenarios with the TPC-C workload (this many warehouses; the run loads them "
                      "if needed) in place of their own; disclosed in every report (TPC-C build steps 7, 10)")
+    g.addoption("--common-workload", action="store", default=None, metavar="SETTINGS",
+                help="start ONE common workload with this settings file (e.g. workloads/attach-check.yaml) for the "
+                     "whole session, attach every scenario to it, stop it once at the end (specs/007)")
     g.addoption("--attach-workload", action="store_true",
-                help="attach every scenario to the common workload already running on the target (specs/007) "
-                     "instead of starting its own; refused when none runs or it is not the one a scenario needs")
+                help="attach every scenario to the common workload already running on the target, and leave it "
+                     "running at the end; refused when none runs or it is not the one a scenario needs")
+    g.addoption("--cooldown", action="store", type=float, default=60.0,
+                help="with a common workload: seconds between two scenarios (default 60)")
+    g.addoption("--workload-health-wait", action="store", type=float, default=600.0,
+                help="with a common workload: seconds to wait for it to be healthy before each scenario (default 600)")
     g.addoption("--tpcc-fresh-load", action="store_true",
                 help="TPC-C runs load the data again before the baseline even when it is fine (default: only "
                      "when missing, of another size, grown or changed); disclosed in the report")

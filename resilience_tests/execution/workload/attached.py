@@ -437,6 +437,8 @@ class AttachedWorkload:
             low, high = window[name]
             total = 0
             for path in journal_paths(self.folder, name):
+                if path.stat().st_size == 0:
+                    continue                                    # a journal the workload never wrote to
                 with path.open("rb") as src, (run_dir / path.name).open("wb") as dst:
                     for raw in src:
                         if not raw.endswith(b"\n"):

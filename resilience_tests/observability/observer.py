@@ -212,7 +212,7 @@ class StackObserver(RunObserver):
                 facts["annotations"] = {"sent": self.sent, "failed": self.failed}
                 if self.failed:
                     self.problems.append(f"{self.failed} run marker(s) were not stored in Grafana ({self.last_error})")
-            if self._prometheus_ok:
+            if self._prometheus_ok and self.config.save_metrics_snapshot:
                 facts.update(await asyncio.wait_for(self._snapshot(run_dir, start_wall_s, end_wall_s),
                                                     SNAPSHOT_TIMEOUT_S))
         except Exception as exc:  # noqa: BLE001 -- never at the cost of the run's own evidence

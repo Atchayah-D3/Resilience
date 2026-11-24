@@ -226,33 +226,26 @@ def test_repeated_faults_get_one_recovery_line_each_at_t0_plus_cycle_recovery(tm
     view = build_run_view(load_run(write_run(tmp_path, events=events)), now=NOW)
     rec = [m for m in view["timeline"] if m["kind"] == "recovered"]
     assert [m["t_s"] for m in rec] == [12.5, 42.5] and [m["cycle"] for m in rec] == [1, 2]
-    assert all(m["kind"] in ("fault", "recovered") for ch in view["charts"] for m in ch["markers"])
 
 
-def test_charts_are_throughput_and_latency_with_y_axis_numbers(tmp_path):
-    events = [ev("run_start", 0)] + [ev("sample", t, "workload", tps=200, p99_ms=40, journal_p99_ms=5)
-                                     for t in range(1, 60)]
-    charts = build_run_view(load_run(write_run(tmp_path, events=events)), now=NOW)["charts"]
-    assert [c["title"] for c in charts] == ["Throughput (committed transactions / s)", "Latency (ms, p99 per second)"]
-    assert [t["label"] for t in charts[0]["yticks"]] == ["0", "50", "100", "150", "200"]
-    html = render_run(write_run(tmp_path, events=events, name="r2"), now=NOW).read_text()
-    assert ">150</text>" in html and "Failed write probes" not in html
+def test_the_page_has_no_charts_and_lists_the_key_moments(tmp_path):
+    """The charts are Grafana's now: the page lists the key moments, not every phase."""
+    events = [ev("run_start", 0), ev("phase_start", 1, phase="baseline"),
+              ev("t0", 2, "injector", t0_mono_ns=BASE + 2 * S, action="lock_pileup"),
+              ev("fault_milestone", 3, text="schema change issued"),
+              ev("t1", 8, t1_mono_ns=BASE + 8 * S, action="lock queue cleared"), ev("run_end", 9)]
+    html = render_run(write_run(tmp_path, events=events), now=NOW).read_text()
+    assert "<svg" not in html and "Annotated timeline" not in html and "Key moments" in html
+    assert "schema change issued" in html and "T1: lock queue cleared" in html
+    assert "phase: baseline" not in html.split("Key moments")[1].split("</table>")[0]
 
 
 def test_fault_without_failed_probe_is_noted_not_invented(tmp_path):
     events = [ev("run_start", 0), ev("t0", 5, "injector", t0_mono_ns=BASE + 5 * S, action="reload"),
               ev("write_probe", 6, "write_prober", ok=True, t_start_mono_ns=BASE + 6 * S)]
     tl = build_run_view(load_run(write_run(tmp_path, events=events)), now=NOW)["timeline"]
-    assert not any(m["kind"] in ("outage_start", "first_write") for m in tl)
-    assert any("outage not observed" in m["label"] for m in tl)
-
-
-def test_long_run_series_is_downsampled(tmp_path):
-    events = [ev("run_start", 0)] + [ev("sample", t, "workload", tps=200, p99_ms=t % 7, journal_p99_ms=1)
-                                     for t in range(5000)]
-    charts = build_run_view(load_run(write_run(tmp_path, events=events)), now=NOW)["charts"]
-    s = charts[0]["series"][0]
-    assert len(s["points"]) <= MAX_POINTS and s["downsampled"] is True
+    assert not any(m["kind"] in ("outage_start", "first_write", "recovered") for m in tl)
+    assert not any("outage" in m["label"] for m in tl)          # no outage: nothing about one is shown
 
 
 def test_missing_results_page_says_no_result(tmp_path):
@@ -330,3 +323,17 @@ def test_a_run_page_that_cannot_be_copied_is_still_linked_at_its_original_place(
     missing = tmp_path / "gone" / "report.html"
     assert collector._copy_run_report({"results": str(tmp_path / "run"), "report": str(missing)}) == str(missing)
     assert collector.lines and "not copied" in collector.lines[0]
+
+
+def test_the_page_leaves_out_what_does_not_apply_and_empty_columns(tmp_path):
+    """Failover steps on a standalone node are not shown; a not-measured value no rule uses is a
+    one-line note; empty Reason and Error columns are not drawn. A rule's own not-measured value
+    stays in the table, and fails that rule."""
+    d = write_run(tmp_path, status="passed", rules=[PASS_RULE],
+                  measured={"rpo_txn": 0, "t_elect_s": "NOT_APPLICABLE", "mttd_s": "NOT_MEASURED"},
+                  not_measured={"mttd_s": "no detection line in the log"})
+    html = render_run(d, now=NOW).read_text()
+    assert "t_elect_s" not in html
+    assert "mttd_s" not in html                                   # not measured, no rule uses it: results.json only
+    assert load_run(d).results["measured"]["mttd_s"] == "NOT_MEASURED"
+    assert "<th>Reason</th>" not in html and "<th>Error</th>" not in html and "Why not measured" not in html

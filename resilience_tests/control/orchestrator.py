@@ -638,7 +638,12 @@ class TestOrchestrator:
             result = await endchecks.run_end_checks(span, self.run_dir, tpcc=tpcc, markers_from_file=True)
         except Exception as exc:  # noqa: BLE001 -- recorded; the measures then count as missing
             self.facts["markers_error"] = f"{type(exc).__name__}: {exc}"
-            return None, None
+            return None, None          # the snapshot files are kept: the evidence of what went wrong
+        # The two full snapshots (the whole marker table, twice) are not kept once compared: their
+        # count and SHA-256 are in the facts, and what this run is judged on -- the markers that
+        # appeared during it (markers_db.txt.gz) and its journal lines -- stays in the run folder.
+        for snapshot in (init.file, cut.file):
+            snapshot.unlink(missing_ok=True)
         end = result.end
         self.facts["journal_check"] = {**result.facts.get("journal_check", {}),
                                        "excluded_in_flight_at_init": dict(span.excluded),

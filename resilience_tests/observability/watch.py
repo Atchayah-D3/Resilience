@@ -226,12 +226,15 @@ def workload_progress(root: Path) -> str | None:
         s = json.loads((folder / "status.json").read_text())
     except (OSError, ValueError):
         return f"common workload {folder.name}: starting"
-    if s.get("state") in ("stopped", "finished", "failed"):
-        return None
+    state = s.get("state")
+    if state in ("stopped", "finished", "failed"):
+        why = f": {s['failure']}" if s.get("failure") else ""
+        return f"common workload {folder.name}: {state}{why} -- its end checks are done (summary.txt in its folder)"
     last = s.get("last_interval") or {}
+    # figures only while its clerks run: after the stop, the last interval is no longer live
     figures = (f", {last['tps']:.1f} TPS, p99 {last.get('p99_ms') or 0:.0f} ms"
-               if isinstance(last.get("tps"), (int, float)) else "")
-    return f"common workload {folder.name}: {s.get('state')} ({s.get('step')}){figures}"
+               if state in ("warming_up", "running") and isinstance(last.get("tps"), (int, float)) else "")
+    return f"common workload {folder.name}: {state} ({s.get('step')}){figures}"
 
 
 def in_progress(run_dir: Path) -> bool:
@@ -275,9 +278,13 @@ def main(argv: list[str] | None = None) -> int:
                 if run_dir is not None and (not (args.next or args.keep or before) or run_dir != before):
                     break
                 progress = workload_progress(root)        # while the scenario waits for the workload
-                if progress and (progress.split(",")[0] != said or time.time() - last_said >= 30):
+                ended = progress is not None and "end checks are done" in progress
+                if progress and (progress.split(",")[0] != said or (time.time() - last_said >= 30 and not ended)):
                     print(f"{_clock(time.time())}  {progress}", flush=True)
                     said, last_said = progress.split(",")[0], time.time()
+                    if ended and args.keep:
+                        print("  (the session is over when pytest has printed its summary; Ctrl-C ends this watch)",
+                              flush=True)
                 time.sleep(1)
             follow(run_dir, args.every)
             if not args.keep:

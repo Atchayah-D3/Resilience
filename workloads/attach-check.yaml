@@ -1,7 +1,8 @@
 # The common workload for the first live checks of the attach story (specs/007) on e2-u22-3:
 # the data already loaded there (283 warehouses, so nothing is reloaded) at a fixed 60 TPS (no
 # capacity record needed), running until the suite runner stops it.
-#   python -m resilience_tests.control.suite --env e2-u22-3 --workload workloads/attach-check.yaml --scenario NL-N-I03a
+#   pytest resilience_tests/test_scenarios.py --env e2-u22-3 --common-workload workloads/attach-check.yaml \
+#       --scenario NL-N-I03a --scenario NL-N-I03b -q -rA
 id: attach-check
 description: >-
   TPC-C at 60 TPS on the loaded data, for checking scenarios attached to the common workload.

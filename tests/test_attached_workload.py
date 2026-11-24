@@ -552,3 +552,18 @@ def test_the_cut_off_is_the_moment_the_snapshot_was_taken_not_the_end_of_reading
     w = AttachedWorkload(folder_with(tmp_path), None)
     cut = asyncio.run(w.cut_off(SlowRead(), tmp_path / "v.gz", settle_s=0))
     assert cut.t_after - cut.t_before < 0.05 and cut.read_s >= 0.29
+
+
+def test_a_run_keeps_only_the_files_it_is_judged_on(env, tmp_path, monkeypatch):
+    """After validate: the two full snapshots are removed (their count and SHA-256 stay in the
+    facts), no metrics.json, no empty journals; the run's own evidence is all there."""
+    # reuse the attached kill-scenario run, then look at its folder
+    test_a_kill_scenario_runs_all_nine_phases_attached_and_the_workload_keeps_running(env, tmp_path, monkeypatch)
+    runs = [p for p in Path(env.driver_host.run_dir).iterdir() if p.name.startswith("NL-C-01-")]
+    assert len(runs) == 1
+    names = {p.name for p in runs[0].iterdir()}
+    assert not {"markers_db_at_init.txt.gz", "markers_db_at_validate.txt.gz", "metrics.json"} & names, names
+    assert all(p.stat().st_size > 0 for p in runs[0].glob("*.jrnl"))      # no empty journal copied
+    assert {"results.json", "summary.txt", "events.jsonl", "integrity.txt", "markers_db.txt.gz"} <= names, names
+    facts = json.loads((runs[0] / "results.json").read_text())["facts"]
+    assert facts["init_snapshot"]["sha256"] and facts["validate_snapshot"]["markers_in_snapshot"] > 0

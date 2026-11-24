@@ -115,7 +115,14 @@ class ReportCollector:
         decision = gate.decide(gate.read_cases(xml))
         gate_text = gate.render(decision)
         (self.dir / "gate.txt").write_text(gate_text + "\n")
-        index = render_index(cases, self.dir / "index.html", gate_text=gate_text)
+        workload = None
+        try:
+            from resilience_tests.control.common_workload import COMMON_WORKLOAD_KEY
+            common = self.config.stash.get(COMMON_WORKLOAD_KEY, None) if COMMON_WORKLOAD_KEY else None
+            workload = common.summary() if common is not None else None
+        except Exception as exc:  # noqa: BLE001 -- the page is a view; never at the cost of the reports
+            self.lines.append(f"common workload not summarised on the index: {type(exc).__name__}: {exc}")
+        index = render_index(cases, self.dir / "index.html", gate_text=gate_text, workload=workload)
         self.lines += [f"report folder:      {self.dir}",
                        f"scenario JUnit XML: {xml}", f"scenario index:     {index}",
                        f"run reports:        {sum(1 for c in cases if c.report_path)} of {len(cases)} cases",

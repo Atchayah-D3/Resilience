@@ -73,6 +73,15 @@ Behaviour comes only from catalog fields:
 .venv/bin/pytest resilience_tests/test_scenarios.py --env e2-dedicated-vm --scenario NL-C-01 -q -rA
 #   --scenario is repeatable; --stop-before-fault = dry run with no fault and no verdict
 
+# the standard way with the common workload (specs/007): ONE workload for the whole session,
+# every scenario attached to it in the order given, 60 s cooldown + health check between them,
+# the workload stopped once at the end (also on failure or Ctrl-C); reports/<time>/index.html
+# shows every scenario and the workload's own end verdict
+.venv/bin/pytest resilience_tests/test_scenarios.py --env e2-u22-3 --common-workload workloads/attach-check.yaml \
+    --scenario NL-N-I03a --scenario NL-N-I03b -q -rA
+#   --attach-workload instead: use a workload already running (and leave it running)
+# follow it in another terminal: .venv/bin/python -m resilience_tests.observability.watch --keep
+
 # undo anything a crashed run left applied
 .venv/bin/python -m resilience_tests.control.killswitch --env e2-dedicated-vm
 

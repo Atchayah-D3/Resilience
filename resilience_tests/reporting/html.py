@@ -50,7 +50,8 @@ def _rel(target: str | None, base: Path) -> str | None:
 
 
 def render_index(cases: list[ReportCase], path: Path | str, title: str = "Scenario runs",
-                 now: dt.datetime | None = None, gate_text: str | None = None) -> Path:
+                 now: dt.datetime | None = None, gate_text: str | None = None,
+                 workload: dict[str, Any] | None = None) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = [{"c": c, "link": _rel(c.report_path, path.parent)} for c in cases]
@@ -58,7 +59,7 @@ def render_index(cases: list[ReportCase], path: Path | str, title: str = "Scenar
     for c in cases:
         counts[c.status] = counts.get(c.status, 0) + 1
     html = env().get_template("index.html.j2").render(
-        title=title, rows=rows, counts=sorted(counts.items()), gate_text=gate_text,
+        title=title, rows=rows, counts=sorted(counts.items()), gate_text=gate_text, workload=workload,
         generated_at=(now or dt.datetime.now(dt.UTC)).strftime("%Y-%m-%d %H:%M:%S UTC"))
     path.write_text(html, encoding="utf-8")
     return path
