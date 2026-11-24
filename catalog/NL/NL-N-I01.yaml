@@ -26,14 +26,17 @@
 # running workload's.
 #
 # Invalid (stopped, never a pass): the login cannot log in or allows fewer sessions than needed; a limit
-# the limit tests need is not set; the customers' baseline cache hit ratio is below 99%; the baseline
-# missed the planned rate; the reports cannot occupy every core.
+# the limit tests need is not set; pg_stat_statements is not installed and loaded; the customers'
+# baseline cache hit ratio is below 99%; the baseline missed the planned rate; the reports cannot
+# occupy every core.
 #
 # Judged (document section 9):
 #   1 fault_confirmed: at minute 1 every report session active, helpers working
 #   2 oltp_tps_ratio >= 0.70 and 3 oltp_p99_ratio <= 2.0           Framework §10.6 NL-N-07
 #   4 customer_p90_max_s <= 5.0: 90% of New-Order, Payment, Order-Status within 5 s (TPC-C Clause 5.2.5.3)
 #   5 customer_cache_hit_ratio_vs_baseline >= 0.80                  Framework §10.6 NL-N-07
+#     (the pages of the customers' own TPC-C calls on every table, order_line and orders included,
+#     from pg_stat_statements for their login)
 #   6 helpers_over_limit == 0: no report has more helpers than the login allows
 #   7 temp_limit_enforced (53400) and 8 statement_timeout_enforced (57014 within 1 s; NEEDS SIGN-OFF)
 #   9 customer_limit_errors == 0: no customer stopped by 53300, 53400 or 57014

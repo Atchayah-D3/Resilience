@@ -24,6 +24,7 @@ from resilience_tests.execution.workload.attached import (
     CutOff,
     SpanCheckAdapter,
     compare_snapshots,
+    payment_check_since,
 )
 from resilience_tests.execution.workload.histogram import latency_histogram
 from resilience_tests.execution.workload.markers import DB_MARKERS_FILE
@@ -408,6 +409,21 @@ def test_the_tpcc_checks_start_from_the_workloads_own_start(tmp_path):
     hooks = AttachedWorkload(folder_with(tmp_path), None).tpcc_hooks()
     assert hooks.orders_at_prepare == 1000 and hooks.history_since.year == 2026
     assert hooks.workload.tpcc.warehouses == 64
+
+
+def test_the_payment_check_reads_the_history_from_just_before_the_init_snapshot_not_the_workloads_start(tmp_path):
+    # the review of 21 Nov: from the workload's start, that history grows with every hour and scenario
+    from datetime import datetime, timedelta, timezone
+    start = datetime(2026, 11, 24, 9, 0, 0)
+    clock = datetime(2026, 11, 24, 11, 0, 0)                       # the database's clock at the init snapshot
+    assert payment_check_since(start, clock) == clock - timedelta(seconds=60)
+    assert payment_check_since(start, start + timedelta(seconds=30)) == start      # never before the workload's start
+    assert payment_check_since(start, None) == start                # clock not read: as before
+    assert payment_check_since(None, clock) is None                 # start not recorded: the check says so
+    assert payment_check_since(start, clock.replace(tzinfo=timezone.utc)) == start  # not comparable: as before
+    aware = datetime(2026, 11, 24, 12, 0, 0, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    hooks = AttachedWorkload(folder_with(tmp_path), None).tpcc_hooks(aware)
+    assert hooks.history_since == aware - timedelta(seconds=60)
 
 
 # --- against the real service, while it keeps writing ---------------------------------------------------

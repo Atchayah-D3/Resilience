@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 import asyncpg
 
 from resilience_tests.adapters.base import AnalyticsSupport
+from resilience_tests.adapters.postgresql.tpcc import TPCC_CALL_SQL
 from resilience_tests.execution.remote import RemoteHost
 from resilience_tests.execution.workload.contract import TPCC_SCHEMA
 
@@ -45,10 +46,29 @@ else:
 ANALYTICS_APPLICATION_NAME = "resilience-analytics"
 S = TPCC_SCHEMA
 
-# The TPC-C tables the reports read, and the customers' own (every other TPC-C table): the
-# customers' cache hit ratio is measured on the latter, which no report touches.
+# The TPC-C tables the reports read, and every other TPC-C table (which no report touches): their
+# cache counters are kept as evidence next to the customers' own ratio below.
 REPORT_TABLES = ("order_line", "orders")
 CUSTOMER_TABLES = ("warehouse", "district", "customer", "history", "new_order", "item", "stock")
+# The customers' own cache hit ratio, over EVERY table they read (order_line and orders included,
+# the tables the reports flood): the page counts of the clerks' five TPC-C calls in
+# pg_stat_statements, for the clerks' login. One call is one whole transaction, and its counts
+# include every statement run inside its function. The reports log in as another role, and the
+# harness's own queries are other statements, so neither is counted.
+CLERK_CALL_PREFIXES = {txn: sql.split("(", 1)[0] + "(" for txn, sql in TPCC_CALL_SQL.items()}
+STATEMENTS_EXTENSION_SQL = ("SELECT n.nspname, e.extversion FROM pg_extension e "
+                            "JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pg_stat_statements'")
+STATEMENTS_TRACK_SQL = "SELECT current_setting('pg_stat_statements.track', true)"   # NULL: library not loaded
+CLERK_STATEMENTS_SQL = """
+SELECT p.txn_type, count(s.queryid) AS entries, coalesce(sum(s.calls), 0) AS calls,
+       coalesce(sum(s.shared_blks_hit), 0) AS hit, coalesce(sum(s.shared_blks_read), 0) AS read
+  FROM unnest($2::text[], $3::text[]) AS p(txn_type, prefix)
+  LEFT JOIN {schema}.pg_stat_statements s
+    ON s.userid = (SELECT oid FROM pg_roles WHERE rolname = $1)
+   AND s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+   AND s.toplevel AND starts_with(s.query, p.prefix)
+ GROUP BY p.txn_type"""
+STATEMENTS_INFO_SQL = "SELECT dealloc, stats_reset FROM {schema}.pg_stat_statements_info"
 
 # Q1: totals per order-line number (CH-benCHmark query 1)
 Q1_SQL = (f"SELECT ol_number, sum(ol_quantity) AS sum_qty, sum(ol_amount) AS sum_amount, "
@@ -190,6 +210,9 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
             for name in SERVER_SETTINGS:
                 out[name] = str(await conn.fetchval("SELECT current_setting($1)", name))
             row = await conn.fetchrow(ROLE_SQL, login.user) if login else None
+            ext = await conn.fetchrow(STATEMENTS_EXTENSION_SQL)
+            out["pg_stat_statements"] = str(ext["extversion"]) if ext else None
+            out["pg_stat_statements_track"] = await conn.fetchval(STATEMENTS_TRACK_SQL)
         finally:
             await conn.close()
         out["role_exists"] = "true" if row else "false"
@@ -257,13 +280,36 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
     async def customer_cache_counters(self) -> dict[str, Any]:
         conn = await self._connect(timeout_s=CONNECT_TIMEOUT_S)
         try:
+            clerks, why = await self._clerk_statements(conn)
             customers = await conn.fetchrow(CACHE_SQL, list(CUSTOMER_TABLES))
             reports = await conn.fetchrow(CACHE_SQL, list(REPORT_TABLES))
         finally:
             await conn.close()
-        return {"customers": {"hit": int(customers["hit"]), "read": int(customers["read"])},
+        return {"clerks": clerks, "clerks_unavailable": why,
+                "customers": {"hit": int(customers["hit"]), "read": int(customers["read"])},
                 "reports": {"hit": int(reports["hit"]), "read": int(reports["read"])},
                 "customer_tables": list(CUSTOMER_TABLES), "report_tables": list(REPORT_TABLES)}
+
+    async def _clerk_statements(self, conn: asyncpg.Connection) -> tuple[dict[str, Any] | None, str | None]:
+        """The clerks' five TPC-C calls in pg_stat_statements (cumulative), or None and why not."""
+        try:
+            ext = await conn.fetchrow(STATEMENTS_EXTENSION_SQL)
+            if ext is None:
+                return None, "pg_stat_statements is not installed in this database"
+            schema = '"' + str(ext["nspname"]).replace('"', '""') + '"'
+            login = self.node.db.user
+            rows = await conn.fetch(CLERK_STATEMENTS_SQL.format(schema=schema), login,
+                                    list(CLERK_CALL_PREFIXES), list(CLERK_CALL_PREFIXES.values()))
+            info = await conn.fetchrow(STATEMENTS_INFO_SQL.format(schema=schema))
+        except (asyncpg.PostgresError, OSError) as exc:
+            return None, f"pg_stat_statements could not be read: {type(exc).__name__}: {exc}"
+        by_type = {r["txn_type"]: {"entries": int(r["entries"]), "calls": int(r["calls"]), "hit": int(r["hit"]),
+                                   "read": int(r["read"])} for r in rows}
+        reset = info["stats_reset"]
+        return {"login": login, "hit": sum(t["hit"] for t in by_type.values()),
+                "read": sum(t["read"] for t in by_type.values()), "calls": sum(t["calls"] for t in by_type.values()),
+                "by_type": by_type, "dealloc": int(info["dealloc"]),
+                "stats_reset": reset.isoformat() if reset is not None else None}, None
 
     # --- the reports ---------------------------------------------------------------------------
 

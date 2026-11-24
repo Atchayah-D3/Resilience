@@ -34,7 +34,7 @@ import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +64,11 @@ JOURNAL_SETTLE_S = 10.0       # after the validate snapshot: acknowledgements of
 # this scenario's marker lines start this long before the init snapshot (longer than any transaction
 # runs -- the clerks abandon one after 10 s).
 SPAN_MARGIN_S = 60.0
+# The per-payment check reads the history rows written from this long before the init snapshot (the
+# database's own clock, as H_DATE is): a Payment acknowledged after the snapshot was sent at most
+# 10 s before its answer (the clerks abandon a transaction after 10 s); the rest is room for a busy
+# harness. Not from the workload's start: that history grows with every hour and every scenario.
+PAYMENT_SINCE_MARGIN_S = 60.0
 DESTROYED_LIST_MAX = 100     # destroyed markers named in the facts (the count is exact)
 SETTLED_S = 10.0
 # A transaction whose marker line is this close before the validate cut-off may still have been
@@ -500,9 +505,11 @@ class AttachedWorkload:
 
     # --- the TPC-C checks on the cut-off --------------------------------------------------------
 
-    def tpcc_hooks(self) -> Any:
+    def tpcc_hooks(self, db_clock_at_init: datetime | None = None) -> Any:
         """The TPC-C profile's checks, set up from the workload's start: its layout and its payment
-        start (the order count before is set from the init snapshot by the caller)."""
+        start (the order count before is set from the init snapshot by the caller). With the
+        database's clock read at the init snapshot, the payment check starts there instead
+        (payment_check_since)."""
         from catalog.schema import Workload
         from resilience_tests.execution.workload.hooks import hooks_for
         hooks = hooks_for(Workload.model_validate(self.used))
@@ -510,8 +517,23 @@ class AttachedWorkload:
         if hasattr(hooks, "orders_at_prepare"):
             hooks.orders_at_prepare = tpcc.get("orders_at_start")
             since = tpcc.get("history_since")
-            hooks.history_since = datetime.fromisoformat(since) if since and since != "None" else None
+            start = datetime.fromisoformat(since) if since and since != "None" else None
+            hooks.history_since = payment_check_since(start, db_clock_at_init)
         return hooks
+
+
+def payment_check_since(workload_start: datetime | None, db_clock_at_init: datetime | None) -> datetime | None:
+    """Where the per-payment check starts reading the history: PAYMENT_SINCE_MARGIN_S before the
+    init snapshot by the database's clock, never before the workload's start. The scenario's own
+    acknowledged Payments are the ones checked (copy_span), so reading less history can only find
+    fewer rows -- a missing row is still missing, and an older row with the same values can no
+    longer stand in for it. Without the clock (or when the two times cannot be compared), the
+    workload's start, as before."""
+    if workload_start is None or db_clock_at_init is None:
+        return workload_start
+    if (workload_start.tzinfo is None) != (db_clock_at_init.tzinfo is None):
+        return workload_start
+    return max(workload_start, db_clock_at_init - timedelta(seconds=PAYMENT_SINCE_MARGIN_S))
 
 
 def _gz_lines(path: Path) -> Iterator[str]:

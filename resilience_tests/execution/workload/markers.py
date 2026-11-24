@@ -48,7 +48,7 @@ class DurableJournal:
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+        self._fd: int | None = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
         self._q: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self._thread = threading.Thread(target=self._run, name=f"journal:{path.name}", daemon=True)
         self._thread.start()
@@ -97,9 +97,13 @@ class DurableJournal:
                 return
 
     def close(self) -> None:
+        """Idempotent: a second close does nothing."""
+        if self._fd is None:
+            return
         self._q.put(_STOP)
         self._thread.join()
         os.close(self._fd)
+        self._fd = None
 
 
 def _settle_all(futures: list[asyncio.Future[None]], err: BaseException | None) -> None:
@@ -154,6 +158,20 @@ class MarkerJournals:
         self.acked.close()
         if self._aborted is not None:
             self._aborted.close()
+
+    def discard_unused(self) -> list[str]:
+        """For a caller whose transactions are journalled elsewhere -- the TPC-C clerks in worker
+        processes write marker.<n>.jrnl and so on: closes these journals and removes their files
+        when nothing was written to them, so a run folder holds only journals that were written
+        (no 0-byte marker.jrnl / acked.jrnl beside the workers'). A file with anything in it is
+        kept. Returns the names removed."""
+        self.close()
+        removed = []
+        for journal in (self.marker, self.acked, self._aborted):
+            if journal is not None and journal.path.exists() and journal.path.stat().st_size == 0:
+                journal.path.unlink()
+                removed.append(journal.path.name)
+        return removed
 
 
 # --- analysis (pure) ---------------------------------------------------------------------

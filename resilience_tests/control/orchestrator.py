@@ -65,6 +65,7 @@ from resilience_tests.execution.probes.probers import (
 from resilience_tests.execution.remote import run_once
 from resilience_tests.execution.workload.attached import (
     INIT_MARKERS_FILE,
+    PAYMENT_SINCE_MARGIN_S,
     VALIDATE_MARKERS_FILE,
     AttachedWorkload,
     AttachRefused,
@@ -165,6 +166,7 @@ class TestOrchestrator:
         # the running common workload this run is attached to (RunOptions.attach_workload)
         self.attached: AttachedWorkload | None = None
         self._init_snapshot: CutOff | None = None   # the database's markers at init, when attached
+        self._init_db_clock: Any = None              # the database's clock just before it (TPC-C payment check)
         self.write_prober: WriteProber | None = None
         self.log_tailer: LogTailer | None = None
         self.disk_prober: DiskUsageProber | None = None
@@ -609,12 +611,19 @@ class TestOrchestrator:
         self.disclosures.append(f"Window figures (baseline, hold) come from the common workload's 1-second "
                                 f"samples: {PERCENTILE_NOTE}.")
         if attached.used.get("profile") == "tpcc":
-            self.disclosures.append("The TPC-C checks after the fault cover everything the common workload did since "
-                                    "its start (earlier scenarios included), compared with the database at the "
-                                    "cut-off moment while the workload kept writing.")
+            self.disclosures.append("The TPC-C consistency rules after the fault cover everything the common workload "
+                                    "did since its start (earlier scenarios included), compared with the database at "
+                                    "the cut-off moment while the workload kept writing. The per-payment check covers "
+                                    "this scenario's acknowledged Payments, against the history rows written from "
+                                    f"{PAYMENT_SINCE_MARGIN_S:g} s before the init snapshot.")
         await self.fault_behaviour.check_ready()
         # the database before this scenario: compared with the validate snapshot, it shows what was
         # lost DURING the scenario (losses an earlier scenario left are already missing from it)
+        if attached.used.get("profile") == "tpcc":
+            try:
+                self._init_db_clock = await self.adapter.tpcc_clock()
+            except Exception as exc:  # noqa: BLE001 -- recorded; the payment check then starts at the workload's start
+                self.facts["init_db_clock_error"] = f"{type(exc).__name__}: {exc}"
         self._init_snapshot = await attached.cut_off(self.adapter, self.run_dir / INIT_MARKERS_FILE, settle_s=0)
         self.facts["init_snapshot"] = self._init_snapshot.facts()
         self.stream.subscribe(self._mark_on_event)
@@ -648,7 +657,8 @@ class TestOrchestrator:
             span = SpanCheckAdapter(self.adapter, init, cut)
             tpcc = None
             if attached.used.get("profile") == "tpcc":
-                hooks = attached.tpcc_hooks()
+                hooks = attached.tpcc_hooks(self._init_db_clock)
+                self.facts["payment_check_since"] = str(hooks.history_since)
                 tpcc = endchecks.TpccInputs(orders_before=init.current_orders, history_since=hooks.history_since,
                                             warehouses=int((attached.used.get("tpcc") or {}).get("warehouses") or 0))
             t = step("end checks started: this scenario's journal lines compared with the database"

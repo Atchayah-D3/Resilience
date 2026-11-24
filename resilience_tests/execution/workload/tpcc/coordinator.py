@@ -106,6 +106,7 @@ class TpccCoordinator:
         self.workload = workload
         self.stream = stream
         self.processes = processes
+        self._main_journals = journals          # only its folder is used: each worker writes its own
         self._ctx = multiprocessing.get_context("spawn")
         self._out_q = self._ctx.Queue()
         self._cmd_qs = [self._ctx.Queue() for _ in range(processes)]
@@ -140,6 +141,9 @@ class TpccCoordinator:
     # --- the driver interface -------------------------------------------------------------
 
     async def start(self) -> None:
+        # the main program's own journals stay empty (the workers write marker.<n>.jrnl ...): removed,
+        # so the run folder -- and the lines a scenario copies from it -- has only written journals
+        self._main_journals.discard_unused()
         self.stream.emit("workload", "start", profile=self.workload.profile, concurrency=self.workload.concurrency,
                          rate_tps=self.workload.rate_tps, warehouses=self.workload.tpcc.warehouses,
                          processes=self.processes,
