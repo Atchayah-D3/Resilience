@@ -1,0 +1,45 @@
+# Prometheus for the RRB benchmark. Replace the example host names with the real ones.
+# 5 s scrapes: the spike rises in 30 s, so 15-60 s defaults would blur it.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Spring Boot API (management port 8081): HTTP latency histograms, Hikari pools,
+  # rrb_login_total, rrb_db_errors_total, cut-off cache, JVM.
+  - job_name: rrb-app
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [app1:8081, app2:8081, app3:8081, app4:8081, app5:8081, app6:8081, app7:8081, app8:8081]
+        labels: {role: app}
+
+  # postgres_exporter, one per database node (port 9187).
+  - job_name: postgres
+    static_configs:
+      - targets: [db-primary:9187]
+        labels: {role: primary}
+      - targets: [db-replica:9187]
+        labels: {role: replica}
+
+  # node_exporter on EVERY machine (port 9100): CPU, disk, network.
+  # Include the load generators: a saturated generator invalidates a run.
+  - job_name: node
+    static_configs:
+      - targets: [db-primary:9100]
+        labels: {role: primary}
+      - targets: [db-replica:9100]
+        labels: {role: replica}
+      - targets: [sdbpool1:9100, sdbpool2:9100]
+        labels: {role: sdbpool}
+      - targets: [app1:9100, app2:9100, app3:9100, app4:9100, app5:9100, app6:9100, app7:9100, app8:9100]
+        labels: {role: app}
+      - targets: [gen1:9100, gen2:9100, gen3:9100, gen4:9100]
+        labels: {role: generator}
+
+  # sdbPool: enable once the sdbPool team confirms how it exposes statistics.
+  # If it is PgBouncer-compatible, pgbouncer_exporter (port 9127) works against its admin console.
+  # - job_name: sdbpool
+  #   static_configs:
+  #     - targets: [sdbpool1:9127, sdbpool2:9127]
+  #       labels: {role: sdbpool}

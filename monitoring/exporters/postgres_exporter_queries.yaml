@@ -1,0 +1,81 @@
+# Custom metrics for postgres_exporter (--extend.query-path=postgres_exporter_queries.yaml).
+# Metric name = <section>_<column>. They complement the built-in collectors with what the
+# RRB runs need: WAL volume, wait events, replication lag, server-log growth (sdbAudit),
+# checkpoints and DEFAULT-partition leakage. Every query was checked on ShaktiDB 18.6.1.0
+# (primary and hot standby). Run the exporter as a role with pg_monitor.
+#
+# Note: newer postgres_exporter releases mark --extend.query-path as deprecated. If your
+# version no longer accepts it, run these queries with sql_exporter instead; the RRB
+# analysis does not depend on them (analysis/sampler.py collects the same data).
+
+rrb_pg_wal:
+  query: "SELECT wal_records, wal_fpi, wal_bytes, wal_buffers_full FROM pg_stat_wal"
+  metrics:
+    - wal_records:      {usage: COUNTER, description: "WAL records generated"}
+    - wal_fpi:          {usage: COUNTER, description: "WAL full-page images"}
+    - wal_bytes:        {usage: COUNTER, description: "WAL bytes generated"}
+    - wal_buffers_full: {usage: COUNTER, description: "WAL writes forced because wal_buffers was full"}
+
+rrb_pg_waits:
+  query: |
+    SELECT coalesce(wait_event_type, 'CPU') || ':' || coalesce(wait_event, 'running') AS wait, count(*) AS backends
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend' AND state = 'active' AND pid <> pg_backend_pid()
+    GROUP BY 1
+  metrics:
+    - wait:     {usage: LABEL, description: "wait_event_type:wait_event (CPU:running = on CPU)"}
+    - backends: {usage: GAUGE, description: "active client backends in this wait at scrape time"}
+
+rrb_pg_sessions:
+  query: "SELECT coalesce(state, 'unknown') AS state, count(*) AS backends FROM pg_stat_activity WHERE backend_type = 'client backend' GROUP BY 1"
+  metrics:
+    - state:    {usage: LABEL, description: "backend state"}
+    - backends: {usage: GAUGE, description: "client backends in this state"}
+
+rrb_pg_replication:
+  query: |
+    SELECT application_name AS standby, sync_state,
+           pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS lag_bytes,
+           coalesce(extract(epoch FROM replay_lag), 0) AS replay_lag_seconds
+    FROM pg_stat_replication
+  metrics:
+    - standby:            {usage: LABEL, description: "standby application_name"}
+    - sync_state:         {usage: LABEL, description: "async / sync / potential"}
+    - lag_bytes:          {usage: GAUGE, description: "WAL bytes not yet replayed on the standby"}
+    - replay_lag_seconds: {usage: GAUGE, description: "replay lag reported by the standby"}
+
+rrb_pg_standby:
+  query: |
+    SELECT CASE WHEN pg_is_in_recovery() THEN 1 ELSE 0 END AS in_recovery,
+           CASE WHEN pg_is_in_recovery()
+                THEN coalesce(extract(epoch FROM clock_timestamp() - pg_last_xact_replay_timestamp()), 0)
+                ELSE 0 END AS replay_delay_seconds
+  metrics:
+    - in_recovery:          {usage: GAUGE, description: "1 on a standby"}
+    - replay_delay_seconds: {usage: GAUGE, description: "time since the last replayed commit (meaningful only under write load)"}
+
+rrb_pg_logdir:
+  query: "SELECT CASE WHEN current_setting('logging_collector') = 'on' THEN (SELECT coalesce(sum(size), 0) FROM pg_ls_logdir()) ELSE 0 END AS bytes"
+  metrics:
+    - bytes: {usage: GAUGE, description: "server log directory size; sdbAudit records land here"}
+
+rrb_pg_checkpointer:
+  query: "SELECT num_timed, num_requested, write_time, sync_time, buffers_written FROM pg_stat_checkpointer"
+  metrics:
+    - num_timed:       {usage: COUNTER, description: "scheduled checkpoints"}
+    - num_requested:   {usage: COUNTER, description: "checkpoints forced (usually by max_wal_size)"}
+    - write_time:      {usage: COUNTER, description: "checkpoint write time, ms"}
+    - sync_time:       {usage: COUNTER, description: "checkpoint sync time, ms"}
+    - buffers_written: {usage: COUNTER, description: "buffers written by checkpoints"}
+
+rrb_pg_default_partition:
+  query: "SELECT relname AS partition, n_live_tup AS rows FROM pg_stat_user_tables WHERE schemaname = 'rrb' AND relname LIKE '%default'"
+  metrics:
+    - partition: {usage: LABEL, description: "DEFAULT partition"}
+    - rows:      {usage: GAUGE, description: "rows in a DEFAULT partition; must stay 0 (run ensure_partitions before a run)"}
+
+rrb_pg_tables:
+  query: "SELECT coalesce(sum(n_dead_tup), 0) AS dead_tuples, coalesce(sum(autovacuum_count), 0) AS autovacuums FROM pg_stat_user_tables WHERE schemaname = 'rrb'"
+  metrics:
+    - dead_tuples: {usage: GAUGE, description: "dead tuples over schema rrb"}
+    - autovacuums: {usage: COUNTER, description: "autovacuum runs over schema rrb"}

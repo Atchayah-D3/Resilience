@@ -1,0 +1,1394 @@
+{
+ "uid": "rrb-overview",
+ "title": "RRB benchmark",
+ "tags": [
+  "rrb",
+  "shaktidb"
+ ],
+ "timezone": "browser",
+ "refresh": "5s",
+ "schemaVersion": 39,
+ "time": {
+  "from": "now-30m",
+  "to": "now"
+ },
+ "panels": [
+  {
+   "type": "row",
+   "title": "Load and API (server side)",
+   "id": 1,
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Requests/s by endpoint",
+   "id": 2,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 1,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (uri) (rate(http_server_requests_seconds_count{uri=~\"/api/v1/.*\"}[30s]))",
+     "legendFormat": "{{uri}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "p99 latency by endpoint (server side)",
+   "id": 3,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 1,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri=~\"/api/v1/.*\"}[1m])))",
+     "legendFormat": "{{uri}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Logins/s by outcome",
+   "id": 4,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 1,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (outcome) (rate(rrb_login_total[30s]))",
+     "legendFormat": "{{outcome}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Errors/s by status (5xx, 4xx except 401)",
+   "id": 5,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 1,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 30,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (status) (rate(http_server_requests_seconds_count{uri=~\"/api/v1/.*\",status=~\"5..|4..\",status!=\"401\"}[30s]))",
+     "legendFormat": "{{status}}"
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "title": "App connection pools",
+   "id": 6,
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 9,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Threads waiting for a DB connection",
+   "id": 7,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 10,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (pool) (hikaricp_connections_pending)",
+     "legendFormat": "{{pool}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Active DB connections",
+   "id": 8,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 10,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (pool) (hikaricp_connections_active)",
+     "legendFormat": "{{pool}} active"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (pool) (hikaricp_connections_max)",
+     "legendFormat": "{{pool}} max"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Pool timeouts and DB errors /s",
+   "id": 9,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 10,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (pool) (rate(hikaricp_connections_timeout_total[1m]))",
+     "legendFormat": "timeout {{pool}}"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (kind) (rate(rrb_db_errors_total[1m]))",
+     "legendFormat": "db error {{kind}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "App JVM CPU",
+   "id": 10,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 10,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "process_cpu_usage{job=\"rrb-app\"}",
+     "legendFormat": "{{instance}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "DB transaction p99 (AC-02 result <= 50 ms, AC-03 login <= 100 ms)",
+   "id": 11,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 18,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le, op) (rate(rrb_db_tx_seconds_bucket[1m])))",
+     "legendFormat": "{{op}} p99"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le, op) (rate(rrb_db_tx_seconds_bucket{op=\"result\"}[1m])))",
+     "legendFormat": "result p99.9"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "JVM GC pause time (share of wall time)",
+   "id": 12,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 18,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (instance) (rate(jvm_gc_pause_seconds_sum[1m]))",
+     "legendFormat": "{{instance}}"
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "title": "Database",
+   "id": 13,
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 26,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Commits/s",
+   "id": 14,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 27,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (role) (rate(pg_stat_database_xact_commit{datname=\"rrb\"}[30s]))",
+     "legendFormat": "{{role}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Rows inserted/s",
+   "id": 15,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 27,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (role) (rate(pg_stat_database_tup_inserted{datname=\"rrb\"}[30s]))",
+     "legendFormat": "{{role}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Buffer cache hit ratio",
+   "id": 16,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 27,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (role) (rate(pg_stat_database_blks_hit{datname=\"rrb\"}[1m])) / (sum by (role) (rate(pg_stat_database_blks_hit{datname=\"rrb\"}[1m])) + sum by (role) (rate(pg_stat_database_blks_read{datname=\"rrb\"}[1m])))",
+     "legendFormat": "{{role}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "WAL MB/s (primary)",
+   "id": 17,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 27,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "MBs",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "rate(rrb_pg_wal_wal_bytes{role=\"primary\"}[30s]) / 1e6",
+     "legendFormat": "WAL"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "rate(rrb_pg_wal_wal_fpi{role=\"primary\"}[30s])",
+     "legendFormat": "full-page images/s"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Active sessions by wait event",
+   "id": 18,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 35,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 30,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (role, wait) (rrb_pg_waits_backends)",
+     "legendFormat": "{{role}} {{wait}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Replication lag",
+   "id": 19,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 35,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "rrb_pg_replication_lag_bytes",
+     "legendFormat": "{{standby}} ({{sync_state}})"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Server log growth (sdbAudit) MB/s",
+   "id": 20,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 35,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "MBs",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "clamp_min(deriv(rrb_pg_logdir_bytes[1m]), 0) / 1e6",
+     "legendFormat": "{{role}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Top statements by DB time (s/s)",
+   "id": 21,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 35,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 30,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "topk(8, sum by (role, queryid) (rate(pg_stat_statements_seconds_total{datname=\"rrb\"}[1m])))",
+     "legendFormat": "{{role}} {{queryid}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Checkpoints forced /min",
+   "id": 22,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 43,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "rate(rrb_pg_checkpointer_num_requested[5m]) * 60",
+     "legendFormat": "{{role}} requested"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "rate(rrb_pg_checkpointer_num_timed[5m]) * 60",
+     "legendFormat": "{{role}} timed"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Rows in DEFAULT partitions (must be 0)",
+   "id": 23,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 43,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "rrb_pg_default_partition_rows",
+     "legendFormat": "{{role}} {{partition}}"
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "title": "Hosts",
+   "id": 24,
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 51,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "CPU busy by role",
+   "id": 25,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 52,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "1 - avg by (role) (rate(node_cpu_seconds_total{mode=~\"idle|iowait\"}[30s]))",
+     "legendFormat": "{{role}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Hottest machine per role",
+   "id": 26,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 52,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "max by (role) (1 - avg by (role, instance) (rate(node_cpu_seconds_total{mode=~\"idle|iowait\"}[30s])))",
+     "legendFormat": "{{role}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "I/O wait (DB nodes)",
+   "id": 27,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 52,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "avg by (role) (rate(node_cpu_seconds_total{mode=\"iowait\",role=~\"primary|replica\"}[30s]))",
+     "legendFormat": "{{role}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Disk busy (DB nodes)",
+   "id": 28,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 52,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "max by (role, device) (rate(node_disk_io_time_seconds_total{role=~\"primary|replica\"}[30s]))",
+     "legendFormat": "{{role}} {{device}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Disk write MB/s (DB nodes)",
+   "id": 29,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 60,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "MBs",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (role) (rate(node_disk_written_bytes_total{role=~\"primary|replica\",device!~\"dm-.*\"}[30s])) / 1e6",
+     "legendFormat": "{{role}}"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Network MB/s by role",
+   "id": 30,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "rrb-prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 60,
+    "w": 6,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "MBs",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "rrb-prom"
+     },
+     "expr": "sum by (role) (rate(node_network_receive_bytes_total{device!=\"lo\"}[30s]) + rate(node_network_transmit_bytes_total{device!=\"lo\"}[30s])) / 1e6",
+     "legendFormat": "{{role}}"
+    }
+   ]
+  }
+ ],
+ "annotations": {
+  "list": []
+ },
+ "templating": {
+  "list": []
+ }
+}

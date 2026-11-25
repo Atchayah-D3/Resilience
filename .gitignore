@@ -1,16 +1,7 @@
-.venv/
+app/target/
+load/*.csv
+load/jmeter/results/
+*.jtl
+results/
+load/jmeter/jmeter.log
 __pycache__/
-*.egg-info/
-.pytest_cache/
-reports/*.xml
-reports/*.html
-evidence/*
-!*/README.md
-.venv-ansible/
-# Spec Kit (.specify/) and its Claude Code skills (.claude/skills/) are shared with the team;
-# .specify/.gitignore keeps its own machine-local state out. Personal settings stay local.
-.claude/settings.local.json
-vendor/elle/elle-cli.jar
-
-# harness run folders (evidence belongs on the driver host, not in git): <ID>-<YYYYMMDD>T<HHMMSS>Z-<hex>
-/*-20[0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-*/

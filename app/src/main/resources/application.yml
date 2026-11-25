@@ -1,0 +1,91 @@
+# All values can be overridden with environment variables (shown in ${...}).
+server:
+  port: ${APP_PORT:8080}
+  shutdown: graceful
+  tomcat:
+    max-connections: ${TOMCAT_MAX_CONNECTIONS:20000}   # keep-alive connections from the LB
+    accept-count: 2000
+    keep-alive-timeout: 60s
+    max-keep-alive-requests: -1
+    connection-timeout: 5s
+
+spring:
+  application:
+    name: rrb-api
+  main:
+    banner-mode: off
+  threads:
+    virtual:
+      enabled: true          # Java 21 virtual threads: one per request, no thread-pool tuning
+  jackson:
+    default-property-inclusion: non_null
+
+management:
+  server:
+    port: ${MGMT_PORT:8081}  # Prometheus scrapes here, separate from benchmark traffic
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: rrb-api
+      instance: ${HOSTNAME:local}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      minimum-expected-value:
+        http.server.requests: 1ms
+      maximum-expected-value:
+        http.server.requests: 30s
+
+logging:
+  level:
+    root: WARN
+    com.shaktidb.bench: INFO
+
+rrb:
+  default-cen-id: ${RRB_CEN_ID:202501}
+  token:
+    # MUST be identical on every app server (tokens issued by one are validated by another).
+    secret: ${RRB_TOKEN_SECRET:local-dev-secret-change-me-32-bytes-min!!}
+    ttl: ${RRB_TOKEN_TTL:30m}
+  session:
+    # false: token validated by HMAC signature only (no DB read)  -> proposal default (JWT-like)
+    # true : also looks up the user_session row on the PRIMARY     -> session-table variant
+    validate-in-db: ${RRB_SESSION_VALIDATE_IN_DB:false}
+  cutoff:
+    # 0s disables the in-memory cache so every cut-off request hits the replica.
+    cache-ttl: ${RRB_CUTOFF_CACHE_TTL:60s}
+
+  datasource:
+    # false: reads also go to the primary pool (single-node / local testing).
+    replica-enabled: ${DB_REPLICA_ENABLED:false}
+    # Both URLs normally point at sdbPool, not at ShaktiDB directly.
+    # prepareThreshold=0 => unnamed statements only: safe with a transaction-mode pooler.
+    # Set DB_PREPARE_THRESHOLD=5 ONLY if sdbPool supports prepared statements in transaction mode.
+    primary:
+      pool-name: primary
+      jdbc-url: jdbc:postgresql://${DB_PRIMARY_HOST:localhost}:${DB_PRIMARY_PORT:6432}/${DB_NAME:rrb}?prepareThreshold=${DB_PREPARE_THRESHOLD:0}&ApplicationName=rrb-api&tcpKeepAlive=true&socketTimeout=${DB_SOCKET_TIMEOUT_S:30}
+      username: ${DB_USER:rrb}
+      password: ${DB_PASSWORD:rrb}
+      maximum-pool-size: ${DB_PRIMARY_POOL_SIZE:30}
+      minimum-idle: ${DB_PRIMARY_POOL_SIZE:30}
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:2000}   # fail fast -> HTTP 503, no silent queue
+      max-lifetime: 1800000
+      auto-commit: false
+    replica:
+      pool-name: replica
+      jdbc-url: jdbc:postgresql://${DB_REPLICA_HOST:localhost}:${DB_REPLICA_PORT:6432}/${DB_NAME:rrb}?prepareThreshold=${DB_PREPARE_THRESHOLD:0}&ApplicationName=rrb-api-ro&tcpKeepAlive=true&socketTimeout=${DB_SOCKET_TIMEOUT_S:30}
+      username: ${DB_USER:rrb}
+      password: ${DB_PASSWORD:rrb}
+      maximum-pool-size: ${DB_REPLICA_POOL_SIZE:30}
+      minimum-idle: ${DB_REPLICA_POOL_SIZE:30}
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:2000}
+      max-lifetime: 1800000
+      auto-commit: false
+      read-only: true
