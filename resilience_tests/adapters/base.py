@@ -690,7 +690,9 @@ class AnalyticsSupport:
         reports play out -- shared_buffers, max_parallel_workers, max_worker_processes,
         max_connections, cpu_cores, role_exists, role_can_login, role_connection_limit,
         role_max_parallel_workers_per_gather, role_work_mem, role_temp_file_limit,
-        role_statement_timeout (None: not set for the role)."""
+        role_statement_timeout (None: not set for the role); pg_stat_statements (its version, None:
+        not installed in the database) and pg_stat_statements_track (None: the library is not
+        loaded), which the customers' cache hit ratio needs."""
         raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
 
     async def start_analytics(self, *, full_table_sessions: int, index_sessions: int, limit_tests: bool,
@@ -729,8 +731,11 @@ class AnalyticsSupport:
         raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
 
     async def customer_cache_counters(self) -> dict[str, Any]:
-        """Cumulative cache counters of the TPC-C tables the reports never read (the customers'
-        own data) and of the tables they read: {customers: {hit, read}, reports: {hit, read}}."""
+        """Cumulative cache counters. `clerks`: the customers' own pages over every table they
+        read, from their TPC-C calls only -- {login, hit, read, calls, by_type: {type: {entries,
+        calls, hit, read}}, dealloc, stats_reset} -- or None, with the reason in
+        `clerks_unavailable`. Evidence only: `customers` (the TPC-C tables the reports never read)
+        and `reports` (the tables they read), {hit, read} each, whoever read them."""
         raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
 
 

@@ -34,7 +34,7 @@ import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,7 @@ from resilience_tests.execution.workload.markers import (
 from resilience_tests.execution.workload.service import client
 from resilience_tests.execution.workload.service import endchecks
 from resilience_tests.execution.workload.service import state as st
+from resilience_tests.execution.workload.tpcc.sizing import Layout
 from resilience_tests.execution.workload.service import windows as win
 from resilience_tests.observability.event_stream import Event, EventStream
 
@@ -63,6 +64,11 @@ JOURNAL_SETTLE_S = 10.0       # after the validate snapshot: acknowledgements of
 # this scenario's marker lines start this long before the init snapshot (longer than any transaction
 # runs -- the clerks abandon one after 10 s).
 SPAN_MARGIN_S = 60.0
+# The per-payment check reads the history rows written from this long before the init snapshot (the
+# database's own clock, as H_DATE is): a Payment acknowledged after the snapshot was sent at most
+# 10 s before its answer (the clerks abandon a transaction after 10 s); the rest is room for a busy
+# harness. Not from the workload's start: that history grows with every hour and every scenario.
+PAYMENT_SINCE_MARGIN_S = 60.0
 DESTROYED_LIST_MAX = 100     # destroyed markers named in the facts (the count is exact)
 SETTLED_S = 10.0
 # A transaction whose marker line is this close before the validate cut-off may still have been
@@ -157,22 +163,43 @@ class AttachedWorkload:
         return float(rate) if rate else None
 
     @property
+    def tpcc_layout(self) -> dict[str, Any] | None:
+        """The TPC-C layout the clerks run (tpcc/sizing.Layout.as_dict): warehouses loaded, the
+        warehouses they use (1 .. active_warehouses; None: every one) and the extra warehouses they
+        never touch. From the settings the service runs (sizes as numbers), with the memory cache
+        it was calculated from when the service recorded it. None when the workload is not TPC-C."""
+        used = self.used
+        tpcc = used.get("tpcc") or {}
+        if used.get("profile") != "tpcc" or not tpcc.get("warehouses"):
+            return None
+        active = tpcc.get("active_warehouses")
+        recorded = ((self.info.get("start_facts") or {}).get("data_step") or {}).get("tpcc_layout") or {}
+        return Layout(warehouses=int(tpcc["warehouses"]), active_warehouses=int(active) if active else None,
+                      cache_bytes=recorded.get("cache_bytes"),
+                      by_cache=tuple(recorded.get("by_cache") or ())).as_dict()
+
+    @property
     def pid(self) -> int | None:
         """For messages only (never a decision)."""
         return (self.status() or {}).get("pid") or self.info.get("pid")
 
     def describe(self) -> dict[str, Any]:
         used, tpcc = self.used, (self.used.get("tpcc") or {})
+        layout = self.tpcc_layout or {}
         return {"folder": str(self.folder), "workload_run_id": self.info.get("run_id"), "id": self.info.get("id"),
                 "profile": used.get("profile"), "clerks": used.get("concurrency"), "rate_tps": self.rate_tps,
-                "warehouses": tpcc.get("warehouses"), "session": used.get("session") or {},
+                "warehouses": tpcc.get("warehouses"), "active_warehouses": layout.get("active_warehouses"),
+                "extra_warehouses": layout.get("extra_warehouses"), "session": used.get("session") or {},
                 "clerks_started_wall": self.info.get("clerks_started_wall"),
                 "application_name": self.info.get("application_name")}
 
     def match_problems(self, wanted: Any, profile_name: str, node_name: str) -> list[str]:
         """Why this workload is not the one the scenario declares (empty: it is). Must match: the
-        target, the profile, transaction markers, the session settings and no Elle history. Sizes
-        and the rate are taken from the running workload and reported, not compared."""
+        target, the profile, transaction markers, the session settings, no Elle history and -- when
+        the scenario keeps its clerks on part of the warehouses (workload.tpcc.active_warehouses) --
+        a workload whose clerks leave warehouses untouched. Sizes and the rate are taken from the
+        running workload and reported, not compared (a number of active warehouses the scenario
+        states is compared: it is the scenario's own rule, not a size calculated from the target)."""
         problems: list[str] = []
         if not self.info:
             return ["the workload has not written service.json yet (its clerks are not running)"]
@@ -192,7 +219,25 @@ class AttachedWorkload:
             problems.append(f"session settings {have or 'none'}, the scenario needs {need or 'none'}")
         if wanted.groups:
             problems.append("the scenario declares clerk groups; the common workload has none")
+        problems += self._layout_problems(wanted)
         return problems
+
+    def _layout_problems(self, wanted: Any) -> list[str]:
+        """A scenario that keeps its clerks on part of the warehouses (its other warehouses are read
+        by the fault alone, e.g. NL-N-I01's index reports) needs a workload that does the same."""
+        need = getattr(getattr(wanted, "tpcc", None), "active_warehouses", None)
+        if wanted.profile != "tpcc" or need is None or self.used.get("profile") != "tpcc":
+            return []
+        layout = self.tpcc_layout or {}
+        active, loaded = layout.get("active_warehouses"), layout.get("warehouses")
+        if not layout.get("extra_warehouses"):
+            return [f"the scenario keeps its clerks on part of the warehouses (active_warehouses: {need}), but the "
+                    f"common workload's clerks use every one of its {loaded} warehouses; start it with "
+                    "workload.tpcc.active_warehouses set (workloads/oltp-common.yaml)"]
+        if isinstance(need, int) and need != active:
+            return [f"the scenario's clerks use {need} warehouses (active_warehouses), the common workload's "
+                    f"use {active}"]
+        return []
 
     # --- health --------------------------------------------------------------------------------
 
@@ -462,9 +507,11 @@ class AttachedWorkload:
 
     # --- the TPC-C checks on the cut-off --------------------------------------------------------
 
-    def tpcc_hooks(self) -> Any:
+    def tpcc_hooks(self, db_clock_at_init: datetime | None = None) -> Any:
         """The TPC-C profile's checks, set up from the workload's start: its layout and its payment
-        start (the order count before is set from the init snapshot by the caller)."""
+        start (the order count before is set from the init snapshot by the caller). With the
+        database's clock read at the init snapshot, the payment check starts there instead
+        (payment_check_since)."""
         from catalog.schema import Workload
         from resilience_tests.execution.workload.hooks import hooks_for
         hooks = hooks_for(Workload.model_validate(self.used))
@@ -472,8 +519,23 @@ class AttachedWorkload:
         if hasattr(hooks, "orders_at_prepare"):
             hooks.orders_at_prepare = tpcc.get("orders_at_start")
             since = tpcc.get("history_since")
-            hooks.history_since = datetime.fromisoformat(since) if since and since != "None" else None
+            start = datetime.fromisoformat(since) if since and since != "None" else None
+            hooks.history_since = payment_check_since(start, db_clock_at_init)
         return hooks
+
+
+def payment_check_since(workload_start: datetime | None, db_clock_at_init: datetime | None) -> datetime | None:
+    """Where the per-payment check starts reading the history: PAYMENT_SINCE_MARGIN_S before the
+    init snapshot by the database's clock, never before the workload's start. The scenario's own
+    acknowledged Payments are the ones checked (copy_span), so reading less history can only find
+    fewer rows -- a missing row is still missing, and an older row with the same values can no
+    longer stand in for it. Without the clock (or when the two times cannot be compared), the
+    workload's start, as before."""
+    if workload_start is None or db_clock_at_init is None:
+        return workload_start
+    if (workload_start.tzinfo is None) != (db_clock_at_init.tzinfo is None):
+        return workload_start
+    return max(workload_start, db_clock_at_init - timedelta(seconds=PAYMENT_SINCE_MARGIN_S))
 
 
 def _gz_lines(path: Path) -> Iterator[str]:

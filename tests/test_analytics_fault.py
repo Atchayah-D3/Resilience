@@ -14,13 +14,14 @@ import pytest
 
 from catalog.schema import AnalyticsLoad, Workload
 from resilience_tests.analysis.predicates import NOT_MEASURED
-from resilience_tests.control.faults.analytics import AnalyticsLoadFault, PhaseAbort, duration_s, hit_ratio, size_bytes
+from resilience_tests.control.faults.analytics import (AnalyticsLoadFault, PhaseAbort, clerk_hit_ratio, duration_s,
+                                                       hit_ratio, size_bytes)
 from resilience_tests.execution.injectors.analytics import minute_one, session_plan
 from resilience_tests.execution.injectors.base import DriverNotAvailable
 from resilience_tests.execution.workload import contract
 from resilience_tests.execution.workload.markers import MarkerJournals
 from resilience_tests.execution.workload.tpcc.profile import TpccDataError, TpccProfile
-from tests.test_analytics_run import SETTINGS
+from tests.test_analytics_run import SETTINGS, clerk_snapshot
 
 
 # --- the session plan and the minute-1 confirmation ----------------------------------------------
@@ -64,13 +65,24 @@ def test_the_hit_ratio_is_taken_between_two_snapshots():
     assert hit_ratio(a, None) is None and hit_ratio(a, a) is None   # nothing read: no ratio, never 1.0
 
 
+def snap(hit: int, read: int, **extra: Any) -> dict[str, Any]:
+    """One cache snapshot: the clerks' calls in pg_stat_statements (judged) and the untouched tables (evidence)."""
+    return {"clerks": clerk_snapshot(hit, read, **extra), "customers": {"hit": 10_000, "read": 0},
+            "reports": {"hit": 0, "read": 0}}
+
+
+def window_cache(window: str, hit: int, read: int) -> dict[str, Any]:
+    return {f"{window}_start": snap(0, 0), f"{window}_end": snap(hit, read)}
+
+
 # --- the behaviour, with a fake run context ------------------------------------------------------
 
 def ctx(tmp_path, **extra: Any) -> Any:
     fault = SimpleNamespace(analytics_load=AnalyticsLoad(), duration=300.0, type="analytics_load")
     scenario = SimpleNamespace(fault=fault, workload=SimpleNamespace(rate_tps=900.0), repeat=None)
     base = dict(scenario=scenario, facts={}, not_measured={}, disclosures=[], run_dir=tmp_path,
-                baseline=SimpleNamespace(tps=900.0), adapter=None, phase_timeout_s=lambda phase: 120.0)
+                baseline=SimpleNamespace(tps=900.0), adapter=None, phase_timeout_s=lambda phase: 120.0,
+                attached_rate_tps=None)
     return SimpleNamespace(**{**base, **extra})
 
 
@@ -102,17 +114,34 @@ def test_an_unlimited_login_is_accepted(tmp_path):
 
 def test_a_baseline_below_the_planned_rate_is_invalid(tmp_path):
     f = fault(tmp_path, baseline=SimpleNamespace(tps=800.0))
-    f._cache = {"baseline_start": {"customers": {"hit": 0, "read": 0}},
-                "baseline_end": {"customers": {"hit": 995, "read": 5}}}
+    f._cache = window_cache("baseline", 995, 5)
     with pytest.raises(PhaseAbort, match="below 95% of the planned 900 TPS"):
+        asyncio.run(f.before_inject())
+
+
+def test_attached_the_planned_rate_is_the_running_workloads_and_a_baseline_below_it_is_invalid(tmp_path):
+    # attached to the common workload: the scenario's own rate (here 900) and prepare's are not used
+    f = fault(tmp_path, baseline=SimpleNamespace(tps=1300.0), attached_rate_tps=1400.0)
+    assert f.planned_rate() == 1400.0
+    f._cache = window_cache("baseline", 995, 5)
+    with pytest.raises(PhaseAbort, match="1300.0 TPS, below 95% of the planned 1400 TPS"):
+        asyncio.run(f.before_inject())
+
+
+def test_an_unknown_planned_rate_is_invalid_never_skipped(tmp_path):
+    # rate_fraction_of_capacity with no rate recorded at prepare and no running workload: nothing to check against
+    f = fault(tmp_path, scenario=SimpleNamespace(fault=SimpleNamespace(analytics_load=AnalyticsLoad(), duration=300.0,
+                                                                       type="analytics_load"),
+                                                 workload=SimpleNamespace(rate_tps=None), repeat=None))
+    f._cache = window_cache("baseline", 995, 5)
+    with pytest.raises(PhaseAbort, match="planned rate is not known"):
         asyncio.run(f.before_inject())
 
 
 def test_reports_that_cannot_occupy_every_core_are_invalid(tmp_path):
     f = fault(tmp_path, settings={**SETTINGS, "role_max_parallel_workers_per_gather": "0", "cpu_cores": "16",
                                   "role_connection_limit": "-1"})
-    f._cache = {"baseline_start": {"customers": {"hit": 0, "read": 0}},
-                "baseline_end": {"customers": {"hit": 995, "read": 5}}}
+    f._cache = window_cache("baseline", 995, 5)
     with pytest.raises(PhaseAbort, match="only 7 processes busy"):     # 6 full-table x 1 + 1 index < 16
         asyncio.run(f.before_inject())
 
@@ -239,3 +268,106 @@ def test_worker_processes_below_two_are_not_a_setting():
     with pytest.raises(ValueError):
         Workload(profile="tpcc", concurrency=8, transaction_markers=True, rate_tps=100,
                  tpcc={"warehouses": 4, "worker_processes": 1})
+
+
+# --- back to normal: judged over the 60 s window, as scenario 3 ----------------------------------
+
+def test_back_to_normal_is_judged_over_the_60_s_window_so_a_lone_checkpoint_stall_does_not_rule_it_out(tmp_path):
+    from resilience_tests.analysis import rto_decomposer
+    from resilience_tests.execution.workload.histogram import latency_histogram
+    from resilience_tests.observability.event_stream import Event
+
+    f = fault(tmp_path)
+    assert f.slo_tps_window_s() == rto_decomposer.SLO_SUSTAIN_S and f.slo_tps_fraction() == 0.95
+    s, t0 = 1_000_000_000, 1_000 * 1_000_000_000
+    baseline = rto_decomposer.Baseline(2000.0, 30.0)
+
+    def sample(i: int, slow_ms: float | None = None) -> Event:
+        lat = [5.0] * 1990 + [slow_ms or 20.0] * 10        # 10 of 2,000 slow: 0.5% of the second
+        return Event(t0 + (i + 1) * s, 0.0, "workload", "sample",
+                     {"interval_s": 1.0, "commits": 2000, "tps": 2000.0, "p99_ms": slow_ms or 20.0,
+                      "latency_hist": latency_histogram(lat)})
+
+    # a checkpoint stall every 30 s: that second's p99 is 300 ms (10 x the baseline's), the rest is normal
+    samples = [sample(i, 300.0 if i % 30 == 15 else None) for i in range(120)]
+    per_second = rto_decomposer.slo_recovery(samples, t0, baseline, tps_fraction=f.slo_tps_fraction())
+    windowed = rto_decomposer.slo_recovery(samples, t0, baseline, tps_fraction=f.slo_tps_fraction(),
+                                           tps_window_s=f.slo_tps_window_s())
+    assert per_second == (None, None)          # never 60 s without a stall second
+    assert windowed == (0.0, 60.0)             # over the window, 0.5% of a few seconds is not the p99
+    # a service still slow for the whole window is not back to normal, windowed or not
+    slow = [sample(i, 300.0) for i in range(120)]
+    lat_slow = [Event(e.t_mono_ns, e.t_wall, e.source, e.kind,
+                      {**e.data, "latency_hist": latency_histogram([5.0] * 1960 + [300.0] * 40)}) for e in slow]
+    assert rto_decomposer.slo_recovery(lat_slow, t0, baseline, tps_fraction=0.95, tps_window_s=60.0) == (None, None)
+
+
+# --- the customers' cache hit ratio: their own calls on every table (pg_stat_statements) ---------
+
+def test_the_customers_ratio_counts_their_calls_on_every_table_not_only_the_tables_the_reports_never_read(tmp_path):
+    # the 21 November case: the untouched tables stay at 1.0 while the customers' own pages (most on
+    # order_line and orders, the tables the reports flood) fall to 70% hits -- now judged, and it fails
+    f = fault(tmp_path)
+    f._cache = {"baseline_start": snap(0, 0), "baseline_end": snap(99_500, 500),
+                "hold_start": snap(99_500, 500), "hold_end": snap(169_500, 30_500)}
+    for c in f._cache.values():
+        c["customers"] = {"hit": 10_000, "read": 0}
+    f._cache["baseline_end"]["customers"] = f._cache["hold_start"]["customers"] = {"hit": 20_000, "read": 0}
+    f._cache["hold_end"]["customers"] = {"hit": 30_000, "read": 0}
+    m = f._cache_measures()
+    assert m["customer_cache_hit_ratio_baseline"] == 0.995 and m["customer_cache_hit_ratio_hold"] == 0.7
+    assert m["customer_cache_hit_ratio_vs_baseline"] == pytest.approx(0.7 / 0.995, abs=1e-4)     # < 0.80: fails
+    facts = f.ctx.facts["analytics_cache_ratios"]
+    assert facts["untouched_tables_hold"] == 1.0                     # the old measure would have passed
+    assert facts["method"].startswith("pg_stat_statements")
+
+
+@pytest.mark.parametrize("change, why", [
+    ({"stats_reset": "2026-11-24T01:00:00+00:00"}, "was reset inside the window"),
+    ({"dealloc": 3}, "discarded entries"),
+])
+def test_counts_that_may_have_started_again_give_no_ratio(change, why):
+    ratio, reason = clerk_hit_ratio(snap(100, 0), snap(1_000, 10, **change))
+    assert ratio is None and why in reason
+
+
+def test_a_call_without_an_entry_or_with_a_count_that_went_down_gives_no_ratio():
+    start, end = snap(100, 0), snap(1_000, 10)
+    end["clerks"]["by_type"][contract.DELIVERY]["entries"] = 0
+    assert "no entry for the clerks' delivery" in clerk_hit_ratio(start, end)[1]
+    start, end = snap(100, 0), snap(1_000, 10)
+    start["clerks"]["by_type"][contract.PAYMENT]["calls"] = 50       # end has 1: the entry started again
+    assert "went down" in clerk_hit_ratio(start, end)[1]
+    assert clerk_hit_ratio(snap(100, 0), snap(100, 0)) == (None, "the clerks' calls read no page inside the window")
+    assert clerk_hit_ratio(snap(0, 0), snap(990, 10)) == (0.99, None)
+
+
+def test_unreadable_statements_give_no_ratio_and_say_why():
+    gone = {"clerks": None, "clerks_unavailable": "pg_stat_statements could not be read: X"}
+    assert clerk_hit_ratio(snap(0, 0), gone) == (None, "pg_stat_statements could not be read: X")
+    assert clerk_hit_ratio(None, snap(1, 1))[0] is None
+
+
+def test_a_baseline_that_cannot_be_measured_is_invalid_and_names_the_reason(tmp_path):
+    f = fault(tmp_path)
+    f._cache = {"baseline_start": snap(0, 0), "baseline_end": snap(995, 5, dealloc=1)}
+    with pytest.raises(PhaseAbort, match="could not be measured: pg_stat_statements discarded entries"):
+        asyncio.run(f.before_inject())
+
+
+def test_the_99_percent_validity_rule_uses_the_customers_own_calls(tmp_path):
+    # untouched tables all hits, but the customers' own pages only 98%: their data is not in the cache
+    f = fault(tmp_path)
+    f._cache = window_cache("baseline", 980, 20)
+    with pytest.raises(PhaseAbort, match="baseline cache hit ratio is 0.9800, below 0.99"):
+        asyncio.run(f.before_inject())
+
+
+@pytest.mark.parametrize("change, message", [
+    ({"pg_stat_statements": None}, "pg_stat_statements is not installed"),
+    ({"pg_stat_statements_track": None}, "library is not loaded"),
+    ({"pg_stat_statements_track": "none"}, "pg_stat_statements.track is 'none'"),
+])
+def test_a_target_without_pg_stat_statements_is_refused_at_init(tmp_path, change, message):
+    with pytest.raises(PhaseAbort, match=message):
+        fault(tmp_path, settings={**SETTINGS, **change})

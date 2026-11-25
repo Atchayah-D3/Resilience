@@ -8,6 +8,7 @@ ledger says an injection is undone, and which failures stop a verdict being issu
 
 import asyncio
 import re
+import json
 from pathlib import Path
 import time
 from typing import Any
@@ -349,6 +350,26 @@ def test_kill_run_measures_the_real_outage_and_passes(env):
     rto = results["measured"]["rto_first_write_s"]
     assert OUTAGE_S - 0.05 <= rto <= OUTAGE_S + 1.0
     assert results["facts"]["outage_observed"] is True and results["measured"]["starts_unattended"] is True
+
+
+def test_validate_shows_each_step_as_it_starts_and_ends(env):
+    """Validate took 30 min on the lab (attached: snapshot, end checks, pg_amcheck on 31 GB) and
+    printed nothing until its end, so it looked stuck. Each step is now an event, in order and
+    inside the phase, with how long it took; the watch window prints them."""
+    results = run(env, "NL-C-01")
+    assert results["status"] == "passed", why(results)
+    events = [json.loads(line) for line in (Path(results["evidence_dir"]) / "events.jsonl").read_text().splitlines()]
+    order = [e["data"]["text"] if e["kind"] == "validate_step" else f"{e['kind']}:{e['data']['phase']}"
+             for e in events if e["kind"] == "validate_step"
+             or (e["kind"] in ("phase_start", "phase_end") and e["data"]["phase"] == "validate")]
+    assert order[0] == "phase_start:validate" and order[-1] == "phase_end:validate"
+    steps = order[1:-1]
+    assert steps[0].startswith("lost-commit check:") and steps[1] == "lost-commit check done"
+    assert steps[2].startswith("integrity check started on the whole database (at most ")
+    assert steps[3].startswith("integrity check done: ")
+    assert "the fault's own measures" in steps and "the fault's own measures done" in steps
+    done = [e for e in events if e["kind"] == "validate_step" and e["data"]["text"].endswith("done")]
+    assert done and all(isinstance(e["data"]["took_s"], float) and e["data"]["took_s"] >= 0 for e in done)
 
 
 def test_checkpoint_crash_nlc02_passes_verdict(env):

@@ -12,9 +12,15 @@ damaged.
 
 The run is INVALID (stopped, never a pass) when the test could not be valid on this target: the
 login cannot log in or allows fewer sessions than the plan needs, a limit the limit tests need is
-not set, statement_timeout does not end inside the hold, the customers' baseline cache hit ratio
-is below 99% (a loss caused by the reports could not be seen), the baseline missed the planned
-rate, or the reports with their helpers cannot occupy every core.
+not set, statement_timeout does not end inside the hold, pg_stat_statements is not there to count
+the customers' own pages, the customers' baseline cache hit ratio is below 99% (a loss caused by
+the reports could not be seen), the baseline missed the planned rate, or the reports with their
+helpers cannot occupy every core.
+
+The customers' cache hit ratio counts the pages of their own TPC-C calls on every table they read
+(pg_stat_statements, the clerks' login), the report tables included: the reports flood exactly
+those, so a ratio over the other tables only would barely move (the 21 November run: 1.00019 of
+the baseline while the report tables fell to 0.707).
 """
 
 from __future__ import annotations
@@ -81,12 +87,42 @@ def size_bytes(value: str | None) -> int | None:
 
 def hit_ratio(start: dict[str, Any] | None, end: dict[str, Any] | None, group: str = "customers") -> float | None:
     """Pages found in the cache / pages read, between two cumulative snapshots; None without both
-    or without any page read."""
-    if not start or not end:
+    or without any page read. Table counters (evidence): `customers`, `reports`."""
+    if not start or not end or not start.get(group) or not end.get(group):
         return None
     hit = end[group]["hit"] - start[group]["hit"]
     read = end[group]["read"] - start[group]["read"]
     return hit / (hit + read) if hit + read > 0 else None
+
+
+def clerk_hit_ratio(start: dict[str, Any] | None, end: dict[str, Any] | None) -> tuple[float | None, str | None]:
+    """The customers' own cache hit ratio between two snapshots, from their TPC-C calls in
+    pg_stat_statements: (ratio, None), or (None, why) when the counts cannot be trusted. Never a
+    number from counts that may have restarted in between: pg_stat_statements reset, an entry
+    discarded to make room (dealloc moved), one of the five calls without an entry, or a count
+    that went down."""
+    if not start or not end:
+        return None, "the counters were not read at both ends of the window"
+    a, b = start.get("clerks"), end.get("clerks")
+    if not a or not b:
+        why = (start if not a else end).get("clerks_unavailable")
+        return None, why or "the clerks' statements were not read at both ends of the window"
+    if a.get("stats_reset") != b.get("stats_reset"):
+        return None, "pg_stat_statements was reset inside the window"
+    if a.get("dealloc") != b.get("dealloc"):
+        return None, ("pg_stat_statements discarded entries inside the window (pg_stat_statements.max): a clerk "
+                      "call's counts may have started again")
+    missing = sorted(t for t in contract.TPCC_TYPES
+                     if not (a["by_type"].get(t) or {}).get("entries") or not (b["by_type"].get(t) or {}).get("entries"))
+    if missing:
+        return None, f"pg_stat_statements has no entry for the clerks' {', '.join(missing)} at both ends of the window"
+    if any(b["by_type"][t][k] < a["by_type"][t][k] for t in contract.TPCC_TYPES for k in ("calls", "hit", "read")):
+        return None, "a clerk call's counts went down inside the window (its entry started again)"
+    hit = sum(b["by_type"][t]["hit"] - a["by_type"][t]["hit"] for t in contract.TPCC_TYPES)
+    read = sum(b["by_type"][t]["read"] - a["by_type"][t]["read"] for t in contract.TPCC_TYPES)
+    if hit + read <= 0:
+        return None, "the clerks' calls read no page inside the window"
+    return hit / (hit + read), None
 
 
 class AnalyticsSampler:
@@ -118,6 +154,10 @@ class AnalyticsSampler:
             except Exception as exc:  # noqa: BLE001 -- evidence only; retried
                 self.stream.emit("analytics", "unavailable", error=f"{type(exc).__name__}: {exc}")
                 await asyncio.sleep(SAMPLE_RETRY_S)
+
+
+def _r(value: float | None) -> float | None:
+    return None if value is None else round(value, 5)
 
 
 @register_fault
@@ -157,6 +197,17 @@ class AnalyticsLoadFault(HeldFault):
             raise PhaseAbort(f"invalid run: the analytics login allows {limit} sessions, but this target needs "
                              f"{self._plan.total} report sessions ({self._plan.full_table} full-table for "
                              f"{self._plan.cores} cores + {self._plan.index} index)")
+        if not observed.get("pg_stat_statements"):
+            raise PhaseAbort("invalid run: pg_stat_statements is not installed in the database, so the customers' "
+                             "cache hit ratio over every table they read cannot be measured (the operator adds it to "
+                             "shared_preload_libraries, restarts, and runs CREATE EXTENSION pg_stat_statements)")
+        track = observed.get("pg_stat_statements_track")
+        if track is None:
+            raise PhaseAbort("invalid run: the pg_stat_statements library is not loaded (shared_preload_libraries), "
+                             "so the customers' cache hit ratio cannot be measured")
+        if track not in ("top", "all"):
+            raise PhaseAbort(f"invalid run: pg_stat_statements.track is {track!r}, so the customers' calls are not "
+                             "counted and their cache hit ratio cannot be measured")
         if plan.limit_tests:
             hold = float(self.ctx.scenario.fault.duration)          # seconds: the catalog requires it
             timeout = duration_s(observed.get("role_statement_timeout"))
@@ -193,6 +244,14 @@ class AnalyticsLoadFault(HeldFault):
     def slo_tps_fraction(self) -> float | None:
         return NORMAL_TPS_FRACTION
 
+    def slo_tps_window_s(self) -> float | None:
+        """The document's "60 s straight" is judged as one window of the sustain period, as scenario 3
+        does (lock_pileup.py): TPS over the whole window and the p99 of every transaction in it, like
+        the baseline p99 it is compared with. Held per second, one checkpoint stall fails the second,
+        so even the undisturbed baseline never finds 60 good seconds in a row (21 and 23 November
+        runs: 529-553 of 599 seconds compliant) and rto_to_slo_s could never be measured."""
+        return rto_decomposer.SLO_SUSTAIN_S      # read at call time: the window IS the sustain period
+
     def phase_extension_s(self, phase: str) -> float:
         if phase != "recovery":
             return super().phase_extension_s(phase)
@@ -224,6 +283,12 @@ class AnalyticsLoadFault(HeldFault):
         await self._snapshot("hold_end")
 
     def planned_rate(self) -> float | None:
+        """The rate the customers were planned to run: the running common workload's when attached
+        (this run neither sized nor started it), else what the run's own workload resolved at
+        prepare (rate_fraction_of_capacity), else the scenario's rate_tps."""
+        attached = self.ctx.attached_rate_tps
+        if attached:
+            return float(attached)
         prepared = (self.ctx.facts.get("workload_prepare") or {}).get("tpcc_data") or {}
         rate = (prepared.get("rate") or {}).get("rate_tps")
         return float(rate) if rate else self.ctx.scenario.workload.rate_tps
@@ -232,15 +297,19 @@ class AnalyticsLoadFault(HeldFault):
         """The validity rules that need the baseline, checked before anything is applied."""
         await super().before_inject()
         ctx = self.ctx
-        ratio = hit_ratio(self._cache.get("baseline_start"), self._cache.get("baseline_end"))
+        ratio, why = clerk_hit_ratio(self._cache.get("baseline_start"), self._cache.get("baseline_end"))
         if ratio is None:
-            raise PhaseAbort("invalid run: the customers' cache hit ratio of the baseline could not be measured")
+            raise PhaseAbort(f"invalid run: the customers' cache hit ratio of the baseline could not be measured: {why}")
         if ratio < BASELINE_HIT_RATIO_MIN:
             raise PhaseAbort(f"invalid run: the customers' baseline cache hit ratio is {ratio:.4f}, below "
                              f"{BASELINE_HIT_RATIO_MIN}: their data is not in the memory cache, so a loss caused by "
                              "the reports could not be seen (fewer active warehouses or a larger cache are needed)")
         rate, baseline = self.planned_rate(), ctx.baseline
-        if rate and baseline is not None and baseline.tps < RATE_KEPT_FRACTION * rate:
+        if not rate:
+            # never skipped: a baseline that missed the plan could not be told from one that kept it
+            raise PhaseAbort("invalid run: the customers' planned rate is not known, so the baseline cannot be "
+                             "checked against it")
+        if baseline is not None and baseline.tps < RATE_KEPT_FRACTION * rate:
             raise PhaseAbort(f"invalid run: the baseline delivered {baseline.tps:.1f} TPS, below "
                              f"{RATE_KEPT_FRACTION:.0%} of the planned {rate:g} TPS")
         helpers = self.helpers_per_report()
@@ -260,9 +329,10 @@ class AnalyticsLoadFault(HeldFault):
         d.append(f"Reports: {len(detail.get('sessions') or [])} sessions of the login {detail.get('login')!r} "
                  f"(tag {detail.get('application_name')}); the index reports read warehouses "
                  f"{detail.get('extra_warehouses')}, which the customers do not use.")
-        d.append("The customers' cache hit ratio is measured on the TPC-C tables the reports never read (warehouse, "
-                 "district, customer, history, new_order, item, stock): a report's own pages need no subtracting, and "
-                 "the limit tests, which end with an error, return no page counts to subtract.")
+        d.append("The customers' cache hit ratio counts the pages of their own five TPC-C calls on every table they "
+                 "read, order_line and orders included (pg_stat_statements, for the clerks' login; a call's counts "
+                 "include every statement inside its function). The reports' pages are not in it: they log in as "
+                 "another role. The ratio on the tables the reports never read is kept as evidence only.")
         d.append("The customers log in as the harness role, which has no limits; only the report login is limited.")
         d.append("90% within 5 s is judged on the worst 1-second p90 of each type during the hold, never lower "
                  "than the p90 over the whole hold.")
@@ -293,20 +363,27 @@ class AnalyticsLoadFault(HeldFault):
         return {name: NOT_MEASURED}
 
     def _cache_measures(self) -> dict[str, Any]:
-        base = hit_ratio(self._cache.get("baseline_start"), self._cache.get("baseline_end"))
-        hold = hit_ratio(self._cache.get("hold_start"), self._cache.get("hold_end"))
-        reports = hit_ratio(self._cache.get("hold_start"), self._cache.get("hold_end"), group="reports")
-        self.ctx.facts["analytics_cache_ratios"] = {"customers_baseline": base, "customers_hold": hold,
-                                                    "report_tables_hold": reports}
+        c = self._cache
+        base, base_why = clerk_hit_ratio(c.get("baseline_start"), c.get("baseline_end"))
+        hold, hold_why = clerk_hit_ratio(c.get("hold_start"), c.get("hold_end"))
+        self.ctx.facts["analytics_cache_ratios"] = {
+            "method": "pg_stat_statements: the clerks' five TPC-C calls, every table",
+            "customers_baseline": base, "customers_hold": hold,
+            "not_measured": {k: v for k, v in (("baseline", base_why), ("hold", hold_why)) if v},
+            # evidence only: table counters, whoever read the pages
+            "untouched_tables_baseline": hit_ratio(c.get("baseline_start"), c.get("baseline_end")),
+            "untouched_tables_hold": hit_ratio(c.get("hold_start"), c.get("hold_end")),
+            "report_tables_hold": hit_ratio(c.get("hold_start"), c.get("hold_end"), group="reports")}
         out: dict[str, Any] = {}
-        for name, value in (("customer_cache_hit_ratio_baseline", base), ("customer_cache_hit_ratio_hold", hold)):
-            out.update({name: round(value, 5)} if value is not None
-                       else self._not(name, "the cache counters were not read at both ends of the window"))
+        for name, value, why in (("customer_cache_hit_ratio_baseline", base, base_why),
+                                 ("customer_cache_hit_ratio_hold", hold, hold_why)):
+            out.update({name: round(value, 5)} if value is not None else self._not(name, why or "not measured"))
         if base and hold is not None:
             out["customer_cache_hit_ratio_vs_baseline"] = round(hold / base, 5)
         else:
             out.update(self._not("customer_cache_hit_ratio_vs_baseline",
-                                 "the customers' cache hit ratio was not measured in the baseline and the hold"))
+                                 "the customers' cache hit ratio was not measured in the baseline and the hold: "
+                                 + "; ".join(w for w in (base_why, hold_why) if w)))
         return out
 
     def _hold_bounds(self) -> tuple[int, int] | None:
@@ -422,6 +499,7 @@ class AnalyticsLoadFault(HeldFault):
         if not state:
             return []
         m = r.get("measured") or {}
+        cache = facts.get("analytics_cache_ratios") or {}
         kinds = state.get("by_kind") or {}
         tests = state.get("limit_tests") or {}
         validity = facts.get("analytics_validity") or {}
@@ -445,7 +523,10 @@ class AnalyticsLoadFault(HeldFault):
             f"{m.get('statement_timeout_enforced')} (overrun {m.get('statement_timeout_overrun_s')} s)",
             f"  customers: TPS ratio {m.get('oltp_tps_ratio')}  p99 ratio {m.get('oltp_p99_ratio')}  worst p90 "
             f"{m.get('customer_p90_max_s')} s  cache hit {m.get('customer_cache_hit_ratio_baseline')} -> "
-            f"{m.get('customer_cache_hit_ratio_hold')} ({m.get('customer_cache_hit_ratio_vs_baseline')} of baseline)",
+            f"{m.get('customer_cache_hit_ratio_hold')} ({m.get('customer_cache_hit_ratio_vs_baseline')} of baseline; "
+            f"their calls, every table)",
+            f"  cache hit, evidence only: tables the reports never read {_r(cache.get('untouched_tables_baseline'))} -> "
+            f"{_r(cache.get('untouched_tables_hold'))}; report tables in the hold {_r(cache.get('report_tables_hold'))}",
             f"  helpers: most per report {m.get('report_helpers_max')}, samples over the limit "
             f"{m.get('helpers_over_limit')}; all sessions open in {m.get('analytics_active_share')} of the samples; "
             f"confirmed at minute {CONFIRM_AT_S / 60:g}: {m.get('fault_confirmed')}",

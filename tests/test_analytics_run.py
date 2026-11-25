@@ -27,6 +27,7 @@ from resilience_tests.control.orchestrator import RunOptions, TestOrchestrator
 from resilience_tests.control.profile import DbEndpoint
 from resilience_tests.execution.injectors import analytics as driver_mod
 from resilience_tests.execution.injectors.analytics import OsSshAnalyticsDriver
+from resilience_tests.execution.workload import contract
 from tests.test_lock_pileup_run import ActiveService
 from tests.test_orchestrator import OutageAdapter, outcomes, scenario, why
 from tests.test_orchestrator import env  # noqa: F401  (env is a fixture)
@@ -40,7 +41,16 @@ SETTINGS = {"analytics_login": "analytics_role", "shared_buffers": "1GB", "max_p
             "max_parallel_workers_per_gather": "2", "max_worker_processes": "8", "max_connections": "100",
             "role_exists": "true", "role_can_login": "true", "role_connection_limit": "4",
             "role_max_parallel_workers_per_gather": "2", "role_work_mem": "16MB", "role_temp_file_limit": "4GB",
-            "role_statement_timeout": f"{TIMEOUT_S:g}s", "cpu_cores": "8"}
+            "role_statement_timeout": f"{TIMEOUT_S:g}s", "cpu_cores": "8",
+            "pg_stat_statements": "1.11", "pg_stat_statements_track": "top"}
+
+
+def clerk_snapshot(hit: int, read: int, **extra: Any) -> dict[str, Any]:
+    """pg_stat_statements' counts of the clerks' five calls (all pages on New-Order, for short)."""
+    by_type = {t: {"entries": 1, "calls": 1, "hit": 0, "read": 0} for t in contract.TPCC_TYPES}
+    by_type[contract.NEW_ORDER].update(hit=hit, read=read)
+    return {"login": "harness", "hit": hit, "read": read, "calls": 5, "by_type": by_type, "dealloc": 0,
+            "stats_reset": "2026-11-24T00:00:00+00:00", **extra}
 
 
 class Reports:
@@ -145,7 +155,9 @@ class AnalyticsEngine(OutageAdapter):
             hit = round(pages * Reports.hit_ratios[period])
             Reports.counters["customers"]["hit"] += hit
             Reports.counters["customers"]["read"] += pages - hit
-        return {"customers": dict(Reports.counters["customers"]), "reports": dict(Reports.counters["reports"])}
+        clerks = clerk_snapshot(Reports.counters["customers"]["hit"], Reports.counters["customers"]["read"])
+        return {"clerks": clerks, "clerks_unavailable": None, "customers": dict(Reports.counters["customers"]),
+                "reports": dict(Reports.counters["reports"])}
 
 
 @pytest.fixture

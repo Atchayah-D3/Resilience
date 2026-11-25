@@ -51,7 +51,8 @@ def _workload(**extra):
 def test_the_shipped_settings_file_is_valid():
     cfg = load_config(REPO / "workloads" / "oltp-common.yaml")
     assert cfg.workload.profile == "tpcc" and cfg.workload.transaction_markers
-    assert cfg.duration_s == 7200 and cfg.warmup_s < cfg.duration_s
+    # until the stop command: a fixed end could fall inside a scenario of a suite (the review of 21 Nov)
+    assert cfg.duration_s is None and cfg.until_stopped and cfg.warmup_s == 300
     assert cfg.workload.rate_fraction_of_capacity == 0.6 and cfg.workload.latency_from == "intended_start"
 
 

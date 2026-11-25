@@ -338,3 +338,26 @@ def test_without_the_run_start_time_the_payment_check_is_not_measured(tmp_path):
     p.history_since = None
     _, _, reasons = split_checks(asyncio.run(p.consistency_checks(FakeAdapter(db={"a", "b", "c"}), _run_dir(tmp_path))))
     assert "partial_commits" in reasons and "start time" in reasons["partial_commits"]
+
+
+def test_driver_load_counts_the_processes_from_their_samples_when_no_start_event_exists(tmp_path):
+    """An attached run's events are copied from the common workload from the init snapshot on:
+    no "start" event, yet the clerks ran in 2 processes (20 Nov run: the facts said 1)."""
+    from resilience_tests.execution.workload.tpcc.profile import _driver_load
+    events = tmp_path / "events.jsonl"
+    lines = [{"source": "workload", "kind": "driver_load",
+              "data": {"cpu_share": [0.374, 0.37], "loop_lag_s": [0.0, 0.001], "processes_reporting": 2}},
+             {"source": "workload", "kind": "driver_load",
+              "data": {"cpu_share": [0.425, 0.4], "loop_lag_s": [0.002, 0.0], "processes_reporting": 2}}]
+    events.write_text("".join(json.dumps(e) + "\n" for e in lines))
+    assert _driver_load(events) == {"driver_limited": False, "max_cpu_share": 0.425, "max_loop_lag_s": 0.002,
+                                    "processes": 2}
+
+
+def test_driver_load_still_reads_the_start_event_of_a_run_with_its_own_workload(tmp_path):
+    from resilience_tests.execution.workload.tpcc.profile import _driver_load
+    events = tmp_path / "events.jsonl"
+    lines = [{"source": "workload", "kind": "start", "data": {"processes": 2}},
+             {"source": "workload", "kind": "driver_load", "data": {"cpu_share": [0.3], "loop_lag_s": [0.0]}}]
+    events.write_text("".join(json.dumps(e) + "\n" for e in lines))
+    assert _driver_load(events)["processes"] == 2

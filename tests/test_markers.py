@@ -141,3 +141,19 @@ def test_marker_numbers_are_unique_across_worker_processes(tmp_path):
     assert len(numbers) == len(set(numbers)) == 200
     with pytest.raises(ValueError):
         MarkerJournals(tmp_path, index=4, processes=4)
+
+
+def test_unused_journals_are_closed_and_their_empty_files_removed(tmp_path):
+    """Review of 21 Nov: 0-byte marker.jrnl / acked.jrnl beside the worker processes' journals. The
+    main program's journals, never written when the clerks run in worker processes, are removed;
+    a file with anything in it is kept, and closing again does nothing."""
+    unused = MarkerJournals(tmp_path)
+    assert (tmp_path / "marker.jrnl").exists() and (tmp_path / "acked.jrnl").exists()
+    assert unused.discard_unused() == ["marker.jrnl", "acked.jrnl"]
+    assert not (tmp_path / "marker.jrnl").exists() and not (tmp_path / "acked.jrnl").exists()
+    unused.close()                                          # the owner's own close later: no error
+
+    used = MarkerJournals(tmp_path / "used" if (tmp_path / "used").mkdir() is None else tmp_path)
+    asyncio.run(used.written(1, "u1", 1.0))
+    assert used.discard_unused() == ["acked.jrnl"]           # the marker line is kept
+    assert (tmp_path / "used" / "marker.jrnl").stat().st_size > 0

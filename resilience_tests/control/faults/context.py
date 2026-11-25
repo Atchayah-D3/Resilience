@@ -70,6 +70,13 @@ class RunContext:
         """The undisturbed load (MeasuredWindow), once the baseline phase has measured it."""
         return self._run.baseline
 
+    @property
+    def attached_rate_tps(self) -> float | None:
+        """The rate (TPS) of the running common workload this run is attached to (specs/007), as
+        the service runs it; None when the run has its own workload."""
+        attached = self._run.attached
+        return attached.rate_tps if attached is not None else None
+
     # ------------------------------------------------------------------ observing the target
 
     @property

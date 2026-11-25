@@ -310,6 +310,9 @@ def test_the_watcher_narrates_a_run_in_plain_words(tmp_path):
     stream.emit("injector", "t0", fault="lock_pileup", blocker="long_read")
     issued = stream.emit("orchestrator", "phase_end", phase="baseline", outcome="ok", error=None).t_mono_ns
     stream.emit("orchestrator", "fault_milestone", text="schema change issued", at_mono_ns=issued - 2 * 10**9)
+    stream.emit("orchestrator", "validate_step", text="integrity check started on the whole database (at most 1800 s)")
+    stream.emit("orchestrator", "validate_step", text="integrity check done: 0 structural errors, 0 checksum failures",
+                took_s=574.4)
     stream.emit("orchestrator", "run_end")
     stream.close()
     (run_dir / "results.json").write_text(json.dumps({
@@ -324,6 +327,8 @@ def test_the_watcher_narrates_a_run_in_plain_words(tmp_path):
     assert "slow write probes 3" in text and "lock-wait log lines 30" in text          # counted, not flooded
     assert text.count("still waiting") == 1
     assert "T0  FAULT INJECTED  fault=lock_pileup, blocker=long_read" in text and "FAULT  schema change issued" in text
+    assert "validate: integrity check started on the whole database (at most 1800 s)" in text
+    assert "validate: integrity check done: 0 structural errors, 0 checksum failures  (574 s)" in text
     assert "STATUS: PASSED" in text and "Grafana: http://grafana:3000/d/resilience-run" in text
 
 

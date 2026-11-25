@@ -24,6 +24,7 @@ from resilience_tests.execution.workload.attached import (
     CutOff,
     SpanCheckAdapter,
     compare_snapshots,
+    payment_check_since,
 )
 from resilience_tests.execution.workload.histogram import latency_histogram
 from resilience_tests.execution.workload.markers import DB_MARKERS_FILE
@@ -114,6 +115,81 @@ def test_a_workload_that_is_not_the_one_the_scenario_needs_is_refused_naming_the
     w = AttachedWorkload(folder_with(tmp_path), None)
     problems = w.match_problems(wanted(**change), env, "shaktidb-standalone")
     assert any(message in p for p in problems), problems
+
+
+# --- the warehouses the clerks use (NL-N-I01: the fault alone reads the others) -----------------------
+
+ACTIVE_SCENARIO = {"warehouses": "by_cache", "order_line_cache_multiple": 8, "active_warehouses": "by_cache",
+                   "active_cache_share": 0.5}
+
+
+def workload_on(active):
+    """What the service records it runs: sizes as numbers (283 loaded, `active` used; None: all)."""
+    return wanted(tpcc={"warehouses": 283, "active_warehouses": active}).model_dump(mode="json")
+
+
+def test_a_scenario_keeping_its_clerks_on_part_of_the_warehouses_is_refused_by_a_workload_using_all(tmp_path):
+    w = AttachedWorkload(folder_with(tmp_path, used=workload_on(None)), None)
+    assert w.tpcc_layout["extra_warehouses"] is None
+    problems = w.match_problems(wanted(tpcc=ACTIVE_SCENARIO), "e2-u22-3", "shaktidb-standalone")
+    assert len(problems) == 1 and "use every one of its 283 warehouses" in problems[0], problems
+    assert "active_warehouses" in problems[0]
+
+
+def test_a_workload_leaving_warehouses_untouched_serves_it_and_hands_over_its_layout(tmp_path):
+    w = AttachedWorkload(folder_with(tmp_path, used=workload_on(4)), None)
+    assert w.match_problems(wanted(tpcc=ACTIVE_SCENARIO), "e2-u22-3", "shaktidb-standalone") == []
+    assert w.tpcc_layout == {"warehouses": 283, "active_warehouses": 4, "cache_bytes": None, "by_cache": [],
+                             "extra_warehouses": (5, 283)}
+    d = w.describe()
+    assert d["active_warehouses"] == 4 and d["extra_warehouses"] == (5, 283)
+    # a scenario that does not care which warehouses the clerks use (NL-N-I03) attaches to it too
+    assert w.match_problems(wanted(), "e2-u22-3", "shaktidb-standalone") == []
+
+
+def test_a_number_of_active_warehouses_the_scenario_states_is_compared(tmp_path):
+    w = AttachedWorkload(folder_with(tmp_path, used=workload_on(4)), None)
+    problems = w.match_problems(wanted(tpcc={"warehouses": 283, "active_warehouses": 6}),
+                                "e2-u22-3", "shaktidb-standalone")
+    assert problems == ["the scenario's clerks use 6 warehouses (active_warehouses), the common workload's use 4"]
+
+
+def test_the_layout_takes_the_memory_cache_the_service_recorded(tmp_path):
+    folder = folder_with(tmp_path, used=workload_on(4))
+    info = st.read_info(folder)
+    info["start_facts"] = {"data_step": {"tpcc_layout": {"warehouses": 283, "active_warehouses": 4,
+                                                          "cache_bytes": 2**30,
+                                                          "by_cache": ["warehouses", "active_warehouses"]}}}
+    st.write_info(folder, info)
+    layout = AttachedWorkload(folder, None).tpcc_layout
+    assert layout["cache_bytes"] == 2**30 and layout["by_cache"] == ["warehouses", "active_warehouses"]
+    assert layout["extra_warehouses"] == (5, 283)
+
+
+def test_attached_init_hands_the_workloads_layout_to_the_adapter_for_the_fault(tmp_path):
+    from types import SimpleNamespace
+
+    from resilience_tests.adapters.base import TpccSupport
+    from resilience_tests.control.orchestrator import TestOrchestrator
+
+    w = AttachedWorkload(folder_with(tmp_path, used=workload_on(4)), EventStream(tmp_path / "run.jsonl"))
+    cut = SimpleNamespace(facts=lambda: {})
+
+    async def cut_off(adapter, path, settle_s):
+        return cut
+    w.cut_off = cut_off
+
+    class Adapter(TpccSupport):
+        pass
+
+    async def check_ready():
+        pass
+    run = SimpleNamespace(attached=w, stream=EventStream(tmp_path / "run2.jsonl"), disclosures=[], facts={},
+                          adapter=Adapter(), run_dir=tmp_path, fault_behaviour=SimpleNamespace(check_ready=check_ready),
+                          _mark_on_event=lambda e: None)
+    asyncio.run(TestOrchestrator._init_attached(run))
+    assert run.adapter.tpcc_layout()["extra_warehouses"] == (5, 283)
+    assert any("the clerks use warehouses 1-4; 5-283 only the fault reads" in d for d in run.disclosures)
 
 
 # --- healthy ---------------------------------------------------------------------------------------
@@ -335,6 +411,21 @@ def test_the_tpcc_checks_start_from_the_workloads_own_start(tmp_path):
     assert hooks.workload.tpcc.warehouses == 64
 
 
+def test_the_payment_check_reads_the_history_from_just_before_the_init_snapshot_not_the_workloads_start(tmp_path):
+    # the review of 21 Nov: from the workload's start, that history grows with every hour and scenario
+    from datetime import datetime, timedelta, timezone
+    start = datetime(2026, 11, 24, 9, 0, 0)
+    clock = datetime(2026, 11, 24, 11, 0, 0)                       # the database's clock at the init snapshot
+    assert payment_check_since(start, clock) == clock - timedelta(seconds=60)
+    assert payment_check_since(start, start + timedelta(seconds=30)) == start      # never before the workload's start
+    assert payment_check_since(start, None) == start                # clock not read: as before
+    assert payment_check_since(None, clock) is None                 # start not recorded: the check says so
+    assert payment_check_since(start, clock.replace(tzinfo=timezone.utc)) == start  # not comparable: as before
+    aware = datetime(2026, 11, 24, 12, 0, 0, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    hooks = AttachedWorkload(folder_with(tmp_path), None).tpcc_hooks(aware)
+    assert hooks.history_since == aware - timedelta(seconds=60)
+
+
 # --- against the real service, while it keeps writing ---------------------------------------------------
 
 
@@ -460,6 +551,14 @@ def test_a_kill_scenario_runs_all_nine_phases_attached_and_the_workload_keeps_ru
     copied = [json.loads(x) for x in (run_dir / "events.jsonl").read_text().splitlines()]
     assert sum(1 for e in copied if e["source"] == "workload" and e["kind"] == "sample") > 3
     assert any("Attached to the running common workload" in d for d in results["disclosures"])
+    # validate's steps, in order: the snapshot, the copy, the comparison, the end checks (with
+    # their own steps), then the integrity check
+    steps = [e["data"]["text"] for e in copied if e["kind"] == "validate_step"]
+    firsts = [next(i for i, t in enumerate(steps) if t.startswith(p)) for p in
+              ("database snapshot: reading", "database snapshot taken: ", "this scenario's journal lines copied: ",
+               "snapshots compared", "end checks started", "end checks: sending the marker journals",
+               "end checks done", "integrity check started", "integrity check done")]
+    assert firsts == sorted(firsts), steps
 
 
 def test_the_baseline_waits_until_the_workload_has_settled_after_a_restart(tmp_path):

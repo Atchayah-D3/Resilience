@@ -118,6 +118,9 @@ class Narrator:
             out.append(f"{at}  !! the fault did NOT land: {d.get('reason') or d}")
         elif kind == "fault_milestone":
             out.append(f"{at}  ***** FAULT  {d.get('text')}")
+        elif kind == "validate_step":
+            took = f"  ({d['took_s']:.0f} s)" if isinstance(d.get("took_s"), (int, float)) else ""
+            out.append(f"{at}     validate: {d.get('text')}{took}")
         elif kind == "hold_start":
             out.append(f"{at}  HOLD start (at most {d.get('planned_s')} s)")
         elif kind == "hold_end":

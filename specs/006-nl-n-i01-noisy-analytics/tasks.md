@@ -43,3 +43,13 @@
 - [X] T019 A report session stops on an unexpected error; immediate failures make the fault not landed (adapters/postgresql/analytics.py)
 - [X] T020 workload.tpcc.worker_processes (catalog/schema.py, tpcc/profile.py); NL-N-I01 sets 2
 - [X] T021 Tests: tests/test_analytics_db.py (reload keeps grants, reports without permission stop), tests/test_analytics_fault.py, tests/test_analytics_run.py
+
+## Phase 8: Attached to the common workload (specs/007, Option A; branch scenario1-attach-workload)
+
+- [X] T022 workloads/oltp-common.yaml: the clerks on the active warehouses (active_warehouses: by_cache, active_cache_share: 0.5); no reload (the loaded warehouses do not change)
+- [X] T023 resilience_tests/execution/workload/attached.py: the running workload's TPC-C layout (tpcc_layout, describe); a scenario that keeps its clerks on part of the warehouses is refused by a workload whose clerks use every one; a stated number of active warehouses is compared
+- [X] T024 resilience_tests/control/orchestrator.py `_init_attached`: the layout handed to the adapter (the index reports' extra warehouses) and disclosed
+- [X] T025 resilience_tests/control/faults/analytics.py + context.py: the planned rate is the running workload's when attached; an unknown planned rate makes the run invalid (was skipped)
+- [X] T026 catalog/NL/NL-N-I01.yaml: the common workload's session settings; the attached run explained
+- [X] T027 Tests: tests/test_attached_workload.py (layout refusal and handover), tests/test_analytics_fault.py (planned rate attached, unknown rate)
+- [ ] T028 Lab (user): capacity record for the active layout, the common workload started with it, NL-N-I01 attached, then NL-N-I03a re-run on the new layout (teammate)

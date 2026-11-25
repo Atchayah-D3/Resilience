@@ -390,7 +390,8 @@ def test_several_worker_processes_lose_nothing_and_their_numbers_add_up(adapter,
     drv, window, events, ready_s, stop_s = asyncio.run(go())
     assert drv.failure is None, drv.failure
     assert window.tps > 300, window
-    assert len(journal_paths(tmp_path, ACKED_JOURNAL)) == 4              # acked.jrnl (empty) + one per process
+    # one per process; the main program's empty acked.jrnl / marker.jrnl are removed at the start
+    assert len(journal_paths(tmp_path, ACKED_JOURNAL)) == 3 and not (tmp_path / ACKED_JOURNAL).exists()
     db = asyncio.run(adapter.marker_ids())
     diff, torn = diff_from_journals(tmp_path, db)
     assert torn == 0 and diff.rpo_txn == 0 and not diff.phantom and not diff.unjournalled_ack
