@@ -204,6 +204,11 @@ def _eval(node: ast.AST, measured: Mapping[str, Any], source: str) -> Any:
                 raise NotApplicableMeasurement(name)
             if value is NOT_MEASURED:
                 raise NotMeasuredMeasurement(name)
+            # None is a value nobody took (a time never reached, a sample never read): comparing it
+            # crashes ("x <= 60" raises TypeError, reported as ERROR) or, worse, "x != 0" is True --
+            # a pass from no measurement at all. It is not measured.
+            if value is None:
+                raise NotMeasuredMeasurement(name)
             # NaN is what a failed calculation yields (0/0): not a value. Every comparison with it
             # is False except !=, which would be True -- a pass from no measurement at all.
             if isinstance(value, float) and math.isnan(value):

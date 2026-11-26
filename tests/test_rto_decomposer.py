@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from resilience_tests.analysis.predicates import NOT_APPLICABLE
+from resilience_tests.analysis.predicates import NOT_APPLICABLE, NOT_MEASURED
 from resilience_tests.analysis.rto_decomposer import Baseline, decompose, first_write_after, slo_recovery
 from resilience_tests.observability.event_stream import Event, read_stream
 
@@ -110,3 +110,24 @@ def test_decomposition_is_also_reported_under_the_document_component_names():
     m = d.as_measured()
     assert m["t_reconnect_s"] == m["rto_first_write_s"] == pytest.approx(24.6)
     assert m["t_reconnect_s"] + m["t_warm_s"] == pytest.approx(m["rto_to_slo_s"])
+
+
+def test_a_return_to_slo_not_seen_in_the_watch_is_not_measured_with_the_reason_never_none():
+    """Was: rto_to_slo_s stayed None, so `rto_to_slo_s <= 60` crashed and was reported as ERROR."""
+    from resilience_tests.analysis import rto_decomposer
+    from resilience_tests.analysis.threshold_eval import evaluate_one
+
+    m = {"rto_to_slo_s": None, "t_warm_s": None, "rto_first_write_s": 0.0}
+    reasons = rto_decomposer.not_back_in_time(m, 295.0)
+    assert m["rto_to_slo_s"] is NOT_MEASURED and m["t_warm_s"] is NOT_MEASURED
+    assert m["rto_first_write_s"] == 0.0                         # a measured value is left alone
+    assert "not back to normal within the 295 s watched from" in reasons["rto_to_slo_s"]
+    r = evaluate_one("rto_to_slo_s <= 60", m, reasons)
+    assert r.outcome == "not_measured" and not r.passed
+    assert "not back to normal within the 295 s watched from" in r.reason
+
+
+def test_a_measured_return_to_slo_is_kept():
+    from resilience_tests.analysis import rto_decomposer
+    m = {"rto_to_slo_s": 42.0, "t_warm_s": 40.0}
+    assert rto_decomposer.not_back_in_time(m, 295.0) == {} and m == {"rto_to_slo_s": 42.0, "t_warm_s": 40.0}
