@@ -371,3 +371,67 @@ def test_the_99_percent_validity_rule_uses_the_customers_own_calls(tmp_path):
 def test_a_target_without_pg_stat_statements_is_refused_at_init(tmp_path, change, message):
     with pytest.raises(PhaseAbort, match=message):
         fault(tmp_path, settings={**SETTINGS, **change})
+
+
+# --- the recovery watch and the wait evidence ------------------------------------------------------
+
+def test_the_recovery_is_watched_long_enough_to_measure_a_late_return(tmp_path):
+    """Was: 130 s watched (60 s limit + one 60 s window + 10 s), so a return later than about 70 s was
+    only 'not reached'. Now the phase may watch 300 s after the reports stop (it ends as soon as the
+    customers are back)."""
+    from resilience_tests.control.faults.analytics import RECOVERY_WATCH_S
+    f = fault(tmp_path)                                   # the profile's recovery bound: 120 s
+    assert f.phase_extension_s("recovery") == RECOVERY_WATCH_S - 120.0
+    assert f.phase_extension_s("validate") == 0.0
+
+
+def db_sample(t_ns: int, waits: dict[str, int]) -> Any:
+    return SimpleNamespace(source="db_activity", kind="sample", t_mono_ns=t_ns, data={"wait_events": waits})
+
+
+def host_sample(t_ns: int, si: int, so: int) -> Any:
+    return SimpleNamespace(source="host_stats", kind="sample", t_mono_ns=t_ns, data={"si": si, "so": so})
+
+
+def load_sample(t_ns: int, p99_ms: float) -> Any:
+    return SimpleNamespace(source="workload", kind="sample", t_mono_ns=t_ns, data={"p99_ms": p99_ms})
+
+
+def test_the_waits_are_averaged_per_group_and_the_worst_seconds_name_their_main_wait():
+    from resilience_tests.control.faults.analytics import wait_evidence
+    s = 1_000_000_000
+    events = [db_sample(1 * s, {"Lock:transactionid": 30, "Lock:tuple": 6, "LWLock:WALWrite": 4, "IO:WalSync": 2}),
+              db_sample(2 * s, {"Lock:transactionid": 2, "IO:DataFileRead": 3, "IO:BufFileWrite": 9}),
+              db_sample(9 * s, {"Lock:transactionid": 99}),                       # outside the window
+              host_sample(1 * s, 0, 4096), host_sample(2 * s, 8, 0),
+              load_sample(1 * s, 900.0), load_sample(2 * s, 20.0)]
+    w = wait_evidence(events, 1 * s, 2 * s, worst_seconds=1)
+    assert (w["row_locks_mean"], w["wal_mean"], w["disk_reads_mean"]) == (19.0, 3.0, 1.5)
+    assert (w["swap_in_kb"], w["swap_out_kb"]) == (8, 4096)
+    assert w["worst"] == {"seconds": 1, "p99_ms_min": 900.0, "p99_ms_max": 900.0,
+                          "main_wait": "Lock:transactionid", "main_wait_sessions_mean": 30.0}
+
+
+def test_a_window_without_samples_reports_no_figure_never_a_zero():
+    from resilience_tests.control.faults.analytics import wait_evidence, wait_lines
+    w = wait_evidence([], 0, 10)
+    assert w == {"db_samples": 0, "host_samples": 0}
+    assert "baseline: no sample" in "\n".join(wait_lines({"baseline": w, "hold": w}))
+
+
+def test_the_waits_are_recorded_for_the_baseline_and_the_hold_and_shown_in_the_summary(tmp_path):
+    s = 1_000_000_000
+    f = fault(tmp_path)
+    f._baseline_ns = {"start": 1 * s, "end": 3 * s}
+    f.ctx.facts["hold"] = {"start_mono_ns": 10 * s, "end_mono_ns": 12 * s}
+    events = [db_sample(2 * s, {"Lock:tuple": 1}), host_sample(2 * s, 0, 0),
+              db_sample(11 * s, {"Lock:transactionid": 40, "IO:DataFileRead": 2}), host_sample(11 * s, 0, 160_000),
+              load_sample(11 * s, 646.0)]
+    f._record_waits(events)
+    waits = f.ctx.facts["analytics_waits"]
+    assert waits["baseline"]["row_locks_mean"] == 1.0 and waits["hold"]["row_locks_mean"] == 40.0
+    text = "\n".join(AnalyticsLoadFault.summary_lines({"facts": {"analytics": {"by_kind": {}}, "analytics_waits": waits},
+                                                      "measured": {}}))
+    assert "baseline: row locks 1.0, write-ahead log 0.0, disk reads 0.0; swap in/out 0/0 KB" in text
+    assert "reports running: row locks 40.0" in text and "swap in/out 0/160000 KB" in text
+    assert "main wait Lock:transactionid, 40.0 sessions on average" in text

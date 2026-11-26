@@ -28,6 +28,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import time
+from collections import Counter
 from typing import Any
 
 from resilience_tests.analysis import rto_decomposer
@@ -42,6 +44,10 @@ from resilience_tests.execution.workload.markers import ABORTED_JOURNAL, journal
 NORMAL_TPS_FRACTION = 0.95
 RECOVERY_LIMIT_S = 60.0
 RECOVERY_WATCH_SLACK_S = 10.0
+# How long the recovery is watched after the reports stop. Judging needs only RECOVERY_LIMIT_S + one
+# window (+ slack); watching longer lets a late return be measured (95 s, say) instead of being only
+# "not reached". The phase ends as soon as the customers are back, so only a failing run waits longer.
+RECOVERY_WATCH_S = 300.0
 # Validity (document sections 1 and 2): the customers' data must be in the memory cache normally,
 # and the baseline must have run at the planned rate. NEEDS SIGN-OFF.
 BASELINE_HIT_RATIO_MIN = 0.99
@@ -53,6 +59,10 @@ CUSTOMER_LIMIT_SQLSTATES = ("53300", "53400", "57014")   # too many connections,
 P90_TYPES = (contract.NEW_ORDER, contract.PAYMENT, contract.ORDER_STATUS)
 SAMPLE_INTERVAL_S = 1.0
 SAMPLE_RETRY_S = 5.0
+# What the sessions waited on (evidence only, never judged): the wait events of the 1-second database
+# samples, grouped. Row locks and the write-ahead log are waited on by writing sessions (the
+# customers; the reports only read); disk reads by everyone, the reports included.
+WORST_SECONDS = 10                   # the customers' slowest seconds of the hold, for the main wait
 
 _DURATION_UNITS = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0, "h": 3600.0, "d": 86400.0}
 _SIZE_UNITS = {"b": 1, "kb": 1024, "mb": 1024 ** 2, "gb": 1024 ** 3, "tb": 1024 ** 4}
@@ -160,6 +170,87 @@ def _r(value: float | None) -> float | None:
     return None if value is None else round(value, 5)
 
 
+def _wait_group(name: str) -> str | None:
+    """The group of a wait event ('type:event'), or None for the ones not reported."""
+    kind, _, event = name.partition(":")
+    if kind == "Lock":
+        return "row_locks"
+    if kind in ("LWLock", "IO") and "wal" in event.lower():
+        return "wal"
+    if name == "IO:DataFileRead":
+        return "disk_reads"
+    return None
+
+
+def wait_evidence(events: list[Any], start_ns: int, end_ns: int, worst_seconds: int = 0) -> dict[str, Any]:
+    """Sessions waiting, on average per 1-second database sample, on row locks, on the write-ahead
+    log and on disk reads between start_ns and end_ns; the host's swap in that window; and, when
+    worst_seconds is given, the main wait in the customers' slowest seconds (highest 1-second p99).
+    A window without samples reports no figure, never a zero it did not measure."""
+    db = sorted((e for e in events if e.source == "db_activity" and e.kind == "sample"
+                 and start_ns <= e.t_mono_ns <= end_ns), key=lambda e: e.t_mono_ns)
+    host = [e for e in events if e.source == "host_stats" and e.kind == "sample"
+            and start_ns <= e.t_mono_ns <= end_ns]
+    out: dict[str, Any] = {"db_samples": len(db), "host_samples": len(host)}
+    if db:
+        groups: Counter[str] = Counter()
+        for e in db:
+            for name, n in (e.data.get("wait_events") or {}).items():
+                group = _wait_group(name)
+                if group:
+                    groups[group] += int(n)
+        for group in ("row_locks", "wal", "disk_reads"):
+            out[f"{group}_mean"] = round(groups[group] / len(db), 2)
+    if host:
+        out["swap_in_kb"] = sum(int(e.data.get("si", 0)) for e in host)
+        out["swap_out_kb"] = sum(int(e.data.get("so", 0)) for e in host)
+    if worst_seconds and db:
+        load = [e for e in events if e.source == "workload" and e.kind == "sample"
+                and start_ns <= e.t_mono_ns <= end_ns and isinstance(e.data.get("p99_ms"), (int, float))]
+        worst = sorted(load, key=lambda e: e.data["p99_ms"], reverse=True)[:worst_seconds]
+        waits: Counter[str] = Counter()
+        matched = 0
+        for w in worst:
+            near = min(db, key=lambda e: abs(e.t_mono_ns - w.t_mono_ns))
+            if abs(near.t_mono_ns - w.t_mono_ns) <= 1.5e9:      # the database sample of that second
+                matched += 1
+                for name, n in (near.data.get("wait_events") or {}).items():
+                    waits[name] += int(n)
+        if matched and waits:
+            name, n = waits.most_common(1)[0]
+            out["worst"] = {"seconds": matched, "p99_ms_min": round(min(w.data["p99_ms"] for w in worst), 1),
+                            "p99_ms_max": round(max(w.data["p99_ms"] for w in worst), 1),
+                            "main_wait": name, "main_wait_sessions_mean": round(n / matched, 1)}
+    return out
+
+
+def wait_lines(waits: dict[str, Any] | None) -> list[str]:
+    """summary.txt lines for facts["analytics_waits"]."""
+    if not waits:
+        return []
+
+    def window(w: dict[str, Any] | None) -> str:
+        if not w or not w.get("db_samples"):
+            return "no sample"
+        swap = (f"swap in/out {w['swap_in_kb']}/{w['swap_out_kb']} KB" if w.get("host_samples")
+                else "swap not sampled")
+        return (f"row locks {w.get('row_locks_mean')}, write-ahead log {w.get('wal_mean')}, disk reads "
+                f"{w.get('disk_reads_mean')}; {swap}")
+
+    lines = ["  waits, evidence only (sessions waiting on average; row locks and write-ahead log are the customers' "
+             "writes, disk reads include the reports):",
+             f"    baseline: {window(waits.get('baseline'))}",
+             f"    reports running: {window(waits.get('hold'))}"]
+    worst = (waits.get("hold") or {}).get("worst")
+    if worst:
+        lines.append(f"    the customers' {worst['seconds']} slowest seconds (p99 {worst['p99_ms_min']}-"
+                     f"{worst['p99_ms_max']} ms): main wait {worst['main_wait']}, "
+                     f"{worst['main_wait_sessions_mean']} sessions on average")
+    if waits.get("error"):
+        lines.append(f"    not recorded: {waits['error']}")
+    return lines
+
+
 @register_fault
 class AnalyticsLoadFault(HeldFault):
     fault_type = "analytics_load"
@@ -170,6 +261,7 @@ class AnalyticsLoadFault(HeldFault):
         self._observed: dict[str, Any] | None = None     # first reading (init)
         self._plan: SessionPlan | None = None
         self._cache: dict[str, dict[str, Any]] = {}
+        self._baseline_ns: dict[str, int] = {}             # start, end (monotonic ns) for the wait evidence
 
     # --- init ------------------------------------------------------------------------------------
 
@@ -255,7 +347,7 @@ class AnalyticsLoadFault(HeldFault):
     def phase_extension_s(self, phase: str) -> float:
         if phase != "recovery":
             return super().phase_extension_s(phase)
-        needed = RECOVERY_LIMIT_S + rto_decomposer.SLO_SUSTAIN_S + RECOVERY_WATCH_SLACK_S
+        needed = max(RECOVERY_WATCH_S, RECOVERY_LIMIT_S + rto_decomposer.SLO_SUSTAIN_S + RECOVERY_WATCH_SLACK_S)
         return max(0.0, needed - self.ctx.phase_timeout_s("recovery"))
 
     # --- baseline and the hold -------------------------------------------------------------------
@@ -271,9 +363,11 @@ class AnalyticsLoadFault(HeldFault):
         self.ctx.facts["analytics_cache"] = self._cache
 
     async def baseline_started(self) -> None:
+        self._baseline_ns["start"] = time.monotonic_ns()
         await self._snapshot("baseline_start")
 
     async def baseline_ended(self) -> None:
+        self._baseline_ns["end"] = time.monotonic_ns()
         await self._snapshot("baseline_end")
 
     async def on_hold_start(self) -> None:
@@ -356,7 +450,23 @@ class AnalyticsLoadFault(HeldFault):
         m.update(self._limit_tests(state))
         m.update(self._customer_limit_errors())
         m.update(await self._leftovers())
+        self._record_waits(events)
         return m
+
+    def _record_waits(self, events: list[Any]) -> None:
+        """facts["analytics_waits"]: what the sessions waited on in the baseline and the hold. Evidence
+        only: never judged, never fatal."""
+        out: dict[str, Any] = {}
+        try:
+            start, end = self._baseline_ns.get("start"), self._baseline_ns.get("end")
+            if start and end:
+                out["baseline"] = wait_evidence(events, start, end)
+            hold = self._hold_bounds()
+            if hold:
+                out["hold"] = wait_evidence(events, *hold, worst_seconds=WORST_SECONDS)
+        except Exception as exc:  # noqa: BLE001 -- evidence only
+            out["error"] = f"{type(exc).__name__}: {exc}"
+        self.ctx.facts["analytics_waits"] = out
 
     def _not(self, name: str, why: str) -> dict[str, Any]:
         self.ctx.not_measured[name] = why
@@ -532,4 +642,5 @@ class AnalyticsLoadFault(HeldFault):
             f"confirmed at minute {CONFIRM_AT_S / 60:g}: {m.get('fault_confirmed')}",
             f"  customers stopped by a limit: {m.get('customer_limit_errors')}  back to normal: {m.get('rto_to_slo_s')} s  "
             f"left: {m.get('analytics_sessions_left')} sessions, {m.get('temp_files_left')} temporary files",
+            *wait_lines(facts.get("analytics_waits")),
         ]

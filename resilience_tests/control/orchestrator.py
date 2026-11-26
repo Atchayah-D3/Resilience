@@ -1007,6 +1007,7 @@ class TestOrchestrator:
             if detail.get("slo_reached_s") is None:
                 detail["slo_reached_s"] = None
                 detail["note"] = "service did not return to SLO within the soak hold"
+                self.facts["slo_watched_s"] = round((time.monotonic_ns() - slo_t0) / 1e9, 1)
             return detail
 
         # When the undisturbed baseline could not hold the SLO itself, a return to SLO can never
@@ -1035,6 +1036,7 @@ class TestOrchestrator:
             await asyncio.sleep(RECOVERY_POLL_S)
         detail["slo_reached_s"] = None
         detail["note"] = "service did not return to SLO within the recovery bound"
+        self.facts["slo_watched_s"] = round((time.monotonic_ns() - slo_t0) / 1e9, 1)
         bound_s = self.profile.phase_timeouts_s.get("recovery", 900) + extension_s
         self.disclosures.append(f"Recovery limitation: {detail['note']} ({bound_s}s timeout)")
         return detail
@@ -1075,6 +1077,9 @@ class TestOrchestrator:
             for name in ("rto_to_slo_s", "t_warm_s"):
                 m[name] = NOT_MEASURED
                 self.not_measured[name] = why
+        # no return to SLO seen in the watch: NOT_MEASURED with the reason, never None (a rule on
+        # None crashed as ERROR) and never a number standing in for a time that was not seen
+        self.not_measured.update(rto_decomposer.not_back_in_time(m, self.facts.get("slo_watched_s")))
         if d.outage_observed and d.rto_first_write_s is None:
             # the probes saw the outage start and never saw it end
             why = ("service did not accept a write again before the recovery bound expired -- "

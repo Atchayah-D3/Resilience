@@ -56,7 +56,9 @@ def evaluate_one(text: str, measured: Mapping[str, Any],
         return PredicateResult(text, "not_applicable", values, reason=f"not applicable to this target: {exc.args[0]}")
     except predicates.NotMeasuredMeasurement as exc:
         name = exc.args[0]
-        why = (reasons or {}).get(name, "no signal source was configured")
+        default = ("no value was recorded" if measured.get(name) is None
+                   else "no signal source was configured")
+        why = (reasons or {}).get(name, default)
         return PredicateResult(text, "not_measured", values, reason=f"{name} was not measured: {why}")
     except (predicates.PredicateError, TypeError) as exc:
         return PredicateResult(text, "error", values, reason=str(exc))

@@ -82,6 +82,25 @@ class RtoDecomposition:
         return self.rto_to_slo_s - self.rto_first_write_s
 
 
+SLO_RETURN_MEASURES = ("rto_to_slo_s", "t_warm_s")
+
+
+def not_back_in_time(measured: dict[str, Any], watched_s: float | None) -> dict[str, str]:
+    """A return to SLO not seen while the recovery was watched leaves rto_to_slo_s and t_warm_s
+    as None. A rule on None would crash (reported as ERROR) or pass by accident, and no number
+    may stand in for a time that was never seen, so each becomes NOT_MEASURED with the reason
+    (the rule then fails and says why). Changes `measured` in place; returns {name: reason}."""
+    within = (f"within the {watched_s:g} s watched from the moment back to normal is counted from" if watched_s
+              else "within the recovery phase")
+    reasons: dict[str, str] = {}
+    for name in SLO_RETURN_MEASURES:
+        if name in measured and measured[name] is None:
+            measured[name] = NOT_MEASURED
+            reasons[name] = (f"not back to normal {within}: no window of {SLO_SUSTAIN_S:g} s that meets the "
+                             "back-to-normal rule began early enough to be seen; the actual time is longer")
+    return reasons
+
+
 def attempt_start_ns(e: Event) -> int:
     """When a probe attempt began. Events are stamped on completion; streams recorded before
     probes carried `t_start_mono_ns` fall back to completion minus the recorded latency."""

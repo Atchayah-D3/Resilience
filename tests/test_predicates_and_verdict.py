@@ -32,14 +32,25 @@ def test_evaluate_and_margin():
 def test_missing_and_not_applicable_never_pass():
     assert evaluate_one("rpo_txn == 0", {}).outcome == "missing"
     assert evaluate_one("rpo_txn == 0", {"rpo_txn": P.NOT_APPLICABLE}).outcome == "not_applicable"
-    assert evaluate_one("rpo_txn == 0", {"rpo_txn": None}).outcome == "fail"
+    assert evaluate_one("rpo_txn == 0", {"rpo_txn": None}).outcome == "not_measured"
     v = evaluate(["rpo_txn == 0", "corruption_count == 0"], {"rpo_txn": 0})
     assert not v.passed and [r.outcome for r in v.results] == ["pass", "missing"]
 
 
 def test_none_measure_fails_ordering_comparison():
     # a measure the harness could not produce (None) must fail, never compare as "small"
-    assert evaluate_one("rto_first_write_s <= 60", {"rto_first_write_s": None}).outcome == "error"
+    r = evaluate_one("rto_first_write_s <= 60", {"rto_first_write_s": None})
+    assert r.outcome == "not_measured" and "no value was recorded" in r.reason
+
+
+def test_none_is_not_a_measurement_so_it_never_passes():
+    """Was: None crashed an ordering rule (ERROR) and made `x != 0` PASS -- a pass from no measurement."""
+    for rule in ("x != 0", "x <= 60", "x == 0", "x >= 0", "not x > 5"):
+        r = evaluate([rule], {"x": None})
+        assert not r.passed and r.results[0].outcome == "not_measured", rule
+    # the reason recorded for the measure is the one shown
+    r = evaluate_one("rto_to_slo_s <= 60", {"rto_to_slo_s": None}, {"rto_to_slo_s": "not back to normal within 300 s"})
+    assert r.reason == "rto_to_slo_s was not measured: not back to normal within 300 s"
 
 
 def test_boolean_measure():
