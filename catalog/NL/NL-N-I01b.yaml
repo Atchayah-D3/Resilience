@@ -1,0 +1,174 @@
+# NL-N-I01b -- Noisy analytics, run 1b: the misbehaving tenant (internal NL-N scenario, modelled on the
+# Framework's NL-N-07 row of Framework §10.6). Source: Resilience_Testing_ShaktiDB_v2, section 5.1
+# (scenario 1): "1b with a misbehaving tenant that overrides its own settings (recorded as a finding)".
+# Spec Kit feature specs/008-nl-n-i01b-misbehaving-tenant.
+#
+# The same customers, layout, reports, limit tests, baseline and 5-minute hold as NL-N-I01a. The
+# difference: before its first report, every report session changes its own settings for the
+# session (session_overrides: a session SET, gone when the session ends; the role is never altered),
+# and one session -- never limit test 1's -- tries to lift temp_file_limit (hard_limit_attempts).
+# What the database answered is the finding: which of the role's limits a tenant can switch off by
+# itself (overridden) and which the database enforces (refused, or read back unchanged).
+#
+# Expected (the document, sections 4 and 5): helpers, work_mem and statement_timeout are only
+# defaults (overridden); temp_file_limit is superuser-only (the change is refused with 42501, and limit
+# test 1 -- one process, SET LOCAL max_parallel_workers_per_gather = 0 for its own transaction -- still
+# ends with 53400); limit test 2 is not stopped by the database (the session turned its time limit off)
+# and runs until the harness ends the fault.
+#
+# The memory guard (NEEDS SIGN-OFF) is armed before the first change and ends the reports early when the
+# target's available memory falls below 2 GB, more than 512 MB is swapped out, or no reading arrives for
+# 2 s: work_mem 1GB lets a hash step take up to work_mem x hash_mem_multiplier per process, more than the
+# shared target has. Before the first 1b run on a target, pilot Q2, Q3 and limit test 1 with these
+# settings while watching memory (spec 008, FR-012b).
+#
+# Invalid (stopped, never a pass): as NL-N-I01a (the login, its limits, pg_stat_statements, the
+# customers' baseline cache hit ratio at least 99%, the planned rate kept, the reports able to occupy
+# every core), plus: the memory guard has no fresh reading of the target's memory before the fault.
+# The statement_timeout validity check of 1a does not apply (the sessions set their own).
+#
+# Judged (only what must still hold):
+#   fault_confirmed                 the reports seen running at minute 1 (document check 1)
+#   overrides_recorded              every session answered for every setting (a refusal is an answer)
+#   temp_limit_enforced             limit test 1 ends with 53400 (document check 7)
+#   temp_limit_override_refused     the change of temp_file_limit is refused with 42501
+#   customer_limit_errors == 0      no customer stopped by 53300, 53400 or 57014 (document check 9)
+#   role_settings_unchanged         the login's own settings, after the reports, as at init
+#   server_crash_restarts == 0      no crash restart in the engine's log (document check 12, standing rule 5)
+#   rpo_txn, corruption_count, structural_integrity_errors (Framework §16.3), the TPC-C gates
+#   no report session and no temporary file left, settings unchanged
+# Recorded, no pass rule (the 1b findings): the customers' TPS and p99 ratios, worst p90 and cache hit
+# ratio; helpers per report and at once; temporary data written; limit test 2's run time; the lowest
+# available memory and the swap-out; whether the guard ended the reports and how long they ran; the
+# write prober's longest gap (document check 13; standing rule 7: in a finding run, recorded only).
+id: NL-N-I01b
+name: Noisy analytics against priority customer work (1b, misbehaving tenant)
+tier: node_local
+category: NL-N
+applies_to: [standalone]
+
+environment:
+  classes: [E1, E2, E3, E4]
+  env_sensitive: false
+
+requires: [transactional_markers, structural_integrity_check, tpcc_workload, analytics_sessions]
+needs_infra: [analytics_login]
+
+steady_state:
+  tps_min: 50                    # floor, not a throughput target; the planned rate is checked before the fault
+  p99_latency_ms_max: 3000
+  duration_s: 600                # as 1a: 10 minutes of undisturbed baseline
+  warmup_s: 300                  # as 1a: 5 minutes of warm-up, not measured
+
+workload:                        # as NL-N-I01a (attached: the running common workload's)
+  profile: tpcc
+  concurrency: 64
+  transaction_markers: true
+  rate_fraction_of_capacity: 0.6 # NEEDS SIGN-OFF, Framework §7.5
+  latency_from: intended_start
+  session:
+    lock_timeout: "0"
+    statement_timeout: "0"
+    transaction_timeout: "0"
+  tpcc:
+    warehouses: by_cache
+    order_line_cache_multiple: 8
+    active_warehouses: by_cache
+    active_cache_share: 0.5
+    worker_processes: 2
+
+fault:
+  type: analytics_load
+  section: os_ssh
+  target: primary
+  duration: 300                  # as 1a: a 5-minute fault (Framework §10.6 NL-N-07)
+  analytics_load:
+    full_table_sessions: by_cores
+    index_sessions: 1
+    limit_tests: true
+    session_overrides:           # the document, section 4: the three SET commands of run 1b
+      max_parallel_workers_per_gather: 8
+      work_mem: 1GB
+      statement_timeout: 0
+    hard_limit_attempts:         # superuser-only: a normal login is expected to be refused (42501)
+      temp_file_limit: -1
+    memory_guard:                # NEEDS SIGN-OFF (spec 008, FR-010)
+      available_min_mb: 2048
+      swap_out_max_mb: 512
+      interval_s: 0.5
+      stale_s: 2.0
+
+blast_radius:
+  max_nodes_affected: 1
+  environments: [lab, staging]
+
+measure:
+  - rpo_txn
+  - indeterminate_txn
+  - rto_first_write_s
+  - rto_to_slo_s                        # reported
+  - corruption_count
+  - structural_integrity_errors
+  - fault_confirmed
+  - overrides_recorded
+  - temp_limit_enforced
+  - temp_limit_override_refused
+  - customer_limit_errors
+  - role_settings_unchanged
+  - server_crash_restarts
+  - oltp_tps_ratio                      # reported (finding)
+  - oltp_p99_ratio                      # reported (finding)
+  - customer_p90_max_s                  # reported (finding)
+  - customer_cache_hit_ratio_baseline   # reported
+  - customer_cache_hit_ratio_hold       # reported
+  - customer_cache_hit_ratio_vs_baseline  # reported (finding)
+  - report_helpers_max                  # reported (finding): most helpers of one report
+  - report_helpers_total_max            # reported (finding): most helpers at once
+  - helpers_over_limit                  # reported: samples above the role's default (expected in 1b)
+  - analytics_active_share              # reported
+  - statement_timeout_enforced          # reported: the sessions turned their time limit off
+  - limit_test_2_ran_s                  # reported (finding)
+  - temp_gb_written                     # reported (finding)
+  - writer_max_gap_s                    # reported (finding, document check 13)
+  - available_memory_min_mb             # reported (finding)
+  - swapped_out_max_mb                  # reported (finding)
+  - memory_guard_tripped                # reported (finding)
+  - reports_ran_s                       # reported (finding)
+  - analytics_sessions_left
+  - temp_files_left
+  - settings_unchanged
+  - missed_transactions                 # reported
+  - partial_commits
+  - tpcc_consistency_violations
+  - aborted_markers_present
+
+accept:
+  - fault_confirmed == true
+  - overrides_recorded == true
+  - temp_limit_enforced == true
+  - temp_limit_override_refused == true
+  - customer_limit_errors == 0
+  - role_settings_unchanged == true
+  - server_crash_restarts == 0
+  - rpo_txn == 0
+  - corruption_count == 0
+  - structural_integrity_errors == 0
+  - partial_commits == 0
+  - tpcc_consistency_violations == 0
+  - aborted_markers_present == 0
+  - analytics_sessions_left == 0
+  - temp_files_left == 0
+  - settings_unchanged == true
+
+priority: P1
+
+see_also: [NL-N-I01a]
+
+description: >
+  Run 1b of noisy analytics: the same reports as NL-N-I01a, but every report session first changes
+  its own helper count, memory per sort and time limit for the session, and one session tries to lift
+  its temporary-file limit. Recorded as a finding: which of the report login's limits a tenant can
+  switch off by itself and which the database enforces, with the customers' figures. Judged only on
+  what must still hold: the hard limits, no customer stopped by a limit, the role unchanged, no crash,
+  nothing lost or damaged, nothing left. A memory guard protects the shared target. Internal scenario
+  of category NL-N, modelled on the Framework's noisy-analytics row (Framework §10.6).

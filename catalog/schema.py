@@ -320,6 +320,24 @@ class LockPileup(_Model):
         return self
 
 
+class MemoryGuard(_Model):
+    """Ends the reports when the target's available memory (MemAvailable: free plus reclaimable
+    cache) falls below `available_min_mb`, when the memory swapped out since the guard was armed
+    goes above `swap_out_max_mb`, or when no reading arrives for `stale_s`. Read every `interval_s`.
+    Every value is NEEDS SIGN-OFF."""
+
+    available_min_mb: float = Field(default=2048.0, gt=0)
+    swap_out_max_mb: float = Field(default=512.0, gt=0)
+    interval_s: float = Field(default=0.5, gt=0, le=1.0)
+    stale_s: float = Field(default=2.0, gt=0)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> MemoryGuard:
+        if self.stale_s <= self.interval_s:
+            raise ValueError("memory_guard.stale_s must be longer than interval_s")
+        return self
+
+
 class AnalyticsLoad(_Model):
     """Noisy analytics (fault type analytics_load, NL-N-I01): report sessions of the environment's
     analytics login read the TPC-C tables back to back for fault.duration, next to the workload.
@@ -334,11 +352,36 @@ class AnalyticsLoad(_Model):
     full_table_sessions: Literal["by_cores"] | Annotated[int, Field(gt=0)] = "by_cores"
     index_sessions: int = Field(default=1, ge=0)
     limit_tests: bool = True
+    # Run 1b, the misbehaving tenant (Resilience_Testing_ShaktiDB_v2, section 5.1): every report
+    # session first changes these of its OWN settings (a session SET, which ends with the session;
+    # the role is never altered), and reads them back. The database's answer per setting is the
+    # finding: overridden, or enforced (refused, or read back unchanged).
+    session_overrides: dict[str, str] = Field(default_factory=dict)
+    # One report session (not limit test 1's) also tries to change these, which a normal login is
+    # expected NOT to be allowed (temp_file_limit: superuser only, SQLSTATE 42501).
+    hard_limit_attempts: dict[str, str] = Field(default_factory=dict)
+    # Ends the reports early when the target runs short of memory (a shared machine): required
+    # with session_overrides, which can raise memory per sort far above the role's default.
+    memory_guard: MemoryGuard | None = None
+
+    @field_validator("session_overrides", "hard_limit_attempts", mode="before")
+    @classmethod
+    def _settings_as_text(cls, v: Any) -> Any:
+        """YAML gives `statement_timeout: 0` as a number; a setting's value is text to the engine."""
+        if isinstance(v, dict):
+            return {k: (str(x).lower() if isinstance(x, bool) else str(x)) for k, x in v.items()}
+        return v
 
     @model_validator(mode="after")
     def _consistent(self) -> AnalyticsLoad:
         if self.limit_tests and isinstance(self.full_table_sessions, int) and self.full_table_sessions < 2:
             raise ValueError("analytics_load.limit_tests needs at least 2 full-table sessions (one per limit test)")
+        bad = [n for n in (*self.session_overrides, *self.hard_limit_attempts) if not IDENT_RE.match(n)]
+        if bad:
+            raise ValueError(f"analytics_load: setting names must be snake_case identifiers: {bad}")
+        if self.session_overrides and self.memory_guard is None:
+            raise ValueError("analytics_load.session_overrides needs a memory_guard: the sessions may raise their "
+                             "memory per sort far above the role's default on a shared machine")
         return self
 
 

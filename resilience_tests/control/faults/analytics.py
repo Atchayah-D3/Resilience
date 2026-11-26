@@ -17,6 +17,15 @@ the customers' own pages, the customers' baseline cache hit ratio is below 99% (
 the reports could not be seen), the baseline missed the planned rate, or the reports with their
 helpers cannot occupy every core.
 
+Run 1b, the misbehaving tenant (NL-N-I01b; Resilience_Testing_ShaktiDB_v2, section 5.1): the same
+reports, but each report session first changes some of its own settings for the session
+(fault.analytics_load.session_overrides) and one session tries the hard limits
+(hard_limit_attempts). The database's answers are the finding: which role limits a tenant can
+switch off by itself (overridden) and which the database enforces. The role is never altered. A
+memory guard (memory_guard), armed before the first change, ends the reports early if the shared
+target runs short of memory. 1b is judged only on what must still hold; the customers' figures
+are recorded. Every 1b measure is produced only when the scenario declares it.
+
 The customers' cache hit ratio counts the pages of their own TPC-C calls on every table they read
 (pg_stat_statements, the clerks' login), the report tables included: the reports flood exactly
 those, so a ratio over the other tables only would barely move (the 21 November run: 1.00019 of
@@ -36,6 +45,7 @@ from resilience_tests.analysis import rto_decomposer
 from resilience_tests.analysis.predicates import NOT_MEASURED
 from resilience_tests.control.faults.base import HeldFault, PhaseAbort, Sampler, register_fault
 from resilience_tests.execution.injectors.analytics import CONFIRM_AT_S, SessionPlan, as_int, session_plan
+from resilience_tests.execution.probes.memory_guard import GuardRules, MemoryGuard
 from resilience_tests.execution.workload import contract
 from resilience_tests.execution.workload.markers import ABORTED_JOURNAL, journal_paths, read_journal
 
@@ -63,6 +73,12 @@ SAMPLE_RETRY_S = 5.0
 # samples, grouped. Row locks and the write-ahead log are waited on by writing sessions (the
 # customers; the reports only read); disk reads by everyone, the reports included.
 WORST_SECONDS = 10                   # the customers' slowest seconds of the hold, for the main wait
+# Run 1b: the server's answer to a session that may not change a setting (temp_file_limit: superuser only)
+INSUFFICIENT_PRIVILEGE = "42501"
+# the report login's settings compared before and after a 1b run (the role itself, never a session's)
+ROLE_KEYS = ("role_exists", "role_can_login", "role_connection_limit", "role_max_parallel_workers_per_gather",
+             "role_work_mem", "role_temp_file_limit", "role_statement_timeout")
+WRITE_GAP_EDGE_S = 5.0               # the write prober's gaps are looked at from this long before the hold
 
 _DURATION_UNITS = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0, "h": 3600.0, "d": 86400.0}
 _SIZE_UNITS = {"b": 1, "kb": 1024, "mb": 1024 ** 2, "gb": 1024 ** 3, "tb": 1024 ** 4}
@@ -133,6 +149,55 @@ def clerk_hit_ratio(start: dict[str, Any] | None, end: dict[str, Any] | None) ->
     if hit + read <= 0:
         return None, "the clerks' calls read no page inside the window"
     return hit / (hit + read), None
+
+
+def same_setting(read_back: str | None, asked: str | None) -> bool:
+    """A setting read back as asked: the same text (case and spaces aside), or the same size."""
+    if read_back is None or asked is None:
+        return False
+    norm = lambda v: v.strip().lower().replace(" ", "")  # noqa: E731
+    if norm(read_back) == norm(asked):
+        return True
+    a, b = size_bytes(read_back), size_bytes(asked)
+    return a is not None and a == b
+
+
+def override_outcome(rec: dict[str, Any]) -> str | None:
+    """One session's change of one setting: "overridden" (accepted and read back as asked),
+    "enforced" (refused, or accepted but read back otherwise), None (no answer)."""
+    if rec.get("answer") == "refused":
+        return "enforced"
+    if rec.get("answer") == "accepted":
+        return "overridden" if same_setting(rec.get("read_back"), rec.get("asked")) else "enforced"
+    return None
+
+
+def overrides_summary(records: list[dict[str, Any]], sessions: int,
+                      settings: dict[str, str]) -> tuple[bool | None, str | None, dict[str, Any]]:
+    """(overrides_recorded, why not measured, per setting: sessions overridden / enforced, values
+    read back, the server's errors). Recorded only when every session answered for every setting;
+    a refusal is an answer (a finding), never a failure."""
+    per: dict[str, Any] = {}
+    for name, asked in settings.items():
+        recs = [r for r in records if r.get("setting") == name]
+        outcomes = [override_outcome(r) for r in recs]
+        per[name] = {"asked": asked,
+                     "overridden_sessions": outcomes.count("overridden"),
+                     "enforced_sessions": outcomes.count("enforced"),
+                     "read_back": sorted({str(r["read_back"]) for r in recs if r.get("read_back") is not None}),
+                     "before": sorted({str(r["before"]) for r in recs if r.get("before") is not None}),
+                     "refused": sorted({f"{r.get('sqlstate')}: {r.get('error')}" for r in recs
+                                        if r.get("answer") == "refused"})}
+    missing = [f"session {r.get('session')} {r.get('setting')}: {r.get('error') or 'no answer'}"
+               for r in records if override_outcome(r) is None]
+    expected = sessions * len(settings)
+    answered = sum(1 for r in records if override_outcome(r) is not None)
+    if not sessions:
+        return None, "no report session was opened", per
+    if missing or answered < expected:
+        why = (f"{answered} of {expected} session settings answered" + (f"; {'; '.join(missing[:4])}" if missing else ""))
+        return None, why, per
+    return True, None, per
 
 
 class AnalyticsSampler:
@@ -251,6 +316,48 @@ def wait_lines(waits: dict[str, Any] | None) -> list[str]:
     return lines
 
 
+def tenant_lines(facts: dict[str, Any], m: dict[str, Any]) -> list[str]:
+    """The "1b findings" block: what the report login was allowed to change and what was refused,
+    and the figures recorded without a pass rule. None for a run without session changes."""
+    tenant = facts.get("analytics_tenant")
+    guard = facts.get("memory_guard")
+    if not tenant and not guard:
+        return []
+    lines = ["  1b findings (recorded, not judged; the rules that must still hold are in the acceptance list):"]
+    for name, p in ((tenant or {}).get("overrides") or {}).items():
+        state = ("overridden" if p.get("overridden_sessions") and not p.get("enforced_sessions")
+                 else "enforced" if p.get("enforced_sessions") and not p.get("overridden_sessions") else "mixed")
+        lines.append(f"    {name}: asked {p.get('asked')} (role default {', '.join(p.get('before') or []) or '?'}) -> "
+                     f"{state}: {p.get('overridden_sessions')} session(s) overridden, read back "
+                     f"{', '.join(p.get('read_back') or []) or '-'}; {p.get('enforced_sessions')} enforced"
+                     + (f" ({'; '.join(p['refused'])})" if p.get("refused") else ""))
+    for a in (tenant or {}).get("attempts") or []:
+        if a.get("answer") == "refused":
+            answer = f"refused {a.get('sqlstate')}: {a.get('error')}"
+        elif a.get("answer") == "accepted":
+            granted = a.get("granted_set")
+            answer = (f"ACCEPTED (read back {a.get('read_back')}): "
+                      + ("the login was granted SET on it by the operator" if granted
+                         else "not a hard cap on this target" if granted is False
+                         else "whether the login was granted SET on it is unknown"))
+        else:
+            answer = f"no answer ({a.get('error')})"
+        lines.append(f"    session {a.get('session')} tried {a.get('setting')} = {a.get('asked')}: {answer}")
+    lines.append(f"    helpers: most per report {m.get('report_helpers_max')}, most at once {m.get('report_helpers_total_max')};  "
+                 f"temporary data written {m.get('temp_gb_written')} GB;  limit test 2 ran {m.get('limit_test_2_ran_s')} s")
+    lines.append(f"    customers: TPS ratio {m.get('oltp_tps_ratio')}  p99 ratio {m.get('oltp_p99_ratio')}  worst p90 "
+                 f"{m.get('customer_p90_max_s')} s  cache hit {m.get('customer_cache_hit_ratio_vs_baseline')} of baseline;  "
+                 f"write prober longest gap {m.get('writer_max_gap_s')} s")
+    if guard:
+        tripped = guard.get("tripped")
+        lines.append(f"    memory: lowest available {guard.get('min_available_mb')} MB, swapped out {guard.get('max_swapped_out_mb')} MB, "
+                     f"{guard.get('readings')} readings;  guard: "
+                     + (f"ENDED THE REPORTS after {tripped.get('after_armed_s')} s ({tripped.get('reason')})" if tripped
+                        else "did not trigger")
+                     + f";  reports ran {m.get('reports_ran_s')} s")
+    return lines
+
+
 @register_fault
 class AnalyticsLoadFault(HeldFault):
     fault_type = "analytics_load"
@@ -262,6 +369,7 @@ class AnalyticsLoadFault(HeldFault):
         self._plan: SessionPlan | None = None
         self._cache: dict[str, dict[str, Any]] = {}
         self._baseline_ns: dict[str, int] = {}             # start, end (monotonic ns) for the wait evidence
+        self._guard: MemoryGuard | None = None             # run 1b: ends the reports before memory runs out
 
     # --- init ------------------------------------------------------------------------------------
 
@@ -300,7 +408,16 @@ class AnalyticsLoadFault(HeldFault):
         if track not in ("top", "all"):
             raise PhaseAbort(f"invalid run: pg_stat_statements.track is {track!r}, so the customers' calls are not "
                              "counted and their cache hit ratio cannot be measured")
+        if plan.limit_tests and "statement_timeout" in plan.session_overrides:
+            # run 1b: the sessions set their own time limit, so limit test 2 is not the role's to stop;
+            # it runs until the harness ends the fault and its run time is recorded (not judged)
+            self.ctx.facts["limit_test_2_note"] = (f"the report sessions set statement_timeout = "
+                                                   f"{plan.session_overrides['statement_timeout']!r} themselves")
         if plan.limit_tests:
+            if size_bytes(observed.get("role_temp_file_limit")) is None:
+                raise PhaseAbort("invalid run: the analytics login has no temp_file_limit, so limit test 1 "
+                                 "cannot be judged (the operator sets the role's limits)")
+        if plan.limit_tests and "statement_timeout" not in plan.session_overrides:
             hold = float(self.ctx.scenario.fault.duration)          # seconds: the catalog requires it
             timeout = duration_s(observed.get("role_statement_timeout"))
             if timeout is None:
@@ -310,9 +427,6 @@ class AnalyticsLoadFault(HeldFault):
                 raise PhaseAbort(f"invalid run: the analytics login's statement_timeout ({timeout:g} s) does not end "
                                  f"inside the {hold:g} s hold with {TIMEOUT_MARGIN_S:g} s to spare, so limit test 2 "
                                  "cannot be judged")
-            if size_bytes(observed.get("role_temp_file_limit")) is None:
-                raise PhaseAbort("invalid run: the analytics login has no temp_file_limit, so limit test 1 "
-                                 "cannot be judged (the operator sets the role's limits)")
 
     async def check_ready(self) -> None:
         """After the data step: the report login can read what the reports read. A reload drops
@@ -353,7 +467,21 @@ class AnalyticsLoadFault(HeldFault):
     # --- baseline and the hold -------------------------------------------------------------------
 
     def samplers(self) -> list[Sampler]:
-        return [AnalyticsSampler(self.ctx.adapter, self.ctx.stream)]
+        out: list[Sampler] = [AnalyticsSampler(self.ctx.adapter, self.ctx.stream)]
+        rules = self.ctx.scenario.fault.analytics_load.memory_guard if self.ctx.scenario.fault.analytics_load else None
+        if rules is not None:
+            self._guard = MemoryGuard(self.ctx.node, self.ctx.stream,
+                                      GuardRules(available_min_mb=rules.available_min_mb,
+                                                 swap_out_max_mb=rules.swap_out_max_mb,
+                                                 interval_s=rules.interval_s, stale_s=rules.stale_s),
+                                      on_trigger=self._guard_tripped)
+            out.append(self._guard)
+        return out
+
+    async def _guard_tripped(self, why: str) -> dict[str, Any]:
+        """The memory guard's action: the reports end now; the hold runs on to its planned end with
+        the customers alone, and the release at its end finds nothing left to stop."""
+        return await self.ctx.adapter.stop_analytics()
 
     async def _snapshot(self, name: str) -> None:
         try:
@@ -417,8 +545,20 @@ class AnalyticsLoadFault(HeldFault):
         ctx.facts["analytics_validity"] = {"baseline_hit_ratio": round(ratio, 5), "planned_rate_tps": rate,
                                            "helpers_per_report": helpers,
                                            "plan": self._plan.as_dict() if self._plan else None}
+        plan = ctx.scenario.fault.analytics_load
+        if plan is not None and plan.memory_guard is not None:
+            # armed last, right before the sessions open and change their settings: never run unguarded
+            if self._guard is None:
+                raise PhaseAbort("invalid run: the memory guard was not started with the run's probes")
+            try:
+                self._guard.arm()
+            except RuntimeError as exc:
+                raise PhaseAbort(f"invalid run: the memory guard cannot protect the target: {exc}") from None
 
     async def after_inject(self, detail: dict[str, Any]) -> None:
+        if self._guard is not None and self._guard.tripped is not None:
+            # the guard tripped while the sessions were opening: its stop found nothing yet to end
+            self._guard.tripped["after_start"] = await self.ctx.adapter.stop_analytics()
         d = self.ctx.disclosures
         d.append(f"Reports: {len(detail.get('sessions') or [])} sessions of the login {detail.get('login')!r} "
                  f"(tag {detail.get('application_name')}); the index reports read warehouses "
@@ -430,6 +570,20 @@ class AnalyticsLoadFault(HeldFault):
         d.append("The customers log in as the harness role, which has no limits; only the report login is limited.")
         d.append("90% within 5 s is judged on the worst 1-second p90 of each type during the hold, never lower "
                  "than the p90 over the whole hold.")
+        plan = self.ctx.scenario.fault.analytics_load
+        if plan is not None and plan.session_overrides:
+            changes = ", ".join(f"{k} = {v}" for k, v in plan.session_overrides.items())
+            d.append(f"Run 1b (misbehaving tenant): each report session changed its own settings for the session "
+                     f"({changes}) before its first report; the role itself was not altered.")
+        if plan is not None and plan.hard_limit_attempts:
+            tries = ", ".join(f"{k} = {v}" for k, v in plan.hard_limit_attempts.items())
+            d.append(f"Run 1b: report session {detail.get('attempt_session') or '(see facts)'} also tried {tries}, "
+                     "each as a statement on its own, not counted as a report.")
+        if plan is not None and plan.memory_guard is not None:
+            g = plan.memory_guard
+            d.append(f"Memory guard (NEEDS SIGN-OFF): the reports end early if the target's available memory falls "
+                     f"below {g.available_min_mb:g} MB, more than {g.swap_out_max_mb:g} MB is swapped out, or no "
+                     f"reading arrives for {g.stale_s:g} s (read every {g.interval_s:g} s).")
         d.append(f"Back to normal (rto_to_slo_s): TPS >= {NORMAL_TPS_FRACTION:.0%} of the baseline and p99 <= "
                  f"{rto_decomposer.SLO_P99_MULTIPLIER:g}x for {rto_decomposer.SLO_SUSTAIN_S:g} s straight, counted "
                  "from the moment the reports were stopped.")
@@ -451,7 +605,135 @@ class AnalyticsLoadFault(HeldFault):
         m.update(self._customer_limit_errors())
         m.update(await self._leftovers())
         self._record_waits(events)
+        m.update(await self._tenant_measures(state, events))
         return m
+
+    # --- run 1b: the misbehaving tenant ------------------------------------------------------------
+
+    def _declared(self, name: str) -> bool:
+        return name in self.ctx.scenario.measure
+
+    async def _tenant_measures(self, state: dict[str, Any], events: list[Any]) -> dict[str, Any]:
+        """The 1b measures, each only when the scenario declares it (no ID branches)."""
+        ctx = self.ctx
+        plan = ctx.scenario.fault.analytics_load
+        out: dict[str, Any] = {}
+        if self._guard is not None:
+            self._guard.disarm()
+            guard = self._guard.state()
+            ctx.facts["memory_guard"] = guard
+            if self._declared("memory_guard_tripped"):
+                out["memory_guard_tripped"] = guard["tripped"] is not None
+            for name, key in (("available_memory_min_mb", "min_available_mb"), ("swapped_out_max_mb", "max_swapped_out_mb")):
+                if self._declared(name):
+                    out.update({name: guard[key]} if guard[key] is not None
+                               else self._not(name, "the memory guard took no reading while armed"))
+        tenant: dict[str, Any] = {}
+        if plan is not None and plan.session_overrides and self._declared("overrides_recorded"):
+            recorded, why, per = overrides_summary(list(state.get("overrides") or []),
+                                                   len(state.get("sessions") or []), dict(plan.session_overrides))
+            tenant["overrides"] = per
+            out.update({"overrides_recorded": True} if recorded else self._not("overrides_recorded", why or "no answer"))
+        if plan is not None and plan.hard_limit_attempts:
+            attempts = list(state.get("attempts") or [])
+            tenant["attempts"] = attempts
+            tenant["attempt_session"] = state.get("attempt_session")
+            if self._declared("temp_limit_override_refused"):
+                out.update(self._override_refused(attempts, "temp_file_limit", "temp_limit_override_refused"))
+        if tenant:
+            ctx.facts["analytics_tenant"] = tenant
+        if self._declared("role_settings_unchanged"):
+            out.update(await self._role_unchanged())
+        if self._declared("server_crash_restarts"):
+            out.update(self._crash_restarts(events))
+        if self._declared("writer_max_gap_s"):
+            out.update(self._writer_gap(events))
+        samples = state.get("samples") or []
+        if self._declared("report_helpers_total_max"):
+            out.update({"report_helpers_total_max": max(int(s.get("helpers_total") or 0) for s in samples)} if samples
+                       else self._not("report_helpers_total_max", "no activity sample was taken while the reports ran"))
+        if self._declared("temp_gb_written"):
+            out.update(self._temp_written(samples))
+        tests = state.get("limit_tests") or {}
+        if self._declared("limit_test_2_ran_s"):
+            timed = tests.get("limit_timeout")
+            out.update({"limit_test_2_ran_s": float(timed["seconds"])} if timed and timed.get("seconds") is not None
+                       else self._not("limit_test_2_ran_s", "limit test 2 never ended (or never started)"))
+        if self._declared("reports_ran_s"):
+            start, stop = state.get("started_mono_ns"), state.get("stopped_mono_ns")
+            out.update({"reports_ran_s": round((int(stop) - int(start)) / 1e9, 1)} if start is not None and stop is not None
+                       else self._not("reports_ran_s", "the reports' start or end was not recorded"))
+        return out
+
+    def _override_refused(self, attempts: list[dict[str, Any]], setting: str, name: str) -> dict[str, Any]:
+        """True when the server refused the change for lack of privilege; False when it was accepted
+        (or refused for another reason); not measured without an answer."""
+        rec = next((a for a in attempts if a.get("setting") == setting), None)
+        if rec is None:
+            return self._not(name, f"no report session tried to change {setting} (no session other than limit test 1's)")
+        if rec.get("answer") is None:
+            return self._not(name, f"no answer to the change of {setting}: {rec.get('error') or 'unknown'}")
+        return {name: rec.get("answer") == "refused" and rec.get("sqlstate") == INSUFFICIENT_PRIVILEGE}
+
+    async def _role_unchanged(self) -> dict[str, Any]:
+        """The report login's own settings, read again after the reports: equal to init's reading
+        (the sessions' changes were for themselves only; the harness never alters the role)."""
+        name = "role_settings_unchanged"
+        before = self._observed or {}
+        try:
+            after = await self.ctx.adapter.observe_analytics_settings()
+        except Exception as exc:  # noqa: BLE001
+            return self._not(name, f"the login's settings could not be read again: {type(exc).__name__}: {exc}")
+        if not before:
+            return self._not(name, "the login's settings were not read at init")
+        changed = {k: {"before": before.get(k), "after": after.get(k)} for k in ROLE_KEYS if before.get(k) != after.get(k)}
+        self.ctx.facts["role_settings_after"] = {k: after.get(k) for k in ROLE_KEYS}
+        if changed:
+            self.ctx.facts["role_settings_changed"] = changed
+        return {name: not changed}
+
+    def _crash_restarts(self, events: list[Any]) -> dict[str, Any]:
+        """Document check 12: server processes that crashed and made the server end every session
+        and restart, from the engine's own log after the fault started (the same lines scenario 3
+        counts, control/faults/lock_pileup.py)."""
+        name = "server_crash_restarts"
+        patterns = [re.compile(p) for p in self.ctx.adapter.crash_restart_log_patterns()]
+        t0 = self.ctx.t0_ns
+        if not patterns or t0 is None:
+            return self._not(name, "this engine names no crash-restart log lines" if not patterns
+                             else "the fault's start (T0) was not recorded")
+        if not any(e.kind == "log_line" for e in events):
+            return self._not(name, "no line of the engine's log reached the harness during the run")
+        hits = [e.data.get("line", "") for e in events if e.kind == "log_line" and e.t_mono_ns > t0
+                and any(p.search(e.data.get("line", "")) for p in patterns)]
+        if hits:
+            self.ctx.facts["crash_restart_lines"] = hits[:20]
+        return {name: len(hits)}
+
+    def _writer_gap(self, events: list[Any]) -> dict[str, Any]:
+        """Document check 13, recorded only in 1b: the longest gap between the write prober's
+        successful writes (its own table and connection) during the hold."""
+        name = "writer_max_gap_s"
+        bounds = self._hold_bounds()
+        if bounds is None:
+            return self._not(name, "the hold window was not recorded")
+        since, until = bounds[0] - int(WRITE_GAP_EDGE_S * 1e9), bounds[1] + int(WRITE_GAP_EDGE_S * 1e9)
+        ok = sorted(e.t_mono_ns for e in events
+                    if e.kind == "write_probe" and e.data.get("ok") and since <= e.t_mono_ns <= until)
+        if len(ok) < 2:
+            return self._not(name, "the write prober recorded fewer than two successful writes around the hold")
+        return {name: round(max(b - a for a, b in zip(ok, ok[1:])) / 1e9, 3)}
+
+    def _temp_written(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
+        """Temporary bytes the database wrote while the reports ran (pg_stat_database, every
+        session's; the customers write next to none)."""
+        name = "temp_gb_written"
+        known = [s for s in samples if s.get("temp_bytes") is not None]
+        if len(known) < 2:
+            return self._not(name, "fewer than two samples of the database's temporary bytes")
+        written = int(known[-1]["temp_bytes"]) - int(known[0]["temp_bytes"])
+        self.ctx.facts["temp_files_written"] = int(known[-1].get("temp_files") or 0) - int(known[0].get("temp_files") or 0)
+        return {name: round(max(0, written) / 1024 ** 3, 3)}
 
     def _record_waits(self, events: list[Any]) -> None:
         """facts["analytics_waits"]: what the sessions waited on in the baseline and the hold. Evidence
@@ -624,7 +906,7 @@ class AnalyticsLoadFault(HeldFault):
 
         return [
             "",
-            "noisy analytics (NL-N-I01):",
+            f"noisy analytics ({(r.get('scenario') or {}).get('id') or 'NL-N-I01'}):",
             f"  plan: {validity.get('plan')}  helpers per report allowed: {validity.get('helpers_per_report')}  "
             f"planned rate: {validity.get('planned_rate_tps')} TPS",
             f"  reports completed: {', '.join(kind_text(k) for k in ('q1', 'q2', 'q3', 'q4'))}",
@@ -643,4 +925,5 @@ class AnalyticsLoadFault(HeldFault):
             f"  customers stopped by a limit: {m.get('customer_limit_errors')}  back to normal: {m.get('rto_to_slo_s')} s  "
             f"left: {m.get('analytics_sessions_left')} sessions, {m.get('temp_files_left')} temporary files",
             *wait_lines(facts.get("analytics_waits")),
+            *tenant_lines(facts, m),
         ]

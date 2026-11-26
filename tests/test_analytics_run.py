@@ -177,7 +177,7 @@ def reports_env(env, monkeypatch):
 
 
 def short() -> Any:
-    sc = scenario("NL-N-I01")
+    sc = scenario("NL-N-I01a")
     marker = scenario("NL-C-01").workload.model_copy(update={"latency_from": "intended_start"})
     accept = [a for a in sc.accept if a not in NOT_ON_MARKER_WORKLOAD]
     return sc.model_copy(update={
@@ -210,7 +210,7 @@ def test_the_reports_run_their_limits_trip_and_the_customers_keep_their_service(
     assert not [e for e in ledger_for(reports_env).outstanding() if e.run_id == results["run_id"]]
     with open(f"{results['evidence_dir']}/summary.txt") as summary:
         text = summary.read()
-    assert "noisy analytics (NL-N-I01):" in text and "limit test 1 (temp_file_limit): error 53400" in text
+    assert "noisy analytics (NL-N-I01a):" in text and "limit test 1 (temp_file_limit): error 53400" in text
 
 
 def test_a_limit_test_the_role_did_not_stop_fails_the_run(reports_env):

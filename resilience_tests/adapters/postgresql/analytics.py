@@ -17,8 +17,10 @@ Reports run as EXPLAIN (ANALYZE, BUFFERS, TIMING OFF): they run in full, and the
 returns their pages and helpers, kept as evidence. The sessions carry
 application_name = 'resilience-analytics', so cleanup and the kill switch end exactly them. The
 login's settings are read, never written; a limit test changes only its own transaction
-(SET LOCAL). The harness role may not end another role's sessions, so the server-side backstop
-runs as the cluster's OS user.
+(SET LOCAL). In run 1b (the misbehaving tenant) each report session first changes some of its own
+settings for the session only (a session SET, gone when the session ends) and one session tries
+the hard limits; the role itself is never altered. The harness role may not end another role's
+sessions, so the server-side backstop runs as the cluster's OS user.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import itertools
 import json
 import random
 import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import asyncpg
@@ -143,6 +146,9 @@ CACHE_SQL = (f"SELECT coalesce(sum(heap_blks_hit + coalesce(idx_blks_hit, 0)), 0
              f"FROM pg_statio_user_tables WHERE schemaname = '{S}' AND relname = ANY($1::text[])")
 TAGGED_SQL = (f"SELECT count(*) FROM pg_stat_activity WHERE application_name = '{ANALYTICS_APPLICATION_NAME}' "
               "AND backend_type = 'client backend'")
+SETTING_SQL = "SELECT current_setting($1)"
+SET_OWN_SQL = "SELECT set_config($1, $2, false)"          # false: for the session, not the transaction
+SET_PRIVILEGE_SQL = "SELECT has_parameter_privilege(current_user, $1, 'SET')"
 TERMINATE_SQL = (f"SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
                  f"WHERE application_name = '{ANALYTICS_APPLICATION_NAME}' AND pid <> pg_backend_pid()")
 
@@ -162,6 +168,16 @@ def plan_figures(explain: Any) -> dict[str, Any]:
     return {"shared_hit": int(top.get("Shared Hit Blocks", 0)), "shared_read": int(top.get("Shared Read Blocks", 0)),
             "temp_written": int(top.get("Temp Written Blocks", 0)), "workers_planned": planned,
             "workers_launched": launched}
+
+
+def attempt_session(plan: list[str], limit_tests: bool) -> int | None:
+    """Which session (0-based) tries the hard limits: the first index session (its small reads
+    write no temporary files, so a limit lifted by mistake costs nothing), else the last
+    full-table session -- never session 0 when it runs limit test 1. None: no such session."""
+    if "index" in plan:
+        return plan.index("index")
+    last = len(plan) - 1
+    return last if last > 0 or (last == 0 and not limit_tests) else None
 
 
 def parse_role_config(config: list[str]) -> dict[str, str]:
@@ -314,7 +330,9 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
     # --- the reports ---------------------------------------------------------------------------
 
     async def start_analytics(self, *, full_table_sessions: int, index_sessions: int, limit_tests: bool,
-                              extra_warehouses: tuple[int, int] | None) -> dict[str, Any]:
+                              extra_warehouses: tuple[int, int] | None,
+                              session_overrides: Mapping[str, str] | None = None,
+                              hard_limit_attempts: Mapping[str, str] | None = None) -> dict[str, Any]:
         login = self.node.analytics
         if login is None:
             return {"supported": False, "error": "the environment names no analytics login (node.analytics)"}
@@ -332,7 +350,7 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
         plan = (["full"] * full_table_sessions) + (["index"] * index_sessions)
         self._reports = {"started_mono_ns": time.monotonic_ns(), "stopped": False, "rows": rows,
                          "kinds": {}, "records": [], "failed": [], "limit_tests": {}, "sessions": [], "samples": [],
-                         "failed_sessions": []}
+                         "failed_sessions": [], "overrides": [], "attempts": [], "attempt_session": None}
         self._report_stop = asyncio.Event()
         conns: list[asyncpg.Connection] = []
         try:
@@ -346,6 +364,17 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
             return {"supported": False, "error": f"report session {len(conns) + 1} of {len(plan)} not opened as "
                                                  f"{login.user}: {type(exc).__name__}: {exc}"}
         self._report_conns = tuple(conns)
+        # run 1b: each session changes its own settings before its first report (session only: the
+        # role is never altered), then one session -- never limit test 1's -- tries the hard limits
+        if session_overrides:
+            for i, c in enumerate(conns):
+                self._reports["overrides"].extend(await self._set_own(i + 1, c, session_overrides))
+        if hard_limit_attempts:
+            at = attempt_session(plan, limit_tests)
+            self._reports["attempt_session"] = None if at is None else at + 1
+            if at is not None:
+                self._reports["attempts"].extend(await self._set_own(at + 1, conns[at], hard_limit_attempts,
+                                                                     privilege=True))
         sessions, tasks = [], []
         rng = random.Random(0xA11A)        # seeded: the same index ranges every run
         for i, (kind, c) in enumerate(zip(plan, conns)):
@@ -373,7 +402,48 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
         return {"supported": True, "t0_mono_ns": t0, "sessions": sessions,
                 "application_name": ANALYTICS_APPLICATION_NAME, "login": login.user,
                 "full_table_sessions": full_table_sessions, "index_sessions": index_sessions,
-                "limit_tests": limit_tests, "extra_warehouses": list(extra_warehouses) if extra_warehouses else None}
+                "limit_tests": limit_tests, "extra_warehouses": list(extra_warehouses) if extra_warehouses else None,
+                "attempt_session": self._reports["attempt_session"]}
+
+    async def _set_own(self, session: int, conn: asyncpg.Connection, settings: Mapping[str, str],
+                       privilege: bool = False) -> list[dict[str, Any]]:
+        """Each setting changed for this session only (set_config(..., false) is a session SET), as
+        a statement on its own outside any transaction, and read back. The answer per setting:
+        accepted (with the value read back) or refused (the server's SQLSTATE and message); None
+        when the harness got no answer (the connection broke), which leaves the check unmeasured.
+        `privilege`: for an accepted change, whether the login holds SET on that parameter (a grant,
+        PostgreSQL 15+), which tells a grant by the operator from a limit that is not a hard cap."""
+        out: list[dict[str, Any]] = []
+        for name, value in settings.items():
+            rec: dict[str, Any] = {"session": session, "setting": name, "asked": value, "answer": None}
+            try:
+                rec["before"] = str(await conn.fetchval(SETTING_SQL, name))
+            except asyncpg.PostgresError as exc:
+                rec["before_error"] = f"{exc.sqlstate}: {exc}"[:300]
+            except Exception as exc:  # noqa: BLE001 -- no answer: recorded, the check is not measured
+                rec["error"] = f"{type(exc).__name__}: {exc}"[:300]
+                out.append(rec)
+                continue
+            try:
+                await conn.fetchval(SET_OWN_SQL, name, value)
+            except asyncpg.PostgresError as exc:
+                rec.update(answer="refused", sqlstate=exc.sqlstate, error=str(exc)[:300])
+            except Exception as exc:  # noqa: BLE001
+                rec["error"] = f"{type(exc).__name__}: {exc}"[:300]
+            else:
+                try:
+                    rec["read_back"] = str(await conn.fetchval(SETTING_SQL, name))
+                    rec["answer"] = "accepted"
+                except Exception as exc:  # noqa: BLE001 -- accepted but not read back: no answer
+                    rec["error"] = f"read back: {type(exc).__name__}: {exc}"[:300]
+                if privilege and rec["answer"] == "accepted":
+                    try:
+                        rec["granted_set"] = bool(await conn.fetchval(SET_PRIVILEGE_SQL, name))
+                    except Exception as exc:  # noqa: BLE001 -- before PostgreSQL 15: unknown
+                        rec["granted_set"] = None
+                        rec["granted_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            out.append(rec)
+        return out
 
     async def _run_session(self, session: int, kind: str, conn: asyncpg.Connection, first: str | None,
                            extra: tuple[int, int] | None, rng: random.Random) -> None:
@@ -460,7 +530,9 @@ class AnalyticsMixin(AnalyticsSupport, PostgreSQLCore):
                 "stopped_mono_ns": reports.get("stopped_mono_ns"), "order_line_rows": reports["rows"],
                 "sessions": reports["sessions"], "by_kind": {k: v.as_dict() for k, v in reports["kinds"].items()},
                 "limit_tests": reports["limit_tests"], "records": reports["records"], "failed": reports["failed"],
-                "failed_sessions": reports["failed_sessions"], "samples": reports["samples"]}
+                "failed_sessions": reports["failed_sessions"], "samples": reports["samples"],
+                "overrides": reports["overrides"], "attempts": reports["attempts"],
+                "attempt_session": reports["attempt_session"]}
 
     async def stop_analytics(self) -> dict[str, Any]:
         """Each running query cancelled (asyncpg sends the server a cancel request when its task is

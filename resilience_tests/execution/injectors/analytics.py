@@ -137,9 +137,14 @@ class OsSshAnalyticsDriver(FaultInjector):
             raise DriverNotAvailable("analytics_load: preflight must run first")
         layout = self._database_adapter(node).tpcc_layout() or {}
         extra = layout.get("extra_warehouses")
+        tenant: dict[str, Any] = {}        # run 1b only: an engine without it is never asked
+        if self.plan.session_overrides:
+            tenant["session_overrides"] = dict(self.plan.session_overrides)
+        if self.plan.hard_limit_attempts:
+            tenant["hard_limit_attempts"] = dict(self.plan.hard_limit_attempts)
         detail = dict(await self._database_adapter(node).start_analytics(
             full_table_sessions=self.sessions.full_table, index_sessions=self.sessions.index,
-            limit_tests=self.sessions.limit_tests, extra_warehouses=tuple(extra) if extra else None))
+            limit_tests=self.sessions.limit_tests, extra_warehouses=tuple(extra) if extra else None, **tenant))
         if not detail.get("supported"):
             raise FaultNotLanded(f"reports not started: {detail.get('error')}", detail)
         detail.setdefault("t0_mono_ns", time.monotonic_ns())

@@ -1,7 +1,10 @@
-# NL-N-I01 -- Noisy analytics against priority customer work (internal NL-N scenario, modelled on the
+# NL-N-I01a -- Noisy analytics against priority customer work, run 1a: well-behaved reports (internal
+# NL-N scenario, modelled on the
 # Framework's NL-N-07 row of Framework §10.6; the team numbers the new noisy-neighbour list itself).
 # Plan: docs/Noisy Neighbour/Resilience Scenario 1 Noisy analytics vs priority OLTP.md (3 November 2026);
-# Spec Kit feature specs/006-nl-n-i01-noisy-analytics.
+# Spec Kit feature specs/006-nl-n-i01-noisy-analytics. Named NL-N-I01 until 26 November 2026; the v2
+# document (Resilience_Testing_ShaktiDB_v2, section 5.1) runs it as 1a next to NL-N-I01b (the
+# misbehaving tenant, specs/008-nl-n-i01b-misbehaving-tenant). Earlier run folders keep NL-N-I01.
 #
 # Big reports of a separate login, limited by the operator, run for 5 minutes on the same TPC-C tables
 # the customers use, and compete with them for CPU, the memory cache and the disk:
@@ -43,8 +46,8 @@
 #  10 rto_to_slo_s <= 60: TPS >= 95%, p99 <= 1.5x, 60 s straight (NEEDS SIGN-OFF)
 #  11 rpo_txn, corruption_count, structural_integrity_errors (Framework §16.3), the TPC-C gates
 # Also judged: no report session and no temporary file left, settings unchanged.
-id: NL-N-I01
-name: Noisy analytics against priority customer work
+id: NL-N-I01a
+name: Noisy analytics against priority customer work (1a, well-behaved reports)
 tier: node_local
 category: NL-N
 applies_to: [standalone]

@@ -696,9 +696,16 @@ class AnalyticsSupport:
         raise NotImplementedError(f"{type(self).__name__} cannot run noisy-analytics reports")
 
     async def start_analytics(self, *, full_table_sessions: int, index_sessions: int, limit_tests: bool,
-                              extra_warehouses: tuple[int, int] | None) -> dict[str, Any]:
+                              extra_warehouses: tuple[int, int] | None,
+                              session_overrides: Mapping[str, str] | None = None,
+                              hard_limit_attempts: Mapping[str, str] | None = None) -> dict[str, Any]:
         """Open the report sessions and start their queries; return once every session is open and
-        running: {supported: True, t0_mono_ns, sessions, application_name} or {supported: False, error}."""
+        running: {supported: True, t0_mono_ns, sessions, application_name} or {supported: False, error}.
+
+        `session_overrides` (run 1b): before its first report, every session changes these of its
+        own settings for the session only and reads them back; `hard_limit_attempts`: one session
+        (never limit test 1's) tries to change these, each as a statement on its own. The answers
+        are in analytics_state()["overrides"] / ["attempts"]; a refusal never stops a session."""
         return {"supported": False, "error": f"{type(self).__name__} cannot run noisy-analytics reports"}
 
     async def analytics_sample(self) -> dict[str, Any]:
