@@ -74,6 +74,7 @@ from resilience_tests.execution.workload.attached import (
     compare_snapshots,
     find_folder,
 )
+from resilience_tests.execution.workload import recovered
 from resilience_tests.execution.workload.markers import DB_MARKERS_FILE
 from resilience_tests.execution.workload.service import endchecks
 from resilience_tests.execution.workload.contract import WorkloadDriverContract
@@ -571,7 +572,9 @@ class TestOrchestrator:
             raise PhaseAbort(str(exc)) from None
         attached = AttachedWorkload(folder, self.stream)
         problems = attached.match_problems(self.scenario.workload, self.profile.name, self.node.name)
-        problems += attached.health_problems()
+        # back to normal is waited for between scenarios (common_workload.py) and judged at the
+        # baseline (_p_baseline), where the baseline window opens -- not refused here a moment earlier
+        problems += attached.health_problems(check_recovery=False)
         self.facts["common_workload"] = attached.describe()
         if problems:
             raise PhaseAbort(f"cannot attach to the common workload in {folder}: " + "; ".join(problems))
@@ -711,6 +714,21 @@ class TestOrchestrator:
                              **({"took_s": round(now - since, 1)} if since is not None else {}))
         return now
 
+    def _check_back_to_normal(self) -> None:
+        """Attached: the baseline is taken only on a workload back to normal after any earlier fault
+        on it (recovered.py, Framework §6.2), recorded either way; a baseline that cannot be shown to
+        be normal is not measured (the run stops, never judged). Then the baseline mark: from here on
+        this run's start-up is over."""
+        assert self.attached is not None and self.stream is not None
+        result = self.attached.recovery()
+        self.facts["back_to_normal_before_baseline"] = result
+        self.stream.emit("orchestrator", "back_to_normal_check", **result)
+        self.disclosures.append(recovered.describe(result))
+        if result.get("needed") is not False and (result.get("error") or not result.get("ok")):
+            why = result.get("error") or "; ".join(result.get("problems") or [])
+            raise PhaseAbort(f"the baseline would not be normal: {why}")
+        self.attached.mark("baseline", run_id=self.run_id, scenario=self.scenario.id)
+
     def _mark_on_event(self, event: Event) -> None:
         """T0 and T1 into the common workload's marks, at the moment they happened."""
         if self.attached is not None and event.kind in ("t0", "t1") and event.source in ("injector", "orchestrator"):
@@ -757,6 +775,8 @@ class TestOrchestrator:
             self.stream.emit("orchestrator", "warmup", seconds=warmup_s)
             await asyncio.sleep(warmup_s)
             self.facts["warmup_s"] = warmup_s
+        if self.attached is not None:
+            self._check_back_to_normal()
         self.windows_ns["baseline_start"] = time.monotonic_ns()
         self.workload.begin_window()
         await self.fault_behaviour.baseline_started()

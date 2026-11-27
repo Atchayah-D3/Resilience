@@ -47,7 +47,7 @@ METRICS_1S_FILE = "metrics-1s.jsonl"
 # Written by the harness (scenario runs), read by the service: one line per scenario event, so the
 # service judges its baseline outside the scenarios and reports each scenario's window separately.
 MARKS_FILE = "scenario-marks.jsonl"
-MARK_KINDS = ("run_start", "t0", "t1", "run_end")
+MARK_KINDS = ("run_start", "baseline", "t0", "t1", "run_end")   # baseline: the scenario's baseline window opens (recovered.py)
 LOG_FILE = "service.log"
 
 # the states written in status.json; the last three are final
@@ -175,7 +175,8 @@ def stop_requested(folder: Path) -> dict[str, Any] | None:
 def write_mark(folder: Path, kind: str, *, run_id: str, scenario: str, t_wall: float | None = None,
                **extra: Any) -> dict[str, Any]:
     """Append one scenario mark to the running workload's folder: run_start (the scenario's run
-    begins), t0 (its fault), t1 (its recovery ends), run_end (its cleanup is over). One whole line,
+    begins), baseline (its baseline window opens: its start-up is over), t0 (its fault), t1 (its
+    recovery ends), run_end (its cleanup is over). One whole line,
     written in a single append and saved to disk."""
     if kind not in MARK_KINDS:
         raise ValueError(f"mark kind {kind!r}: one of {', '.join(MARK_KINDS)}")

@@ -343,8 +343,11 @@ def tenant_lines(facts: dict[str, Any], m: dict[str, Any]) -> list[str]:
         else:
             answer = f"no answer ({a.get('error')})"
         lines.append(f"    session {a.get('session')} tried {a.get('setting')} = {a.get('asked')}: {answer}")
-    lines.append(f"    helpers: most per report {m.get('report_helpers_max')}, most at once {m.get('report_helpers_total_max')};  "
-                 f"temporary data written {m.get('temp_gb_written')} GB;  limit test 2 ran {m.get('limit_test_2_ran_s')} s")
+    server_cap = (facts.get("scenario_observed") or {}).get("max_parallel_workers")
+    lines.append(f"    helpers: most per report {m.get('report_helpers_max')}, most at once {m.get('report_helpers_total_max')}"
+                 + (f" (the server's own limit for every session together, max_parallel_workers = {server_cap}, set by "
+                    "the operator: the tenant cannot raise it)" if server_cap is not None else "")
+                 + f";  temporary data written {m.get('temp_gb_written')} GB;  limit test 2 ran {m.get('limit_test_2_ran_s')} s")
     lines.append(f"    customers: TPS ratio {m.get('oltp_tps_ratio')}  p99 ratio {m.get('oltp_p99_ratio')}  worst p90 "
                  f"{m.get('customer_p90_max_s')} s  cache hit {m.get('customer_cache_hit_ratio_vs_baseline')} of baseline;  "
                  f"write prober longest gap {m.get('writer_max_gap_s')} s")
@@ -554,6 +557,16 @@ class AnalyticsLoadFault(HeldFault):
                 self._guard.arm()
             except RuntimeError as exc:
                 raise PhaseAbort(f"invalid run: the memory guard cannot protect the target: {exc}") from None
+
+    async def hold_and_release(self) -> dict[str, Any]:
+        """The hold, then the reports are ended (T1). The memory guard judges only while the reports
+        run: disarmed as soon as they are ended, so its lowest reading and any trip belong to them,
+        never to the recovery or the checks after (measure() disarms it too, if the hold ended early)."""
+        try:
+            return await super().hold_and_release()
+        finally:
+            if self._guard is not None:
+                self._guard.disarm()
 
     async def after_inject(self, detail: dict[str, Any]) -> None:
         if self._guard is not None and self._guard.tripped is not None:

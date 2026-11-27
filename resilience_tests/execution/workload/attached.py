@@ -45,6 +45,7 @@ from resilience_tests.execution.workload.markers import (
     MARKER_JOURNAL,
     journal_paths,
 )
+from resilience_tests.execution.workload import recovered as rec
 from resilience_tests.execution.workload.service import client
 from resilience_tests.execution.workload.service import endchecks
 from resilience_tests.execution.workload.service import state as st
@@ -75,6 +76,7 @@ SETTLED_S = 10.0
 # running at it (the clerks abandon a transaction after 10 s): its answer may come after the cut-off.
 INFLIGHT_S = 15.0              # before the baseline: this many clean seconds in a row (no drops, reconnects, unknowns)
 TAIL_BYTES = 512 * 1024       # the end of metrics-1s.jsonl read for the recent stretch
+RECOVERY_TAIL_BYTES = 4 * 1024 * 1024  # ...and for the last 60 s of the back-to-normal check (samples ~4-6 KB each)
 # what is copied from the workload's events.jsonl into the run's stream
 COPIED = {("workload", "sample"), ("workload", "driver_load"), ("workload", "fatal")}
 COPIED_SERVICE_PREFIX = "outage"
@@ -149,6 +151,7 @@ class AttachedWorkload:
         self._window_from: float | None = None
         self._task: asyncio.Task[None] | None = None
         self._copy_from: int | None = None        # events.jsonl offset of the moment of attach
+        self._reference: rec.Reference | None = None   # fixed once the first fault ran: kept once read
 
     # --- what it runs ------------------------------------------------------------------------
 
@@ -270,9 +273,11 @@ class AttachedWorkload:
             problems[-1] += self._gone()
         return problems
 
-    def health_problems(self, now: float | None = None) -> list[str]:
+    def health_problems(self, now: float | None = None, check_recovery: bool = True) -> list[str]:
         """Healthy enough to measure a baseline on (attach, between scenarios): running past its
-        warm-up, alive, and doing its work over the last HEALTH_WINDOW_S."""
+        warm-up, alive, and doing its work over the last HEALTH_WINDOW_S; and, once a fault has run
+        on the workload, back to normal against its reference (recovery(), Framework §6.2) unless
+        `check_recovery` is False (the scenario records it at its baseline instead)."""
         now = time.time() if now is None else now
         recent = self.recent_samples()
         newest = float(recent[-1]["t_wall"]) if recent else None
@@ -299,21 +304,45 @@ class AttachedWorkload:
             if errors > MAX_ERROR_SHARE * max(1, commits + errors):
                 problems.append(f"{errors} failed transactions against {commits} commits in the last "
                                 f"{HEALTH_WINDOW_S:.0f} s")
+        if check_recovery:
+            result = self.recovery(now)
+            if result.get("error"):
+                problems.append(f"back to normal cannot be judged: {result['error']}")
+            elif result.get("needed") is not False and not result.get("ok"):
+                problems += list(result.get("problems") or [])
         return problems
 
-    def recent_samples(self) -> list[dict[str, Any]]:
+    def recovery(self, now: float | None = None) -> dict[str, Any]:
+        """Back to normal before a baseline (recovered.py): {"needed": False, "why": ...} before any
+        fault ran on the workload; else the check of the last 60 s against the reference, or
+        {"error": ...} when it cannot be judged (never taken as back to normal)."""
+        now = time.time() if now is None else now
+        marks = st.read_marks(self.folder)
+        if rec.first_fault_wall(marks) is None:
+            return {"needed": False, "why": "no fault has run on the common workload yet", "checked_wall": round(now, 3)}
+        try:
+            if self._reference is None:
+                fault = rec.first_fault_wall(marks)
+                assert fault is not None
+                self._reference = rec.reference(rec.read_samples_until(self.folder / st.METRICS_1S_FILE, fault), marks)
+            result = rec.check(self.recent_samples(RECOVERY_TAIL_BYTES), self._reference, now)
+        except (rec.NoReference, ValueError, KeyError) as exc:
+            return {"needed": True, "error": str(exc), "checked_wall": round(now, 3)}
+        return {"needed": True, "checked_wall": round(now, 3), **result}
+
+    def recent_samples(self, tail_bytes: int = TAIL_BYTES) -> list[dict[str, Any]]:
         """The last samples of metrics-1s.jsonl (whole lines only), without reading the whole file."""
         path = self.folder / st.METRICS_1S_FILE
         try:
             with path.open("rb") as fh:
                 fh.seek(0, 2)
                 size = fh.tell()
-                fh.seek(max(0, size - TAIL_BYTES))
+                fh.seek(max(0, size - tail_bytes))
                 data = fh.read()
         except FileNotFoundError:
             return []
         lines = data.split(b"\n")
-        if size > TAIL_BYTES:
+        if size > tail_bytes:
             lines = lines[1:]                     # the first line read may be cut
         return [json.loads(x) for x in lines[:-1] if x.strip()]
 

@@ -545,7 +545,9 @@ def test_a_kill_scenario_runs_all_nine_phases_attached_and_the_workload_keeps_ru
     assert facts["validate_snapshot"]["journal_lines_copied"]["acked.jrnl"] > 0
     assert facts["markers"]["destroyed_older_count"] == 0
     assert results["measured"]["rpo_txn"] == 0 and results["measured"]["rto_first_write_s"] is not None
-    assert [m["kind"] for m in st.read_marks(folder)] == ["run_start", "t0", "t1", "run_end"]
+    assert [m["kind"] for m in st.read_marks(folder)] == ["run_start", "baseline", "t0", "t1", "run_end"]
+    # the first scenario on this workload: no earlier fault, so back to normal is not checked (recorded)
+    assert facts["back_to_normal_before_baseline"]["needed"] is False
     assert "settled_before_baseline_s" in facts
     run_dir = Path(results["evidence_dir"])
     copied = [json.loads(x) for x in (run_dir / "events.jsonl").read_text().splitlines()]

@@ -402,6 +402,17 @@ def test_the_findings_block_names_what_was_overridden_and_what_was_refused(tmp_p
     assert tenant_lines({}, {}) == []                 # 1a: no block
 
 
+def test_the_findings_name_the_servers_own_helper_limit():
+    """Run 26 Nov: asked 8 helpers per report, got at most 6 (7 at once): the server-wide
+    max_parallel_workers = 8, an operator setting the tenant cannot change, is what held it."""
+    lines = "\n".join(tenant_lines({"analytics_tenant": {"overrides": {}}, "scenario_observed": {"max_parallel_workers": "8"}},
+                                   {"report_helpers_max": 6, "report_helpers_total_max": 7}))
+    assert "most per report 6, most at once 7 (the server's own limit for every session together, " \
+           "max_parallel_workers = 8, set by the operator: the tenant cannot raise it)" in lines
+    lines = "\n".join(tenant_lines({"analytics_tenant": {"overrides": {}}}, {"report_helpers_max": 6}))
+    assert "most per report 6, most at once None;" in lines           # not observed: no claim made
+
+
 # --- the whole run, through the real orchestrator (tests/test_analytics_run.py's fake engine) ------
 
 from resilience_tests.adapters.base import register_adapter  # noqa: E402
@@ -531,3 +542,20 @@ def test_low_memory_ends_the_reports_early_and_is_recorded(tenant_env):
     assert m["reports_ran_s"] < HOLD_S
     assert "below 2048 MB" in results["facts"]["memory_guard"]["tripped"]["reason"]
     assert results["status"] == "passed", why(results)       # judged on what must still hold
+
+
+def test_the_guard_judges_only_while_the_reports_run(tenant_env, monkeypatch):
+    """Low memory after the reports were ended (recovery, the checks) is not the reports' doing: run
+    26 Nov, the guard stayed armed about 15 minutes after the hold."""
+    async def low_after_the_reports(self: MemoryGuard) -> None:
+        while True:
+            mb = 1500.0 if Tenant.stopped_ns is not None else 8000.0
+            self.observe(Reading(time.monotonic_ns(), int(mb * 1024), 1_000_000, 1000))
+            await asyncio.sleep(0.1)
+
+    monkeypatch.setattr(guard_mod.MemoryGuard, "_read_loop", low_after_the_reports)
+    results = run_1b(tenant_env)
+    m = results["measured"]
+    assert m["memory_guard_tripped"] is False and m["available_memory_min_mb"] == 8000.0
+    assert results["facts"]["memory_guard"]["armed_s"] < HOLD_S + 5
+    assert results["status"] == "passed", why(results)

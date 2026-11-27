@@ -7,7 +7,9 @@ workload for the whole session, the scenarios one after another against it.
     session start     start the workload once (or, with --attach-workload, use the one running)
                       and wait until it runs past its warm-up
     before a scenario cooldown (not before the first), then wait until the workload is healthy again
-                      (alive, running, doing its work); every scenario attaches to it
+                      (alive, running, doing its work) and, once a fault has run on it, back to
+                      normal: p99 <= 1.5x and TPS >= 80% of its own reference over the last 60 s
+                      (Framework §6.2, execution/workload/recovered.py); every scenario attaches to it
     session end       stop the workload once -- also after a failure or Ctrl-C -- only if this
                       session started it; its end summary goes into the session's index.html
 
